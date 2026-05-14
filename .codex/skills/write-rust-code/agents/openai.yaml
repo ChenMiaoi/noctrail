@@ -1,0 +1,4 @@
+interface:
+  display_name: "Write Rust Code"
+  short_description: "Write idiomatic Rust for Noctrail."
+  default_prompt: "Write minimal Rust code that follows Noctrail architecture, rustfmt/clippy expectations, strong error handling, tests, and maintainable API boundaries."

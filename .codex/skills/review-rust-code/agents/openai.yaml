@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Rust Code"
+  short_description: "Review Rust like a maintainer."
+  default_prompt: "Review Rust changes as a mature open-source maintainer: prioritize correctness, safety, minimality, API stability, tests, and actionable file-line findings."

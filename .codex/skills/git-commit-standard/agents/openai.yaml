@@ -1,0 +1,4 @@
+interface:
+  display_name: "Git Commit Standard"
+  short_description: "Create disciplined Git commits."
+  default_prompt: "Prepare an atomic signed-off Git commit with intentional staging, relevant validation, and a precise commit message."

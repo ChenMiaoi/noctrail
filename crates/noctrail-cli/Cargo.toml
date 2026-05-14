@@ -1,0 +1,15 @@
+[package]
+name = "noctrail-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Command-line entry point for Noctrail."
+publish = false
+
+[[bin]]
+name = "noctrail"
+path = "src/main.rs"
+
+[dependencies]

@@ -1,0 +1,19 @@
+# Rust
+/target/
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Logs and diagnostics
+*.log
+*.trace
+
+# Editor and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
