@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use noctrail_config::{ConfigReloader, FontConfig, ThemeConfig};
+use noctrail_config::{AgentConfig, ConfigReloader, FontConfig, ThemeConfig};
 use noctrail_layout::{FocusDirection, LayoutRect, SplitAxis, WorkspaceId};
 use noctrail_pty::{PtyOutputReader, PtySize};
 use noctrail_render::{FontPreferences, GpuRenderer, PaneBorderStyle, RenderBackend, Rgba};
@@ -59,6 +59,7 @@ pub struct GuiLaunchOptions {
     pub config_path: Option<PathBuf>,
     pub theme: ThemeConfig,
     pub font: FontConfig,
+    pub agent: AgentConfig,
 }
 
 impl Default for GuiLaunchOptions {
@@ -69,6 +70,7 @@ impl Default for GuiLaunchOptions {
             config_path: None,
             theme: ThemeConfig::default(),
             font: FontConfig::default(),
+            agent: AgentConfig::default(),
         }
     }
 }
@@ -1901,9 +1903,7 @@ mod tests {
             GuiLaunchOptions {
                 safe_mode: true,
                 renderer_backend: RenderBackend::Gpu,
-                config_path: None,
-                theme: ThemeConfig::default(),
-                font: FontConfig::default(),
+                ..GuiLaunchOptions::default()
             },
         );
 
@@ -1948,9 +1948,7 @@ mod tests {
             GuiLaunchOptions {
                 safe_mode: false,
                 renderer_backend: RenderBackend::Software,
-                config_path: None,
-                theme: ThemeConfig::default(),
-                font: FontConfig::default(),
+                ..GuiLaunchOptions::default()
             },
         );
 
@@ -1973,8 +1971,7 @@ mod tests {
                 safe_mode: false,
                 renderer_backend: RenderBackend::Software,
                 config_path: Some(path.clone()),
-                theme: ThemeConfig::default(),
-                font: FontConfig::default(),
+                ..GuiLaunchOptions::default()
             },
         );
 

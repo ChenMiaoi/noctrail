@@ -258,6 +258,38 @@ pub struct Config {
     pub renderer: RendererConfig,
     pub font: FontConfig,
     pub theme: ThemeConfig,
+    pub agent: AgentConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentProviderKind {
+    #[serde(rename = "openai-compatible")]
+    #[default]
+    OpenAiCompatible,
+    Local,
+    Cli,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(default)]
+pub struct AgentProviderConfig {
+    #[serde(rename = "type")]
+    pub kind: AgentProviderKind,
+    pub model: Option<String>,
+    pub endpoint: Option<String>,
+    pub command: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(default)]
+pub struct AgentConfig {
+    pub enabled: bool,
+    #[serde(rename = "read-env")]
+    pub read_env: bool,
+    #[serde(rename = "read-history")]
+    pub read_history: bool,
+    pub provider: Option<AgentProviderConfig>,
 }
 
 #[derive(Debug, Error)]
@@ -375,6 +407,12 @@ fn validate_config(path: &Path, config: &Config) -> Result<(), ConfigError> {
             reason: "theme.animation.duration-ms must be greater than 0".to_string(),
         });
     }
+    if config.agent.enabled && config.agent.provider.is_none() {
+        return Err(ConfigError::Validation {
+            path: path.to_path_buf(),
+            reason: "agent.provider must be configured when agent.enabled = true".to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -445,6 +483,10 @@ mod tests {
             DEFAULT_ANIMATION_DURATION_MS
         );
         assert!(!config.theme.low_power.enabled);
+        assert!(!config.agent.enabled);
+        assert!(!config.agent.read_env);
+        assert!(!config.agent.read_history);
+        assert_eq!(config.agent.provider, None);
     }
 
     #[test]
@@ -452,7 +494,7 @@ mod tests {
         let path = temp_config_path("theme-load");
         fs::write(
             &path,
-            "[renderer]\nbackend = \"software\"\n\n[font]\nfamily = \"Iosevka\"\nsize = 16.5\nfallback = [\"Noto Sans CJK SC\"]\n\n[theme]\nopacity = 0.8\n\n[theme.color]\nbackground = \"#112233\"\nforeground = \"#abcdef\"\n\n[theme.border]\nactive = \"#7aa2f7\"\ninactive = \"#3b4261\"\nwidth = 2\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.blur]\nenabled = true\nfallback-tint-opacity = 0.94\n\n[theme.animation]\nenabled = false\nduration-ms = 180\n\n[theme.low-power]\nenabled = true\n\n[theme.cursor]\ncolor = \"#ffeeaa\"\nblink-interval-ms = 450\n\n[theme.selection]\nbackground = \"#264f78cc\"\nforeground = \"#ffffff\"\n",
+            "[renderer]\nbackend = \"software\"\n\n[font]\nfamily = \"Iosevka\"\nsize = 16.5\nfallback = [\"Noto Sans CJK SC\"]\n\n[theme]\nopacity = 0.8\n\n[theme.color]\nbackground = \"#112233\"\nforeground = \"#abcdef\"\n\n[theme.border]\nactive = \"#7aa2f7\"\ninactive = \"#3b4261\"\nwidth = 2\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.blur]\nenabled = true\nfallback-tint-opacity = 0.94\n\n[theme.animation]\nenabled = false\nduration-ms = 180\n\n[theme.low-power]\nenabled = true\n\n[theme.cursor]\ncolor = \"#ffeeaa\"\nblink-interval-ms = 450\n\n[theme.selection]\nbackground = \"#264f78cc\"\nforeground = \"#ffffff\"\n\n[agent]\nenabled = true\nread-env = true\nread-history = true\n\n[agent.provider]\ntype = \"openai-compatible\"\nmodel = \"gpt-5\"\nendpoint = \"https://example.invalid/v1\"\n",
         )
         .expect("write config");
 
@@ -482,6 +524,20 @@ mod tests {
         assert_eq!(
             config.theme.selection.background,
             RgbaColor::from_rgba(0x26, 0x4f, 0x78, 0xcc)
+        );
+        assert!(config.agent.enabled);
+        assert!(config.agent.read_env);
+        assert!(config.agent.read_history);
+        let provider = config
+            .agent
+            .provider
+            .as_ref()
+            .expect("agent provider should be loaded");
+        assert_eq!(provider.kind, AgentProviderKind::OpenAiCompatible);
+        assert_eq!(provider.model.as_deref(), Some("gpt-5"));
+        assert_eq!(
+            provider.endpoint.as_deref(),
+            Some("https://example.invalid/v1")
         );
 
         let _ = fs::remove_file(path);
@@ -513,6 +569,22 @@ mod tests {
             ConfigError::Parse {
                 path: error_path, ..
             } => assert_eq!(error_path, path),
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn agent_enable_without_provider_is_rejected() {
+        let path = temp_config_path("agent-provider-required");
+        fs::write(&path, "[agent]\nenabled = true\n").expect("write config");
+
+        let error = Config::load_from_path(&path).expect_err("config should fail");
+        match error {
+            ConfigError::Validation { reason, .. } => {
+                assert!(reason.contains("agent.provider must be configured"));
+            }
             other => panic!("unexpected error: {other:?}"),
         }
 

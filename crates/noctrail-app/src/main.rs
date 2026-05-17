@@ -11,7 +11,10 @@ use noctrail_app::{
     gui::{self, GuiLaunchOptions},
     input,
 };
-use noctrail_config::{Config, ConfigError, RendererBackend as ConfigRendererBackend, ThemeConfig};
+use noctrail_config::{
+    AgentConfig, AgentProviderConfig, AgentProviderKind, Config, ConfigError,
+    RendererBackend as ConfigRendererBackend, ThemeConfig,
+};
 use noctrail_layout::{FocusDirection, LayoutRect, SplitAxis};
 use noctrail_pty::{PtyCommand, PtySize};
 use noctrail_render::{PaneBorderStyle, RenderBackend, Rgba};
@@ -24,6 +27,7 @@ Usage:
   noctrail-app [command] [options]
 
 Commands:
+  agent-default-smoke Run the default-off agent policy probe
   block-smoke Run the block browser/history probe
   crash-smoke Run the panic-hook recovery probe
   failure-block-smoke Run the non-zero exit block probe
@@ -49,6 +53,7 @@ struct StartupOptions {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartupCommand {
+    AgentDefaultSmoke,
     BlockSmoke,
     CrashSmoke,
     FailureBlockSmoke,
@@ -82,6 +87,14 @@ struct VisualEffectsMode {
     blur_fallback_reason: Option<&'static str>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentAccessPolicy {
+    enabled: bool,
+    read_env: bool,
+    read_history: bool,
+    provider_request: bool,
+}
+
 fn main() {
     install_process_panic_hook(crash_diagnostic_path());
     let args = env::args().skip(1).collect::<Vec<_>>();
@@ -101,6 +114,12 @@ fn main() {
 
     match options.command {
         StartupCommand::Help => print!("{HELP}"),
+        StartupCommand::AgentDefaultSmoke => {
+            if let Err(error) = run_agent_default_smoke() {
+                eprintln!("{error}");
+                process::exit(1);
+            }
+        }
         StartupCommand::BlockSmoke => {
             if let Err(error) = run_block_smoke() {
                 eprintln!("{error}");
@@ -161,6 +180,10 @@ fn parse_startup_options(args: &[String]) -> Result<StartupOptions, StartupError
 
     while index < args.len() {
         match args[index].as_str() {
+            "agent-default-smoke" if !command_set => {
+                command = StartupCommand::AgentDefaultSmoke;
+                command_set = true;
+            }
             "block-smoke" if !command_set => {
                 command = StartupCommand::BlockSmoke;
                 command_set = true;
@@ -238,6 +261,7 @@ fn resolve_launch_options(options: &StartupOptions) -> Result<GuiLaunchOptions, 
         config_path: options.config_path.clone(),
         theme: config.theme,
         font: config.font,
+        agent: config.agent,
     })
 }
 
@@ -515,6 +539,57 @@ fn run_failure_block_smoke() -> Result<(), Box<dyn std::error::Error>> {
         block.structured_output.is_some(),
     );
     println!("failure block smoke ok");
+    Ok(())
+}
+
+fn run_agent_default_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    let default_policy = agent_access_policy(&Config::default().agent);
+    if default_policy.enabled {
+        return Err("default agent policy should start disabled".into());
+    }
+    if default_policy.read_env {
+        return Err("default agent policy should not read env".into());
+    }
+    if default_policy.read_history {
+        return Err("default agent policy should not read history".into());
+    }
+    if default_policy.provider_request {
+        return Err("default agent policy should not issue provider requests".into());
+    }
+
+    let disabled_with_provider = AgentConfig {
+        enabled: false,
+        read_env: true,
+        read_history: true,
+        provider: Some(AgentProviderConfig {
+            kind: AgentProviderKind::OpenAiCompatible,
+            model: Some("gpt-5".to_string()),
+            endpoint: Some("https://example.invalid/v1".to_string()),
+            command: Vec::new(),
+        }),
+    };
+    let disabled_policy = agent_access_policy(&disabled_with_provider);
+    if disabled_policy.provider_request || disabled_policy.read_env || disabled_policy.read_history
+    {
+        return Err("disabled agent policy should ignore provider/env/history access".into());
+    }
+
+    println!(
+        "agent={} read_env={} read_history={} provider_request={}",
+        if default_policy.enabled { "on" } else { "off" },
+        if default_policy.read_env { "on" } else { "off" },
+        if default_policy.read_history {
+            "on"
+        } else {
+            "off"
+        },
+        if default_policy.provider_request {
+            "ready"
+        } else {
+            "none"
+        },
+    );
+    println!("agent default smoke ok");
     Ok(())
 }
 
@@ -1199,6 +1274,15 @@ fn animations_enabled(theme: &ThemeConfig) -> bool {
     theme.animation.enabled && !theme.low_power.enabled
 }
 
+fn agent_access_policy(config: &AgentConfig) -> AgentAccessPolicy {
+    AgentAccessPolicy {
+        enabled: config.enabled,
+        read_env: config.enabled && config.read_env,
+        read_history: config.enabled && config.read_history,
+        provider_request: config.enabled && config.provider.is_some(),
+    }
+}
+
 fn on_off(enabled: bool) -> &'static str {
     if enabled { "on" } else { "off" }
 }
@@ -1231,6 +1315,16 @@ mod tests {
             Some(PathBuf::from("/tmp/noctrail.toml"))
         );
         assert!(options.safe_mode);
+    }
+
+    #[test]
+    fn parses_agent_default_smoke_command() {
+        let options = parse_startup_options(&["agent-default-smoke".to_string()])
+            .expect("options should parse");
+
+        assert_eq!(options.command, StartupCommand::AgentDefaultSmoke);
+        assert_eq!(options.config_path, None);
+        assert!(!options.safe_mode);
     }
 
     #[test]
@@ -1348,7 +1442,7 @@ mod tests {
         let path = temp_config_path("theme-font");
         fs::write(
             &path,
-            "[font]\nfamily = \"Iosevka\"\nsize = 15.5\n\n[theme]\nopacity = 0.85\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.blur]\nenabled = true\nfallback-tint-opacity = 0.94\n\n[theme.animation]\nenabled = false\nduration-ms = 180\n\n[theme.low-power]\nenabled = true\n\n[theme.cursor]\nblink-interval-ms = 420\n",
+            "[font]\nfamily = \"Iosevka\"\nsize = 15.5\n\n[theme]\nopacity = 0.85\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.blur]\nenabled = true\nfallback-tint-opacity = 0.94\n\n[theme.animation]\nenabled = false\nduration-ms = 180\n\n[theme.low-power]\nenabled = true\n\n[theme.cursor]\nblink-interval-ms = 420\n\n[agent]\nenabled = true\nread-env = true\nread-history = false\n\n[agent.provider]\ntype = \"local\"\nmodel = \"llama\"\n",
         )
         .expect("write config");
         let options = StartupOptions {
@@ -1370,9 +1464,36 @@ mod tests {
         assert_eq!(launch.theme.animation.duration_ms, 180);
         assert!(launch.theme.low_power.enabled);
         assert_eq!(launch.theme.cursor.blink_interval_ms, 420);
+        assert!(launch.agent.enabled);
+        assert!(launch.agent.read_env);
+        assert!(!launch.agent.read_history);
+        assert_eq!(
+            launch.agent.provider.as_ref().map(|provider| provider.kind),
+            Some(AgentProviderKind::Local)
+        );
         assert_eq!(launch.config_path, Some(path.clone()));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn agent_access_policy_stays_closed_when_agent_is_disabled() {
+        let policy = agent_access_policy(&AgentConfig {
+            enabled: false,
+            read_env: true,
+            read_history: true,
+            provider: Some(AgentProviderConfig {
+                kind: AgentProviderKind::Cli,
+                model: None,
+                endpoint: None,
+                command: vec!["codex".to_string()],
+            }),
+        });
+
+        assert!(!policy.enabled);
+        assert!(!policy.read_env);
+        assert!(!policy.read_history);
+        assert!(!policy.provider_request);
     }
 
     #[test]
