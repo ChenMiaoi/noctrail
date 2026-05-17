@@ -88,6 +88,41 @@ pub enum RuntimeError {
     Pty(#[from] PtyError),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeCommand {
+    Write {
+        pane_id: PaneId,
+        bytes: Vec<u8>,
+    },
+    Resize {
+        pane_id: PaneId,
+        size: PtySize,
+    },
+    Close {
+        pane_id: PaneId,
+    },
+    Restart {
+        pane_id: PaneId,
+        command: PtyCommand,
+    },
+}
+
+#[derive(Debug)]
+pub enum RuntimeEvent {
+    Output {
+        pane_id: PaneId,
+        bytes: Vec<u8>,
+    },
+    Exited {
+        pane_id: PaneId,
+        status: PtyExitStatus,
+    },
+    Error {
+        pane_id: PaneId,
+        error: RuntimeError,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputQueueConfig {
     pub capacity_bytes: usize,
@@ -311,6 +346,34 @@ impl PaneRuntimeRegistry {
         self.insert(pane)
     }
 
+    pub fn apply_command(
+        &mut self,
+        command: RuntimeCommand,
+    ) -> Result<Option<RuntimeEvent>, RuntimeError> {
+        match command {
+            RuntimeCommand::Write { pane_id, bytes } => {
+                self.write_input(pane_id, &bytes)?;
+                Ok(None)
+            }
+            RuntimeCommand::Resize { pane_id, size } => {
+                self.resize_pane(pane_id, size)?;
+                Ok(None)
+            }
+            RuntimeCommand::Close { pane_id } => Ok(self
+                .close(pane_id)?
+                .map(|status| RuntimeEvent::Exited { pane_id, status })),
+            RuntimeCommand::Restart { pane_id, command } => {
+                let size = self
+                    .get(pane_id)
+                    .ok_or(RuntimeError::PaneNotFound(pane_id))?
+                    .size();
+                Ok(self
+                    .restart(pane_id, command, size)?
+                    .map(|status| RuntimeEvent::Exited { pane_id, status }))
+            }
+        }
+    }
+
     pub fn write_input(&mut self, pane_id: PaneId, bytes: &[u8]) -> Result<usize, RuntimeError> {
         let pane = self
             .get_mut(pane_id)
@@ -330,6 +393,40 @@ impl PaneRuntimeRegistry {
             .get_mut(pane_id)
             .ok_or(RuntimeError::PaneNotFound(pane_id))?;
         pane.read_output(buf).map_err(Into::into)
+    }
+
+    pub fn read_output_event(
+        &mut self,
+        pane_id: PaneId,
+        buf: &mut [u8],
+    ) -> Result<Option<RuntimeEvent>, RuntimeError> {
+        let count = {
+            let pane = self
+                .get_mut(pane_id)
+                .ok_or(RuntimeError::PaneNotFound(pane_id))?;
+            pane.read_output(buf)?
+        };
+
+        if count > 0 {
+            return Ok(Some(RuntimeEvent::Output {
+                pane_id,
+                bytes: buf[..count].to_vec(),
+            }));
+        }
+
+        let status = {
+            let pane = self
+                .get_mut(pane_id)
+                .ok_or(RuntimeError::PaneNotFound(pane_id))?;
+            pane.try_wait()?
+        };
+
+        if let Some(status) = status {
+            let _ = self.remove(pane_id);
+            return Ok(Some(RuntimeEvent::Exited { pane_id, status }));
+        }
+
+        Ok(None)
     }
 
     pub fn restart(
@@ -521,6 +618,76 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn command_api_routes_close_and_restart() -> Result<(), Box<dyn StdError>> {
+        let mut registry = PaneRuntimeRegistry::new();
+        let pane_id = registry.spawn_shell(PtySize::new(80, 24))?;
+
+        let restart = registry
+            .apply_command(RuntimeCommand::Restart {
+                pane_id,
+                command: smoke_command("command-restart"),
+            })?
+            .expect("restart should emit an exit event for the previous runtime");
+        assert!(matches!(
+            restart,
+            RuntimeEvent::Exited {
+                pane_id: event_pane_id,
+                ..
+            } if event_pane_id == pane_id
+        ));
+        assert!(registry.contains(pane_id));
+
+        let close = registry
+            .apply_command(RuntimeCommand::Close { pane_id })?
+            .expect("close should emit an exit event");
+        assert!(matches!(
+            close,
+            RuntimeEvent::Exited {
+                pane_id: event_pane_id,
+                ..
+            } if event_pane_id == pane_id
+        ));
+        assert!(!registry.contains(pane_id));
+
+        Ok(())
+    }
+
+    #[test]
+    fn read_output_event_reports_output_then_exit() -> Result<(), Box<dyn StdError>> {
+        let mut registry = PaneRuntimeRegistry::new();
+        let pane_id = registry.spawn(finite_command("runtime-event-ok"), PtySize::new(80, 24))?;
+        let mut buf = [0_u8; 1024];
+
+        let output = registry
+            .read_output_event(pane_id, &mut buf)?
+            .expect("first read should emit output");
+        match output {
+            RuntimeEvent::Output {
+                pane_id: event_pane_id,
+                bytes,
+            } => {
+                assert_eq!(event_pane_id, pane_id);
+                assert!(String::from_utf8_lossy(&bytes).contains("runtime-event-ok"));
+            }
+            other => panic!("expected output event, got {other:?}"),
+        }
+
+        let exit = registry
+            .read_output_event(pane_id, &mut buf)?
+            .expect("second read should emit exit");
+        assert!(matches!(
+            exit,
+            RuntimeEvent::Exited {
+                pane_id: event_pane_id,
+                ..
+            } if event_pane_id == pane_id
+        ));
+        assert!(!registry.contains(pane_id));
+
+        Ok(())
+    }
+
     fn read_all_output(
         registry: &mut PaneRuntimeRegistry,
         pane_id: PaneId,
@@ -551,6 +718,22 @@ mod tests {
         {
             let mut command = PtyCommand::new("sh");
             command.args(["-lc", &format!("printf '{marker}'")]);
+            command
+        }
+    }
+
+    fn finite_command(marker: &str) -> PtyCommand {
+        #[cfg(windows)]
+        {
+            let mut command = PtyCommand::new("cmd.exe");
+            command.args(["/C", "echo", marker]);
+            command
+        }
+
+        #[cfg(not(windows))]
+        {
+            let mut command = PtyCommand::new("sh");
+            command.args(["-lc", &format!("printf '{marker}\\n'")]);
             command
         }
     }
