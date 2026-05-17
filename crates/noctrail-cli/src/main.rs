@@ -1,3 +1,5 @@
+mod installer;
+
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -34,6 +36,7 @@ Commands:
   doctor shell  Print shell resolution diagnostics
   doctor gpu  Print GPU backend diagnostics
   doctor font Print font fallback diagnostics
+  installer-smoke Run the packaged installer lifecycle smoke
   shell-hook  Print a shell integration hook script
   hook-smoke  Run the shell hook compatibility smoke matrix
   replay      Replay one or more terminal recording fixtures
@@ -73,6 +76,12 @@ fn main() {
                     eprintln!("unknown doctor topic: {other}");
                     process::exit(2);
                 }
+            }
+        }
+        Some("installer-smoke") => {
+            if let Err(error) = installer::run_installer_smoke() {
+                eprintln!("{error}");
+                process::exit(1);
             }
         }
         Some("shell-hook") => {

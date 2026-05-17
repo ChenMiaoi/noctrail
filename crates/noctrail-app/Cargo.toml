@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
 description = "Desktop app shell for Noctrail."
 publish = false
 
@@ -25,3 +27,27 @@ toml = "0.9"
 [[bin]]
 name = "noctrail-app"
 path = "src/main.rs"
+
+[package.metadata.packager]
+product-name = "Noctrail"
+identifier = "com.chenmiaoi.noctrail"
+publisher = "Noctrail contributors"
+homepage = "https://github.com/ChenMiaoi/noctrail"
+description = "Desktop app shell for Noctrail."
+before-packaging-command = "cargo build -p noctrail-app --release"
+out-dir = "../../target/packager"
+binaries-dir = "../../target/release"
+resources = [
+    "../../README.md",
+    "../../LICENSES/LGPL-3.0-or-later.txt",
+]
+
+[package.metadata.generate-rpm]
+name = "noctrail"
+summary = "Desktop app shell for Noctrail."
+url = "https://github.com/ChenMiaoi/noctrail"
+assets = [
+    { source = "../../target/release/noctrail-app", dest = "/usr/bin/noctrail-app", mode = "755" },
+    { source = "../../README.md", dest = "/usr/share/doc/noctrail/README.md", mode = "644", doc = true },
+    { source = "../../LICENSES/LGPL-3.0-or-later.txt", dest = "/usr/share/licenses/noctrail/LGPL-3.0-or-later.txt", mode = "644", doc = true },
+]
