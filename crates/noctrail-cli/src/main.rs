@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use noctrail_config::{Config, LayoutSplitAxis, RendererBackend as ConfigRendererBackend};
 #[cfg(windows)]
 use noctrail_pty::ShellSource;
 use noctrail_pty::{PtySession, PtySize, ResolvedShell};
@@ -34,8 +35,11 @@ Usage:
 Commands:
   doctor      Print basic environment diagnostics
   doctor shell  Print shell resolution diagnostics
+  doctor pty  Print PTY spawn diagnostics
   doctor gpu  Print GPU backend diagnostics
   doctor font Print font fallback diagnostics
+  doctor config [path] Print config diagnostics
+  doctor permissions Print local path permission diagnostics
   installer-smoke Run the packaged installer lifecycle smoke
   shell-hook  Print a shell integration hook script
   hook-smoke  Run the shell hook compatibility smoke matrix
@@ -65,6 +69,12 @@ fn main() {
             match topic.as_deref() {
                 None => print_doctor(),
                 Some("shell") => print_doctor_shell(),
+                Some("pty") => {
+                    if let Err(error) = print_doctor_pty() {
+                        eprintln!("{error}");
+                        process::exit(1);
+                    }
+                }
                 Some("gpu") => {
                     if let Err(error) = print_doctor_gpu() {
                         eprintln!("{error}");
@@ -72,6 +82,19 @@ fn main() {
                     }
                 }
                 Some("font") => print_doctor_font(),
+                Some("config") => {
+                    let path = args.next().map(PathBuf::from);
+                    if let Err(error) = print_doctor_config(path.as_deref()) {
+                        eprintln!("{error}");
+                        process::exit(1);
+                    }
+                }
+                Some("permissions") => {
+                    if let Err(error) = print_doctor_permissions() {
+                        eprintln!("{error}");
+                        process::exit(1);
+                    }
+                }
                 Some(other) => {
                     eprintln!("unknown doctor topic: {other}");
                     process::exit(2);
@@ -174,7 +197,98 @@ fn print_doctor() {
     println!("noctrail {}", env!("CARGO_PKG_VERSION"));
     println!("target: {}", env::consts::OS);
     println!("arch: {}", env::consts::ARCH);
-    println!("hint: run `noctrail doctor shell` for shell diagnostics");
+    let shell = ResolvedShell::detect();
+    println!(
+        "shell={} source={}",
+        shell.command().program().to_string_lossy(),
+        shell.source().label()
+    );
+
+    match doctor_pty_summary() {
+        Ok(summary) => println!(
+            "pty=ok pid={} size={}x{}",
+            summary
+                .process_id
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            summary.size.cols,
+            summary.size.rows,
+        ),
+        Err(error) => println!("pty=error {error}"),
+    }
+
+    match doctor_gpu_summary() {
+        Ok(summary) => println!(
+            "gpu={} backend={:?} device={:?}",
+            summary.adapter_name, summary.backend, summary.device_type
+        ),
+        Err(error) => println!("gpu=error {error}"),
+    }
+
+    let font = doctor_font_summary();
+    println!(
+        "font.primary={} samples={}",
+        font.primary_label,
+        font.sample_statuses.join(",")
+    );
+
+    match doctor_config_summary(None) {
+        Ok(summary) => println!(
+            "config.path={} renderer={} split_axis={} workspace={} agent={}",
+            summary.path,
+            summary.renderer_backend,
+            summary.default_split_axis,
+            summary.startup_workspace,
+            on_off(summary.agent_enabled),
+        ),
+        Err(error) => println!("config=error {error}"),
+    }
+
+    match doctor_permissions_summary() {
+        Ok(summary) => {
+            println!(
+                "permissions.cwd_readable={} cwd_writable={} temp_writable={}",
+                summary.cwd_readable, summary.cwd_writable, summary.temp_writable
+            );
+            println!(
+                "permissions.home_readable={}",
+                summary
+                    .home_readable
+                    .map(|readable| readable.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
+        }
+        Err(error) => println!("permissions=error {error}"),
+    }
+}
+
+struct DoctorPtySummary {
+    process_id: Option<u32>,
+    size: PtySize,
+}
+
+struct DoctorConfigSummary {
+    path: String,
+    renderer_backend: &'static str,
+    default_split_axis: &'static str,
+    startup_workspace: u8,
+    agent_enabled: bool,
+}
+
+struct DoctorFontSummary {
+    primary_label: String,
+    sample_statuses: Vec<String>,
+}
+
+struct DoctorPermissionsSummary {
+    cwd_readable: bool,
+    cwd_writable: bool,
+    home_readable: Option<bool>,
+    temp_writable: bool,
+}
+
+fn on_off(enabled: bool) -> &'static str {
+    if enabled { "on" } else { "off" }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -632,6 +746,89 @@ struct PromptProbeReport {
     status: PromptProbeStatus,
 }
 
+fn doctor_pty_summary() -> Result<DoctorPtySummary, String> {
+    let probe = pty_smoke_probe("NOCTRAIL_DOCTOR_PTY")?;
+    let mut session = PtySession::spawn_shell(PtySize::new(80, 24))
+        .map_err(|error| format!("failed to spawn PTY shell: {error}"))?;
+    let process_id = session.process_id();
+    let size = session.size();
+    session
+        .write(&probe.input)
+        .map_err(|error| format!("failed to write PTY doctor probe: {error}"))?;
+    let output = read_all_output(&mut session)
+        .map_err(|error| format!("failed to read PTY doctor output: {error}"))?;
+    let _ = session.close();
+
+    let haystack = String::from_utf8_lossy(&output);
+    for expected in &probe.expected_fragments {
+        if !haystack.contains(expected) {
+            return Err(format!(
+                "doctor PTY probe output missing {:?}; output was {:?}",
+                expected, haystack
+            ));
+        }
+    }
+
+    Ok(DoctorPtySummary { process_id, size })
+}
+
+fn doctor_config_summary(path: Option<&Path>) -> Result<DoctorConfigSummary, String> {
+    let (path_label, config) = match path {
+        Some(path) => (
+            path.display().to_string(),
+            Config::load_from_path(path).map_err(|error| format!("{error}"))?,
+        ),
+        None => ("(default)".to_string(), Config::default()),
+    };
+
+    Ok(DoctorConfigSummary {
+        path: path_label,
+        renderer_backend: match config.renderer.backend {
+            ConfigRendererBackend::Gpu => "gpu",
+            ConfigRendererBackend::Software => "software",
+        },
+        default_split_axis: match config.layout.default_split_axis {
+            LayoutSplitAxis::Auto => "auto",
+            LayoutSplitAxis::Horizontal => "horizontal",
+            LayoutSplitAxis::Vertical => "vertical",
+        },
+        startup_workspace: config.layout.startup_workspace,
+        agent_enabled: config.agent.enabled,
+    })
+}
+
+fn doctor_font_summary() -> DoctorFontSummary {
+    let diagnostics = probe_font_diagnostics(&FontPreferences::default());
+    DoctorFontSummary {
+        primary_label: diagnostics
+            .primary
+            .resolved_family
+            .clone()
+            .unwrap_or_else(|| diagnostics.primary.requested_family.clone()),
+        sample_statuses: diagnostics
+            .samples
+            .iter()
+            .map(|sample| format!("{}={}", sample.label, sample.status.label()))
+            .collect(),
+    }
+}
+
+fn doctor_permissions_summary() -> Result<DoctorPermissionsSummary, String> {
+    let cwd = env::current_dir().map_err(|error| format!("failed to resolve cwd: {error}"))?;
+    let cwd_readable = directory_readable(&cwd);
+    let cwd_writable = directory_writable(&cwd);
+    let home = doctor_home_dir();
+    let home_readable = home.as_deref().map(directory_readable);
+    let temp_writable = directory_writable(&env::temp_dir());
+
+    Ok(DoctorPermissionsSummary {
+        cwd_readable,
+        cwd_writable,
+        home_readable,
+        temp_writable,
+    })
+}
+
 fn print_doctor_shell() {
     let shell = ResolvedShell::detect();
 
@@ -678,6 +875,20 @@ fn print_doctor_shell() {
             );
         }
     }
+}
+
+fn print_doctor_pty() -> Result<(), String> {
+    let summary = doctor_pty_summary()?;
+    println!(
+        "pty.status=ok\npty.pid={}\npty.size={}x{}",
+        summary
+            .process_id
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        summary.size.cols,
+        summary.size.rows,
+    );
+    Ok(())
 }
 
 fn run_tui_matrix(filters: &[String]) -> Result<(), String> {
@@ -2757,11 +2968,15 @@ fn make_executable_path(path: &Path) -> Result<(), String> {
 }
 
 fn print_doctor_gpu() -> Result<(), String> {
-    let diagnostics = probe_gpu_backend().map_err(|error| error.to_string())?;
+    let diagnostics = doctor_gpu_summary()?;
     println!("gpu.adapter={}", diagnostics.adapter_name);
     println!("gpu.backend={:?}", diagnostics.backend);
     println!("gpu.device_type={:?}", diagnostics.device_type);
     Ok(())
+}
+
+fn doctor_gpu_summary() -> Result<noctrail_render::GpuBackendDiagnostics, String> {
+    probe_gpu_backend().map_err(|error| error.to_string())
 }
 
 fn print_doctor_font() {
@@ -2936,6 +3151,63 @@ impl Default for FixtureBorder {
             inactive: default_inactive_border(),
         }
     }
+}
+
+fn print_doctor_config(path: Option<&Path>) -> Result<(), String> {
+    let summary = doctor_config_summary(path)?;
+    println!("config.path={}", summary.path);
+    println!("config.status=ok");
+    println!("config.renderer={}", summary.renderer_backend);
+    println!(
+        "config.layout.default_split_axis={}",
+        summary.default_split_axis
+    );
+    println!(
+        "config.layout.startup_workspace={}",
+        summary.startup_workspace
+    );
+    println!("config.agent.enabled={}", on_off(summary.agent_enabled));
+    Ok(())
+}
+
+fn print_doctor_permissions() -> Result<(), String> {
+    let summary = doctor_permissions_summary()?;
+    println!("permissions.cwd.readable={}", summary.cwd_readable);
+    println!("permissions.cwd.writable={}", summary.cwd_writable);
+    println!("permissions.temp.writable={}", summary.temp_writable);
+    println!(
+        "permissions.home.readable={}",
+        summary
+            .home_readable
+            .map(|readable| readable.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    Ok(())
+}
+
+fn doctor_home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+fn directory_readable(path: &Path) -> bool {
+    fs::read_dir(path).is_ok()
+}
+
+fn directory_writable(path: &Path) -> bool {
+    let probe_name = format!(
+        ".noctrail-doctor-write-{}-{}",
+        process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    );
+    let probe_path = path.join(probe_name);
+    let wrote = fs::write(&probe_path, b"ok").is_ok();
+    let _ = fs::remove_file(&probe_path);
+    wrote
 }
 
 #[derive(Debug, Deserialize)]

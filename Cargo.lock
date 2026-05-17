@@ -1270,6 +1270,7 @@ name = "noctrail-cli"
 version = "0.1.0"
 dependencies = [
  "glob",
+ "noctrail-config",
  "noctrail-pty",
  "noctrail-render",
  "noctrail-runtime",
