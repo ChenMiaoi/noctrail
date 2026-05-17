@@ -1,7 +1,8 @@
 use std::{
-    env,
+    env, fs, panic,
     path::PathBuf,
     process,
+    sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -23,6 +24,7 @@ Usage:
   noctrail-app [command] [options]
 
 Commands:
+  crash-smoke Run the panic-hook recovery probe
   gui       Open the GUI shell window (default)
   perf-smoke Run the performance smoke probe
   soak-smoke Run the split/close/resize soak probe
@@ -44,6 +46,7 @@ struct StartupOptions {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartupCommand {
+    CrashSmoke,
     Gui,
     PerfSmoke,
     SoakSmoke,
@@ -74,6 +77,7 @@ struct VisualEffectsMode {
 }
 
 fn main() {
+    install_process_panic_hook(crash_diagnostic_path());
     let args = env::args().skip(1).collect::<Vec<_>>();
     let options = match parse_startup_options(&args) {
         Ok(options) => options,
@@ -91,6 +95,12 @@ fn main() {
 
     match options.command {
         StartupCommand::Help => print!("{HELP}"),
+        StartupCommand::CrashSmoke => {
+            if let Err(error) = run_crash_smoke() {
+                eprintln!("{error}");
+                process::exit(1);
+            }
+        }
         StartupCommand::Gui => {
             if let Err(error) = run_gui(&options) {
                 eprintln!("{error}");
@@ -127,6 +137,10 @@ fn parse_startup_options(args: &[String]) -> Result<StartupOptions, StartupError
 
     while index < args.len() {
         match args[index].as_str() {
+            "crash-smoke" if !command_set => {
+                command = StartupCommand::CrashSmoke;
+                command_set = true;
+            }
             "gui" | "run" if !command_set => {
                 command = StartupCommand::Gui;
                 command_set = true;
@@ -208,6 +222,35 @@ fn load_config(options: &StartupOptions) -> Result<Config, StartupError> {
 
 fn run_gui(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>> {
     gui::run_with_options(resolve_launch_options(options)?)?;
+    Ok(())
+}
+
+fn run_crash_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    let diagnostic_path = crash_diagnostic_path();
+    let _ = fs::remove_file(&diagnostic_path);
+    let _guard = panic_hook_lock()
+        .lock()
+        .expect("panic hook test lock should be available");
+    let previous = panic::take_hook();
+    panic::set_hook(build_panic_hook(diagnostic_path.clone()));
+
+    let panic_result = panic::catch_unwind(|| {
+        panic!("crash smoke token=sk-live-secret password=hunter2");
+    });
+
+    let _ = panic::take_hook();
+    panic::set_hook(previous);
+    if panic_result.is_ok() {
+        return Err("crash smoke did not panic".into());
+    }
+
+    let diagnostic = fs::read_to_string(&diagnostic_path)?;
+    if diagnostic.contains("sk-live-secret") || diagnostic.contains("hunter2") {
+        return Err("crash diagnostic leaked an unredacted secret".into());
+    }
+
+    println!("crash_diagnostic={}", diagnostic_path.display());
+    println!("crash smoke ok");
     Ok(())
 }
 
@@ -438,6 +481,96 @@ fn run_soak_cycles(
         let _ = app.frame();
     }
     Ok(())
+}
+
+fn install_process_panic_hook(path: PathBuf) {
+    let _guard = panic_hook_lock()
+        .lock()
+        .expect("panic hook lock should be available");
+    let _ = panic::take_hook();
+    panic::set_hook(build_panic_hook(path));
+}
+
+fn build_panic_hook(
+    path: PathBuf,
+) -> Box<dyn Fn(&panic::PanicHookInfo<'_>) + Sync + Send + 'static> {
+    Box::new(move |info| {
+        let _ = write_crash_diagnostic(&path, info);
+        eprintln!("noctrail panic diagnostic written to {}", path.display());
+    })
+}
+
+fn crash_diagnostic_path() -> PathBuf {
+    env::temp_dir().join("noctrail-last-diagnostic.log")
+}
+
+fn write_crash_diagnostic(
+    path: &std::path::Path,
+    info: &panic::PanicHookInfo<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let message = redact_diagnostic_text(&panic_payload_text(info));
+    let location = info
+        .location()
+        .map(|location| format!("{}:{}", location.file(), location.line()))
+        .unwrap_or_else(|| "unknown".to_string());
+    let command_line = redact_diagnostic_text(&env::args().collect::<Vec<_>>().join(" "));
+    let diagnostic = format!(
+        "pid={}\nlocation={}\nmessage={}\ncommand={}\n",
+        process::id(),
+        location,
+        message,
+        command_line,
+    );
+    fs::write(path, diagnostic)?;
+    Ok(())
+}
+
+fn panic_payload_text(info: &panic::PanicHookInfo<'_>) -> String {
+    if let Some(message) = info.payload().downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = info.payload().downcast_ref::<String>() {
+        return message.clone();
+    }
+
+    "non-string panic payload".to_string()
+}
+
+fn redact_diagnostic_text(text: &str) -> String {
+    let mut redacted = text.to_string();
+    for marker in [
+        "token=",
+        "password=",
+        "secret=",
+        "api_key=",
+        "authorization=",
+        "Bearer ",
+        "sk-",
+        "ghp_",
+    ] {
+        redacted = redact_after_marker(&redacted, marker);
+    }
+    redacted
+}
+
+fn redact_after_marker(text: &str, marker: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = 0;
+
+    while let Some(found) = text[cursor..].find(marker) {
+        let start = cursor + found;
+        let value_start = start + marker.len();
+        result.push_str(&text[cursor..value_start]);
+        let value_end = text[value_start..]
+            .find(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | '"' | '\''))
+            .map(|offset| value_start + offset)
+            .unwrap_or(text.len());
+        result.push_str("[REDACTED]");
+        cursor = value_end;
+    }
+
+    result.push_str(&text[cursor..]);
+    result
 }
 
 fn read_all_runtime_output(app: &mut DesktopApp) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -759,6 +892,11 @@ fn parse_rss_kb(text: &str) -> Option<u64> {
         .find_map(|token| token.parse::<u64>().ok())
 }
 
+fn panic_hook_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn p95_millis(samples: &mut [Duration]) -> f64 {
     samples.sort_unstable();
     let index = ((samples.len().saturating_sub(1)) * 95) / 100;
@@ -801,6 +939,16 @@ mod tests {
             Some(PathBuf::from("/tmp/noctrail.toml"))
         );
         assert!(options.safe_mode);
+    }
+
+    #[test]
+    fn parses_crash_smoke_command() {
+        let options =
+            parse_startup_options(&["crash-smoke".to_string()]).expect("options should parse");
+
+        assert_eq!(options.command, StartupCommand::CrashSmoke);
+        assert_eq!(options.config_path, None);
+        assert!(!options.safe_mode);
     }
 
     #[test]
@@ -1038,6 +1186,41 @@ mod tests {
     fn parse_rss_kb_extracts_the_numeric_column() {
         assert_eq!(parse_rss_kb("  12345\n"), Some(12_345));
         assert_eq!(parse_rss_kb("rss\n"), None);
+    }
+
+    #[test]
+    fn redaction_masks_secret_markers() {
+        let redacted =
+            redact_diagnostic_text("token=abc password=hunter2 Bearer ghp_example sk-live-secret");
+
+        assert!(!redacted.contains("hunter2"));
+        assert!(!redacted.contains("ghp_example"));
+        assert!(!redacted.contains("sk-live-secret"));
+        assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn crash_hook_writes_redacted_diagnostic() {
+        let _guard = panic_hook_lock()
+            .lock()
+            .expect("panic hook lock should be available");
+        let path = temp_config_path("crash-diag");
+        let previous = panic::take_hook();
+        panic::set_hook(build_panic_hook(path.clone()));
+
+        let result = panic::catch_unwind(|| {
+            panic!("boom token=sk-live-secret");
+        });
+
+        let _ = panic::take_hook();
+        panic::set_hook(previous);
+        assert!(result.is_err());
+
+        let diagnostic = fs::read_to_string(&path).expect("diagnostic should exist");
+        assert!(diagnostic.contains("message=boom token=[REDACTED]"));
+        assert!(!diagnostic.contains("sk-live-secret"));
+
+        let _ = fs::remove_file(path);
     }
 
     fn temp_config_path(label: &str) -> PathBuf {
