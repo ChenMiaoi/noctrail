@@ -9,3 +9,4 @@ description = "Render plan and backend boundary for Noctrail."
 publish = false
 
 [dependencies]
+noctrail-term = { path = "../noctrail-term" }
