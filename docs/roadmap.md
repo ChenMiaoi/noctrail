@@ -664,11 +664,15 @@ Beta 阻断项：
 docs/
   roadmap.md
   rendering-architecture-and-selection.md
+  config-reference.md
+  privacy-security.md
+  release-blockers.md
+  rendering-ecosystem-notes.md
   adr/
-    0001-terminal-core-first.md
-    0002-crate-boundaries.md
-    0003-runtime-event-model.md
-    0004-renderer-wgpu-text-stack.md
+    0001-crate-boundaries.md
+    0002-renderer-wgpu-text-stack.md
+    0003-terminal-core-first.md
+    0004-runtime-event-model.md
     0005-agent-deferred-review-boundary.md
   specs/
     terminal-state.md
@@ -687,6 +691,7 @@ docs/
 原则：
 
 - `roadmap.md` 写“做什么、顺序、验收、阻断项”。
+- `rendering-architecture-and-selection.md` 写当前可执行的渲染边界。
 - `adr/` 写“为什么这么选”。
 - `specs/` 写“具体协议和数据结构”。
 - `test-matrix/` 写“如何验证”。
