@@ -9,3 +9,5 @@ description = "Pane runtime registry boundary for Noctrail."
 publish = false
 
 [dependencies]
+noctrail-pty = { path = "../noctrail-pty" }
+thiserror = "2"
