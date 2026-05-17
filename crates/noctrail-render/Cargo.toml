@@ -9,6 +9,7 @@ description = "Render plan and backend boundary for Noctrail."
 publish = false
 
 [dependencies]
+cosmic-text = { version = "0.19", features = ["monospace_fallback"] }
 noctrail-term = { path = "../noctrail-term" }
 pollster = "0.4"
 thiserror = "2"

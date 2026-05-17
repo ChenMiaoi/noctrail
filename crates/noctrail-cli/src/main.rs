@@ -3,7 +3,10 @@ use std::{env, path::PathBuf, process, thread, time::Duration};
 #[cfg(windows)]
 use noctrail_pty::ShellSource;
 use noctrail_pty::{PtySession, PtySize, ResolvedShell};
-use noctrail_render::{RenderBackend, RenderPlan, RenderRect, probe_gpu_backend};
+use noctrail_render::{
+    FontDiagnostics, FontFamilyDiagnostics, FontPreferences, RenderBackend, RenderPlan, RenderRect,
+    probe_font_diagnostics, probe_gpu_backend,
+};
 use noctrail_runtime::{PaneId, PaneRuntimeRegistry, RuntimeCommand, RuntimeEvent};
 use noctrail_term::recording::replay_recording_file;
 use noctrail_term::{Cell, Color, Cursor, ScreenRowSnapshot, Style, TerminalSnapshot};
@@ -18,6 +21,7 @@ Commands:
   doctor      Print basic environment diagnostics
   doctor shell  Print shell resolution diagnostics
   doctor gpu  Print GPU backend diagnostics
+  doctor font Print font fallback diagnostics
   replay      Replay one or more terminal recording fixtures
   render-smoke Run the render smoke check
   pty-smoke   Run the PTY smoke check
@@ -45,6 +49,7 @@ fn main() {
                         process::exit(1);
                     }
                 }
+                Some("font") => print_doctor_font(),
                 Some(other) => {
                     eprintln!("unknown doctor topic: {other}");
                     process::exit(2);
@@ -143,6 +148,75 @@ fn print_doctor_gpu() -> Result<(), String> {
     println!("gpu.backend={:?}", diagnostics.backend);
     println!("gpu.device_type={:?}", diagnostics.device_type);
     Ok(())
+}
+
+fn print_doctor_font() {
+    let diagnostics = probe_font_diagnostics(&FontPreferences::default());
+
+    println!("font.locale={}", diagnostics.locale);
+    println!("font.primary.size={}", diagnostics.preferences.size);
+    print_font_family("font.primary", &diagnostics.primary);
+
+    for (index, fallback) in diagnostics.fallbacks.iter().enumerate() {
+        print_font_family(&format!("font.fallback.{}", index + 1), fallback);
+    }
+
+    for sample in &diagnostics.samples {
+        println!("font.sample.{}.text={}", sample.label, sample.text);
+        println!(
+            "font.sample.{}.status={}",
+            sample.label,
+            sample.status.label()
+        );
+        if sample.fonts.is_empty() {
+            println!("font.sample.{}.fonts=(none)", sample.label);
+        } else {
+            println!(
+                "font.sample.{}.fonts={}",
+                sample.label,
+                sample.fonts.join(", ")
+            );
+        }
+        if sample.missing_glyphs.is_empty() {
+            println!("font.sample.{}.missing=(none)", sample.label);
+        } else {
+            println!(
+                "font.sample.{}.missing={}",
+                sample.label,
+                sample.missing_glyphs.join(" ")
+            );
+        }
+    }
+
+    print_font_logs(&diagnostics);
+}
+
+fn print_font_family(prefix: &str, diagnostics: &FontFamilyDiagnostics) {
+    println!("{prefix}.requested={}", diagnostics.requested_family);
+    println!("{prefix}.resolution={}", diagnostics.resolution.label());
+    match &diagnostics.resolved_family {
+        Some(family) => println!("{prefix}.resolved_family={family}"),
+        None => println!("{prefix}.resolved_family=(missing)"),
+    }
+    match &diagnostics.resolved_post_script_name {
+        Some(name) => println!("{prefix}.resolved_postscript={name}"),
+        None => println!("{prefix}.resolved_postscript=(missing)"),
+    }
+    match diagnostics.monospaced {
+        Some(monospaced) => println!("{prefix}.monospaced={monospaced}"),
+        None => println!("{prefix}.monospaced=(unknown)"),
+    }
+}
+
+fn print_font_logs(diagnostics: &FontDiagnostics) {
+    if diagnostics.logs.is_empty() {
+        println!("font.logs=(none)");
+        return;
+    }
+
+    for (index, log) in diagnostics.logs.iter().enumerate() {
+        println!("font.log.{}={log}", index + 1);
+    }
 }
 
 fn replay_fixtures(patterns: &[String]) -> Result<(), String> {

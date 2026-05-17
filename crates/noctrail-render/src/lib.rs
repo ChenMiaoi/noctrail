@@ -2,6 +2,10 @@
 
 use std::sync::Arc;
 
+use cosmic_text::{
+    Attrs as FontAttrs, Buffer as FontBuffer, Family as FontFamily, FontSystem, Metrics, Shaping,
+    fontdb::{self, Query},
+};
 use noctrail_term::{
     Cell, Cursor, DamageSet, ScreenRowSnapshot, Selection, Style, TerminalSnapshot,
 };
@@ -161,6 +165,419 @@ impl RenderPlan {
 
 #[derive(Debug, Default)]
 pub struct RenderSurface;
+
+const DEFAULT_FONT_FAMILY: &str = "JetBrainsMono Nerd Font";
+const DEFAULT_FONT_SIZE: f32 = 14.0;
+const DEFAULT_FONT_FALLBACKS: [&str; 4] = [
+    "Noto Sans CJK SC",
+    "Noto Color Emoji",
+    "Apple Color Emoji",
+    "Segoe UI Emoji",
+];
+const FONT_SAMPLE_ASCII: &str = "abcXYZ 0123";
+const FONT_SAMPLE_CJK: &str = "你好，世界";
+const FONT_SAMPLE_EMOJI: &str = "🙂🧪🚀";
+const FONT_SAMPLE_NERD: &str = "\u{e0b0} \u{f417} \u{f120}";
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FontPreferences {
+    pub family: String,
+    pub size: f32,
+    pub fallback: Vec<String>,
+}
+
+impl Default for FontPreferences {
+    fn default() -> Self {
+        Self {
+            family: DEFAULT_FONT_FAMILY.to_string(),
+            size: DEFAULT_FONT_SIZE,
+            fallback: default_font_fallbacks(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FontFamilyResolution {
+    Requested,
+    SystemMonospaceFallback,
+    Missing,
+}
+
+impl FontFamilyResolution {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::SystemMonospaceFallback => "system-monospace-fallback",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FontFamilyDiagnostics {
+    pub requested_family: String,
+    pub resolution: FontFamilyResolution,
+    pub resolved_family: Option<String>,
+    pub resolved_post_script_name: Option<String>,
+    pub monospaced: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FontSampleStatus {
+    Primary,
+    Fallback,
+    Missing,
+}
+
+impl FontSampleStatus {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Fallback => "fallback",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FontSampleDiagnostics {
+    pub label: &'static str,
+    pub text: String,
+    pub status: FontSampleStatus,
+    pub fonts: Vec<String>,
+    pub missing_glyphs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FontDiagnostics {
+    pub locale: String,
+    pub preferences: FontPreferences,
+    pub primary: FontFamilyDiagnostics,
+    pub fallbacks: Vec<FontFamilyDiagnostics>,
+    pub samples: Vec<FontSampleDiagnostics>,
+    pub logs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FontCandidate {
+    id: fontdb::ID,
+    label: String,
+}
+
+pub fn probe_font_diagnostics(preferences: &FontPreferences) -> FontDiagnostics {
+    let mut font_system = FontSystem::new();
+    collect_font_diagnostics(&mut font_system, preferences)
+}
+
+fn collect_font_diagnostics(
+    font_system: &mut FontSystem,
+    preferences: &FontPreferences,
+) -> FontDiagnostics {
+    let locale = font_system.locale().to_string();
+    let (primary, primary_candidate, mut logs) =
+        resolve_primary_family(font_system.db(), &preferences.family);
+
+    let mut fallbacks = Vec::with_capacity(preferences.fallback.len());
+    for family in &preferences.fallback {
+        let (diagnostics, candidate, fallback_logs) =
+            resolve_requested_family(font_system.db(), family);
+        fallbacks.push(diagnostics);
+        let _ = candidate;
+        logs.extend(fallback_logs);
+    }
+
+    let samples = if font_system.db().faces().next().is_none() {
+        sample_definitions()
+            .iter()
+            .map(|(label, text)| FontSampleDiagnostics {
+                label,
+                text: (*text).to_string(),
+                status: FontSampleStatus::Missing,
+                fonts: Vec::new(),
+                missing_glyphs: text
+                    .chars()
+                    .filter(|ch| !ch.is_whitespace())
+                    .map(|ch| ch.to_string())
+                    .collect(),
+            })
+            .collect()
+    } else {
+        sample_definitions()
+            .iter()
+            .map(|(label, text)| {
+                diagnose_font_sample(
+                    font_system,
+                    preferences,
+                    primary_candidate.as_ref(),
+                    label,
+                    text,
+                )
+            })
+            .collect()
+    };
+
+    FontDiagnostics {
+        locale,
+        preferences: preferences.clone(),
+        primary,
+        fallbacks,
+        samples,
+        logs,
+    }
+}
+
+fn resolve_primary_family(
+    db: &fontdb::Database,
+    requested_family: &str,
+) -> (FontFamilyDiagnostics, Option<FontCandidate>, Vec<String>) {
+    if let Some(face) = query_family_face(db, FontFamily::Name(requested_family)) {
+        return (
+            FontFamilyDiagnostics {
+                requested_family: requested_family.to_string(),
+                resolution: FontFamilyResolution::Requested,
+                resolved_family: face.families.first().map(|(family, _)| family.clone()),
+                resolved_post_script_name: Some(face.post_script_name.clone()),
+                monospaced: Some(face.monospaced),
+            },
+            Some(FontCandidate {
+                id: face.id,
+                label: font_face_label(face),
+            }),
+            Vec::new(),
+        );
+    }
+
+    if let Some(face) = preferred_system_monospace_face(db) {
+        return (
+            FontFamilyDiagnostics {
+                requested_family: requested_family.to_string(),
+                resolution: FontFamilyResolution::SystemMonospaceFallback,
+                resolved_family: face.families.first().map(|(family, _)| family.clone()),
+                resolved_post_script_name: Some(face.post_script_name.clone()),
+                monospaced: Some(face.monospaced),
+            },
+            Some(FontCandidate {
+                id: face.id,
+                label: font_face_label(face),
+            }),
+            vec![format!(
+                "requested primary family {:?} unavailable; using system monospace {:?}",
+                requested_family,
+                face.families
+                    .first()
+                    .map(|(family, _)| family.as_str())
+                    .unwrap_or(face.post_script_name.as_str())
+            )],
+        );
+    }
+
+    (
+        FontFamilyDiagnostics {
+            requested_family: requested_family.to_string(),
+            resolution: FontFamilyResolution::Missing,
+            resolved_family: None,
+            resolved_post_script_name: None,
+            monospaced: None,
+        },
+        None,
+        vec![format!(
+            "requested primary family {:?} unavailable and no system monospace face was found",
+            requested_family
+        )],
+    )
+}
+
+fn default_font_fallbacks() -> Vec<String> {
+    let mut fallback = DEFAULT_FONT_FALLBACKS
+        .iter()
+        .map(|family| (*family).to_string())
+        .collect::<Vec<_>>();
+
+    #[cfg(target_os = "macos")]
+    fallback.insert(1, "PingFang SC".to_string());
+
+    #[cfg(windows)]
+    fallback.insert(1, "Microsoft YaHei UI".to_string());
+
+    fallback
+}
+
+fn resolve_requested_family(
+    db: &fontdb::Database,
+    requested_family: &str,
+) -> (FontFamilyDiagnostics, Option<FontCandidate>, Vec<String>) {
+    if let Some(face) = query_family_face(db, FontFamily::Name(requested_family)) {
+        return (
+            FontFamilyDiagnostics {
+                requested_family: requested_family.to_string(),
+                resolution: FontFamilyResolution::Requested,
+                resolved_family: face.families.first().map(|(family, _)| family.clone()),
+                resolved_post_script_name: Some(face.post_script_name.clone()),
+                monospaced: Some(face.monospaced),
+            },
+            Some(FontCandidate {
+                id: face.id,
+                label: font_face_label(face),
+            }),
+            Vec::new(),
+        );
+    }
+
+    (
+        FontFamilyDiagnostics {
+            requested_family: requested_family.to_string(),
+            resolution: FontFamilyResolution::Missing,
+            resolved_family: None,
+            resolved_post_script_name: None,
+            monospaced: None,
+        },
+        None,
+        vec![format!(
+            "requested fallback family {:?} unavailable",
+            requested_family
+        )],
+    )
+}
+
+fn query_family_face<'a>(
+    db: &'a fontdb::Database,
+    family: FontFamily<'_>,
+) -> Option<&'a fontdb::FaceInfo> {
+    let attrs = FontAttrs::new().family(family);
+    let query = Query {
+        families: &[attrs.family],
+        weight: attrs.weight,
+        stretch: attrs.stretch,
+        style: attrs.style,
+    };
+
+    db.query(&query).and_then(|id| db.face(id))
+}
+
+fn preferred_system_monospace_face(db: &fontdb::Database) -> Option<&fontdb::FaceInfo> {
+    for family in preferred_system_monospace_families() {
+        if let Some(face) = query_family_face(db, FontFamily::Name(family)) {
+            return Some(face);
+        }
+    }
+
+    db.faces()
+        .filter(|face| face.monospaced && !face.post_script_name.contains("Emoji"))
+        .min_by_key(|face| {
+            (
+                !face.families[0].0.contains("Mono"),
+                face.post_script_name.as_str(),
+            )
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn preferred_system_monospace_families() -> &'static [&'static str] {
+    &["SF Mono", "Menlo", "Monaco"]
+}
+
+#[cfg(windows)]
+fn preferred_system_monospace_families() -> &'static [&'static str] {
+    &["Cascadia Mono", "Consolas", "Lucida Console"]
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn preferred_system_monospace_families() -> &'static [&'static str] {
+    &["Noto Sans Mono", "DejaVu Sans Mono", "Liberation Mono"]
+}
+
+fn font_face_label(face: &fontdb::FaceInfo) -> String {
+    let family = face
+        .families
+        .first()
+        .map(|(family, _)| family.as_str())
+        .unwrap_or(face.post_script_name.as_str());
+    format!("{family} ({})", face.post_script_name)
+}
+
+fn sample_definitions() -> [(&'static str, &'static str); 4] {
+    [
+        ("ascii", FONT_SAMPLE_ASCII),
+        ("cjk", FONT_SAMPLE_CJK),
+        ("emoji", FONT_SAMPLE_EMOJI),
+        ("nerd", FONT_SAMPLE_NERD),
+    ]
+}
+
+fn diagnose_font_sample(
+    font_system: &mut FontSystem,
+    preferences: &FontPreferences,
+    primary_candidate: Option<&FontCandidate>,
+    label: &'static str,
+    text: &str,
+) -> FontSampleDiagnostics {
+    let metrics = Metrics::new(preferences.size, preferences.size * 1.4);
+    let attrs = FontAttrs::new()
+        .family(FontFamily::Name(&preferences.family))
+        .metrics(metrics);
+    let glyphs = {
+        let mut buffer = FontBuffer::new(font_system, metrics);
+        let mut buffer = buffer.borrow_with(font_system);
+        let width = (text.chars().count().max(1) as f32) * preferences.size * 2.0;
+        buffer.set_size(Some(width), Some(metrics.line_height * 2.0));
+        buffer.set_text(text, &attrs, Shaping::Advanced, None);
+        buffer
+            .layout_runs()
+            .flat_map(|run| {
+                run.glyphs
+                    .iter()
+                    .map(|glyph| (glyph.start, glyph.end, glyph.font_id, glyph.glyph_id))
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut fonts = Vec::new();
+    let mut missing_glyphs = Vec::new();
+    let mut used_fallback = false;
+
+    for (start, ch) in text.char_indices() {
+        if ch.is_whitespace() {
+            continue;
+        }
+
+        let glyph = ch.to_string();
+        let end = start + ch.len_utf8();
+        let matched_glyph = glyphs.iter().find(|(glyph_start, glyph_end, _, glyph_id)| {
+            *glyph_start <= start && *glyph_end >= end && *glyph_id != 0
+        });
+
+        if let Some((_, _, font_id, _)) = matched_glyph {
+            if Some(*font_id) != primary_candidate.map(|candidate| candidate.id) {
+                used_fallback = true;
+            }
+            let font_label = font_system
+                .db()
+                .face(*font_id)
+                .map(font_face_label)
+                .unwrap_or_else(|| format!("unknown-face-{font_id}"));
+            if !fonts.iter().any(|font| font == &font_label) {
+                fonts.push(font_label);
+            }
+        } else if !missing_glyphs.iter().any(|missing| missing == &glyph) {
+            missing_glyphs.push(glyph);
+        }
+    }
+
+    let status = if !missing_glyphs.is_empty() {
+        FontSampleStatus::Missing
+    } else if used_fallback || primary_candidate.is_none() {
+        FontSampleStatus::Fallback
+    } else {
+        FontSampleStatus::Primary
+    };
+
+    FontSampleDiagnostics {
+        label,
+        text: text.to_string(),
+        status,
+        fonts,
+        missing_glyphs,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuDiagnostics {
@@ -395,6 +812,7 @@ pub fn probe_gpu_backend() -> Result<GpuBackendDiagnostics, GpuRendererError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cosmic_text::fontdb;
     use noctrail_term::{Color, ScreenRowSnapshot, SelectionMode};
 
     fn cell(text: &str) -> Cell {
@@ -509,6 +927,44 @@ mod tests {
 
         assert_eq!(plan.rows[0].glyphs[0].text, "e\u{301}");
         assert_eq!(plan.rows[0].glyphs[0].span, 1);
+    }
+
+    #[test]
+    fn default_font_preferences_match_rendering_note() {
+        let preferences = FontPreferences::default();
+
+        assert_eq!(preferences.family, DEFAULT_FONT_FAMILY);
+        assert_eq!(preferences.size, DEFAULT_FONT_SIZE);
+        for family in DEFAULT_FONT_FALLBACKS {
+            assert!(preferences.fallback.iter().any(|item| item == family));
+        }
+    }
+
+    #[test]
+    fn font_diagnostics_report_missing_fonts_in_empty_database() {
+        let mut font_system =
+            FontSystem::new_with_locale_and_db("en-US".to_string(), fontdb::Database::new());
+
+        let diagnostics = collect_font_diagnostics(&mut font_system, &FontPreferences::default());
+
+        assert_eq!(
+            diagnostics.primary.resolution,
+            FontFamilyResolution::Missing
+        );
+        assert_eq!(diagnostics.fallbacks.len(), default_font_fallbacks().len());
+        assert!(
+            diagnostics
+                .fallbacks
+                .iter()
+                .all(|fallback| fallback.resolution == FontFamilyResolution::Missing)
+        );
+        assert!(
+            diagnostics
+                .samples
+                .iter()
+                .all(|sample| sample.status == FontSampleStatus::Missing)
+        );
+        assert!(!diagnostics.logs.is_empty());
     }
 
     #[test]
