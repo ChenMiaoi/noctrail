@@ -1,13 +1,13 @@
 //! Desktop app shell for Noctrail.
 
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
 mod clipboard;
 
 pub mod gui;
 pub mod input;
 
-use noctrail_layout::LayoutRect;
+use noctrail_layout::{LayoutError, LayoutRect, LayoutTree, PaneLayout};
 use noctrail_pty::{PtyCommand, PtyError, PtyExitStatus, PtySize};
 use noctrail_render::{RenderBackend, RenderInput, RenderPlan, RenderRect};
 use noctrail_runtime::{PaneId, PaneRuntime};
@@ -23,6 +23,14 @@ const ROOT_PANE_ID: PaneId = PaneId::new(1);
 pub enum AppError {
     #[error("the active pane does not have a runtime")]
     MissingRuntime,
+    #[error("the desktop app does not have an active pane")]
+    MissingActivePane,
+    #[error("pane {0:?} was not found")]
+    PaneNotFound(PaneId),
+    #[error("pane id space exhausted")]
+    PaneIdExhausted,
+    #[error(transparent)]
+    Layout(#[from] LayoutError),
     #[error(transparent)]
     Pty(#[from] PtyError),
 }
@@ -311,24 +319,21 @@ pub struct DesktopFrame {
 pub struct DesktopApp {
     surface: LayoutRect,
     backend: RenderBackend,
-    pane: TerminalPane,
+    layout: LayoutTree,
+    panes: HashMap<PaneId, TerminalPane>,
+    next_pane_id: u64,
 }
 
 impl DesktopApp {
     pub fn new(surface: LayoutRect, terminal_size: PtySize) -> Self {
-        Self {
-            surface,
-            backend: RenderBackend::default(),
-            pane: TerminalPane::new(ROOT_PANE_ID, terminal_size),
-        }
+        Self::from_root_pane(surface, TerminalPane::new(ROOT_PANE_ID, terminal_size))
     }
 
     pub fn spawn_shell(surface: LayoutRect, terminal_size: PtySize) -> Result<Self, AppError> {
-        Ok(Self {
+        Ok(Self::from_root_pane(
             surface,
-            backend: RenderBackend::default(),
-            pane: TerminalPane::spawn_shell(ROOT_PANE_ID, terminal_size)?,
-        })
+            TerminalPane::spawn_shell(ROOT_PANE_ID, terminal_size)?,
+        ))
     }
 
     pub fn spawn(
@@ -336,11 +341,10 @@ impl DesktopApp {
         command: PtyCommand,
         terminal_size: PtySize,
     ) -> Result<Self, AppError> {
-        Ok(Self {
+        Ok(Self::from_root_pane(
             surface,
-            backend: RenderBackend::default(),
-            pane: TerminalPane::spawn(ROOT_PANE_ID, command, terminal_size)?,
-        })
+            TerminalPane::spawn(ROOT_PANE_ID, command, terminal_size)?,
+        ))
     }
 
     pub fn backend(&self) -> RenderBackend {
@@ -355,72 +359,171 @@ impl DesktopApp {
         self.surface
     }
 
+    pub fn active_pane_id(&self) -> Option<PaneId> {
+        self.layout.active_pane()
+    }
+
+    pub fn pane_count(&self) -> usize {
+        self.panes.len()
+    }
+
+    pub fn pane_layouts(&self) -> Vec<PaneLayout> {
+        self.layout.arrange(self.surface)
+    }
+
     pub fn pane(&self) -> &TerminalPane {
-        &self.pane
+        self.active_pane_ref()
     }
 
     pub fn pane_mut(&mut self) -> &mut TerminalPane {
-        &mut self.pane
+        self.active_pane_mut()
+    }
+
+    pub fn pane_by_id(&self, pane_id: PaneId) -> Option<&TerminalPane> {
+        self.panes.get(&pane_id)
+    }
+
+    pub fn pane_mut_by_id(&mut self, pane_id: PaneId) -> Option<&mut TerminalPane> {
+        self.panes.get_mut(&pane_id)
+    }
+
+    pub fn split_active_pane_shell(&mut self) -> Result<PaneId, AppError> {
+        self.split_active_pane_with(PtyCommand::shell())
+    }
+
+    pub fn split_active_pane_with(&mut self, command: PtyCommand) -> Result<PaneId, AppError> {
+        let new_pane_id = self.allocate_pane_id()?;
+        let terminal_size = self.active_pane_ref().terminal_size();
+        let pane = TerminalPane::spawn(new_pane_id, command, terminal_size)?;
+
+        self.layout.split_active(new_pane_id, self.surface)?;
+        self.panes.insert(new_pane_id, pane);
+        Ok(new_pane_id)
     }
 
     pub fn advance_output(&mut self, bytes: &[u8]) {
-        self.pane.advance_output(bytes);
+        self.active_pane_mut().advance_output(bytes);
     }
 
     pub fn write_input(&mut self, bytes: &[u8]) -> Result<usize, AppError> {
-        self.pane.write_input(bytes)
+        self.active_pane_mut().write_input(bytes)
     }
 
     pub fn paste_text(&mut self, text: &str) -> Result<usize, AppError> {
-        self.pane.paste_text(text)
+        self.active_pane_mut().paste_text(text)
     }
 
     pub fn copy_selection_text(&self) -> Option<String> {
-        self.pane.copy_selection_text()
+        self.active_pane_ref().copy_selection_text()
     }
 
     pub fn mouse_tracking_mode(&self) -> MouseTrackingMode {
-        self.pane.mouse_tracking_mode()
+        self.active_pane_ref().mouse_tracking_mode()
     }
 
     pub fn mouse_reporting_enabled(&self) -> bool {
-        self.pane.mouse_reporting_enabled()
+        self.active_pane_ref().mouse_reporting_enabled()
     }
 
     pub fn sgr_mouse_mode(&self) -> bool {
-        self.pane.sgr_mouse_mode()
+        self.active_pane_ref().sgr_mouse_mode()
     }
 
     pub fn resize(&mut self, surface: LayoutRect, terminal_size: PtySize) -> Result<(), AppError> {
-        self.pane.resize(terminal_size)?;
         self.surface = surface;
+        for pane in self.panes.values_mut() {
+            pane.resize(terminal_size)?;
+        }
         Ok(())
     }
 
     pub fn scroll_scrollback(&mut self, delta_lines: i32) {
-        self.pane.scroll_scrollback(delta_lines);
+        self.active_pane_mut().scroll_scrollback(delta_lines);
     }
 
     pub fn select_viewport_range(&mut self, start: Position, end: Position, mode: SelectionMode) {
-        self.pane.select_viewport_range(start, end, mode);
+        self.active_pane_mut()
+            .select_viewport_range(start, end, mode);
     }
 
     pub fn clear_selection(&mut self) {
-        self.pane.clear_selection();
+        self.active_pane_mut().clear_selection();
     }
 
     pub fn frame(&self) -> DesktopFrame {
-        DesktopFrame {
-            pane_id: self.pane.pane_id(),
-            surface: self.surface,
-            terminal_size: self.pane.terminal_size(),
-            process_id: self.pane.process_id(),
-            render_plan: self.pane.render_plan(self.surface, self.backend),
-        }
+        let pane_id = self
+            .active_pane_id()
+            .expect("desktop app should always have an active pane");
+        self.frame_for_pane(pane_id)
+            .expect("active pane should exist in the pane registry")
+    }
+
+    pub fn frame_for_pane(&self, pane_id: PaneId) -> Result<DesktopFrame, AppError> {
+        let pane = self
+            .pane_by_id(pane_id)
+            .ok_or(AppError::PaneNotFound(pane_id))?;
+        let pane_surface = self
+            .pane_layouts()
+            .into_iter()
+            .find(|layout| layout.pane_id == pane_id)
+            .map(|layout| layout.rect)
+            .ok_or(AppError::PaneNotFound(pane_id))?;
+
+        Ok(DesktopFrame {
+            pane_id,
+            surface: pane_surface,
+            terminal_size: pane.terminal_size(),
+            process_id: pane.process_id(),
+            render_plan: pane.render_plan(pane_surface, self.backend),
+        })
     }
 
     pub fn close_runtime(&mut self) -> Result<Option<PtyExitStatus>, AppError> {
-        self.pane.close_runtime()
+        self.active_pane_mut().close_runtime()
+    }
+
+    fn from_root_pane(surface: LayoutRect, pane: TerminalPane) -> Self {
+        let mut panes = HashMap::new();
+        panes.insert(ROOT_PANE_ID, pane);
+        Self {
+            surface,
+            backend: RenderBackend::default(),
+            layout: LayoutTree::new(ROOT_PANE_ID),
+            panes,
+            next_pane_id: ROOT_PANE_ID.0 + 1,
+        }
+    }
+
+    fn allocate_pane_id(&mut self) -> Result<PaneId, AppError> {
+        while self.next_pane_id < u64::MAX {
+            let pane_id = PaneId::new(self.next_pane_id);
+            self.next_pane_id += 1;
+            if !self.panes.contains_key(&pane_id) {
+                return Ok(pane_id);
+            }
+        }
+
+        Err(AppError::PaneIdExhausted)
+    }
+
+    fn active_pane_ref(&self) -> &TerminalPane {
+        let pane_id = self
+            .layout
+            .active_pane()
+            .expect("desktop app should always have an active pane");
+        self.panes
+            .get(&pane_id)
+            .expect("layout active pane should exist in the pane registry")
+    }
+
+    fn active_pane_mut(&mut self) -> &mut TerminalPane {
+        let pane_id = self
+            .layout
+            .active_pane()
+            .expect("desktop app should always have an active pane");
+        self.panes
+            .get_mut(&pane_id)
+            .expect("layout active pane should exist in the pane registry")
     }
 }
 
@@ -535,6 +638,9 @@ mod tests {
     fn shellless_app_builds_single_pane_frame() {
         let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
 
+        assert_eq!(app.active_pane_id(), Some(PaneId::new(1)));
+        assert_eq!(app.pane_count(), 1);
+        assert_eq!(app.pane_layouts().len(), 1);
         let frame = app.frame();
         assert_eq!(frame.pane_id, PaneId::new(1));
         assert_eq!(frame.surface, LayoutRect::new(0, 0, 120, 80));
@@ -546,6 +652,28 @@ mod tests {
         assert_eq!(frame.render_plan.scrollback_rows, 0);
         assert!(frame.render_plan.active);
         assert!(frame.render_plan.selection.is_none());
+    }
+
+    #[test]
+    fn splitting_active_pane_adds_a_new_leaf_and_focuses_it() -> Result<(), Box<dyn StdError>> {
+        let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(80, 24));
+
+        let new_pane = app.split_active_pane_shell()?;
+
+        assert_eq!(app.active_pane_id(), Some(new_pane));
+        assert_eq!(app.pane_count(), 2);
+        assert!(app.pane_by_id(PaneId::new(1)).is_some());
+        assert!(app.pane_by_id(new_pane).is_some());
+
+        let layouts = app.pane_layouts();
+        assert_eq!(layouts.len(), 2);
+
+        let original_frame = app.frame_for_pane(PaneId::new(1))?;
+        let new_frame = app.frame_for_pane(new_pane)?;
+        assert_eq!(original_frame.surface, LayoutRect::new(0, 0, 60, 40));
+        assert_eq!(new_frame.surface, LayoutRect::new(60, 0, 60, 40));
+        assert_eq!(app.frame().pane_id, new_pane);
+        Ok(())
     }
 
     #[test]
@@ -650,6 +778,62 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn split_panes_keep_independent_shell_sessions() -> Result<(), Box<dyn StdError>> {
+        let mut app =
+            DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 40), PtySize::new(80, 24))?;
+        let root_pane = app.active_pane_id().expect("root pane should exist");
+        let new_pane = app.split_active_pane_shell()?;
+
+        app.pane_mut_by_id(root_pane)
+            .ok_or(AppError::PaneNotFound(root_pane))?
+            .write_input(shell_command_bytes("NOCTRAIL_ROOT").as_slice())?;
+        app.pane_mut_by_id(root_pane)
+            .ok_or(AppError::PaneNotFound(root_pane))?
+            .write_input(shell_exit_bytes().as_slice())?;
+
+        app.pane_mut_by_id(new_pane)
+            .ok_or(AppError::PaneNotFound(new_pane))?
+            .write_input(shell_command_bytes("NOCTRAIL_SPLIT").as_slice())?;
+        app.pane_mut_by_id(new_pane)
+            .ok_or(AppError::PaneNotFound(new_pane))?
+            .write_input(shell_exit_bytes().as_slice())?;
+
+        let root_output = read_all_runtime_output_for_pane(&mut app, root_pane)?;
+        let split_output = read_all_runtime_output_for_pane(&mut app, new_pane)?;
+        let root_text = String::from_utf8_lossy(&root_output);
+        let split_text = String::from_utf8_lossy(&split_output);
+
+        assert!(
+            root_text.contains("NOCTRAIL_ROOT"),
+            "root pane output missing its marker: {root_text:?}"
+        );
+        assert!(
+            !root_text.contains("NOCTRAIL_SPLIT"),
+            "root pane output leaked split marker: {root_text:?}"
+        );
+        assert!(
+            split_text.contains("NOCTRAIL_SPLIT"),
+            "split pane output missing its marker: {split_text:?}"
+        );
+        assert!(
+            !split_text.contains("NOCTRAIL_ROOT"),
+            "split pane output leaked root marker: {split_text:?}"
+        );
+
+        let root_status = app
+            .pane_mut_by_id(root_pane)
+            .ok_or(AppError::PaneNotFound(root_pane))?
+            .close_runtime()?;
+        let split_status = app
+            .pane_mut_by_id(new_pane)
+            .ok_or(AppError::PaneNotFound(new_pane))?
+            .close_runtime()?;
+        assert!(root_status.is_some());
+        assert!(split_status.is_some());
+        Ok(())
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn ctrl_d_writes_eot_byte_to_foreground_process() -> Result<(), Box<dyn StdError>> {
@@ -680,6 +864,24 @@ mod tests {
             .pane_mut()
             .runtime_mut()
             .ok_or(AppError::MissingRuntime)?;
+        read_all_runtime_output_from_runtime(runtime)
+    }
+
+    fn read_all_runtime_output_for_pane(
+        app: &mut DesktopApp,
+        pane_id: PaneId,
+    ) -> Result<Vec<u8>, AppError> {
+        let runtime = app
+            .pane_mut_by_id(pane_id)
+            .ok_or(AppError::PaneNotFound(pane_id))?
+            .runtime_mut()
+            .ok_or(AppError::MissingRuntime)?;
+        read_all_runtime_output_from_runtime(runtime)
+    }
+
+    fn read_all_runtime_output_from_runtime(
+        runtime: &mut PaneRuntime,
+    ) -> Result<Vec<u8>, AppError> {
         let mut output = Vec::new();
         let mut chunk = [0_u8; 1024];
 
