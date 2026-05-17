@@ -188,7 +188,7 @@ fn run_smoke(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>>
 
     let frame = app.frame();
     println!(
-        "pane={:?} pid={:?} backend={:?} pane={}x{} content={}x{} terminal={}x{} rows={} font={} size={} opacity={} requested_opacity={} transparency_fallback={} blur={} blur_fallback={} animation={} animation_duration_ms={}",
+        "pane={:?} pid={:?} backend={:?} pane={}x{} content={}x{} terminal={}x{} rows={} status_shell={} status_cwd={} status_git={} status_exit={} font={} size={} opacity={} requested_opacity={} transparency_fallback={} blur={} blur_fallback={} animation={} animation_duration_ms={}",
         frame.pane_id,
         frame.process_id,
         frame.render_plan.backend,
@@ -199,6 +199,10 @@ fn run_smoke(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>>
         frame.terminal_size.cols,
         frame.terminal_size.rows,
         frame.render_plan.rows.len(),
+        frame.status_line.shell.as_deref().unwrap_or("none"),
+        display_status_path(frame.status_line.cwd.as_deref()),
+        frame.status_line.git_branch.as_deref().unwrap_or("none"),
+        frame.status_line.exit_status.as_deref().unwrap_or("none"),
         launch_options.font.family,
         launch_options.font.size,
         effects.effective_opacity,
@@ -229,6 +233,22 @@ fn run_smoke(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>>
     println!("input smoke ok");
 
     let _ = app.close_runtime()?;
+    let final_frame = app.frame();
+    println!(
+        "final_status_shell={} final_status_cwd={} final_status_git={} final_status_exit={}",
+        final_frame.status_line.shell.as_deref().unwrap_or("none"),
+        display_status_path(final_frame.status_line.cwd.as_deref()),
+        final_frame
+            .status_line
+            .git_branch
+            .as_deref()
+            .unwrap_or("none"),
+        final_frame
+            .status_line
+            .exit_status
+            .as_deref()
+            .unwrap_or("none"),
+    );
     Ok(())
 }
 
@@ -358,6 +378,11 @@ fn shell_marker_command(marker: &str) -> String {
 
 fn shell_exit_command() -> &'static str {
     "exit\r\n"
+}
+
+fn display_status_path(path: Option<&std::path::Path>) -> String {
+    path.map(|path| path.display().to_string())
+        .unwrap_or_else(|| "none".to_string())
 }
 
 #[cfg(test)]

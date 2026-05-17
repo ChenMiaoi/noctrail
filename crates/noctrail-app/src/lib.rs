@@ -1,6 +1,11 @@
 //! Desktop app shell for Noctrail.
 
-use std::{collections::HashMap, fmt};
+use std::{
+    collections::HashMap,
+    fmt,
+    path::{Path, PathBuf},
+    process::Command as ProcessCommand,
+};
 
 mod clipboard;
 
@@ -30,6 +35,27 @@ pub struct PaneChromeConfig {
     pub radius: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PaneStatusLine {
+    pub shell: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub git_branch: Option<String>,
+    pub exit_status: Option<String>,
+}
+
+impl PaneStatusLine {
+    fn from_command(command: &PtyCommand) -> Self {
+        let cwd = command.cwd().cloned();
+
+        Self {
+            shell: Some(command_shell_label(command)),
+            cwd: cwd.clone(),
+            git_branch: cwd.as_deref().and_then(detect_git_branch),
+            exit_status: None,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("the active pane does not have a runtime")]
@@ -55,6 +81,7 @@ pub struct TerminalPane {
     terminal_size: PtySize,
     scrollback_offset: usize,
     last_damage: DamageSet,
+    status_line: PaneStatusLine,
 }
 
 impl fmt::Debug for TerminalPane {
@@ -83,6 +110,7 @@ impl TerminalPane {
             terminal_size,
             scrollback_offset: 0,
             last_damage: full_frame_damage(terminal_size),
+            status_line: PaneStatusLine::default(),
         }
     }
 
@@ -91,6 +119,7 @@ impl TerminalPane {
         command: PtyCommand,
         terminal_size: PtySize,
     ) -> Result<Self, AppError> {
+        let status_line = PaneStatusLine::from_command(&command);
         let runtime = PaneRuntime::spawn(command, terminal_size)?;
         let mut terminal = TerminalState::new(
             usize::from(terminal_size.cols),
@@ -105,6 +134,7 @@ impl TerminalPane {
             terminal_size,
             scrollback_offset: 0,
             last_damage: full_frame_damage(terminal_size),
+            status_line,
         })
     }
 
@@ -162,6 +192,10 @@ impl TerminalPane {
 
     pub fn process_id(&self) -> Option<u32> {
         self.runtime.as_ref().and_then(PaneRuntime::process_id)
+    }
+
+    pub fn status_line(&self) -> &PaneStatusLine {
+        &self.status_line
     }
 
     pub fn paste_bytes(&self, text: &str) -> Vec<u8> {
@@ -275,14 +309,43 @@ impl TerminalPane {
         self.last_damage = full_frame_damage(self.terminal_size);
     }
 
+    pub fn refresh_exit_status(&mut self) -> Result<bool, AppError> {
+        if self.status_line.exit_status.is_some() {
+            return Ok(false);
+        }
+
+        let Some(runtime) = self.runtime.as_mut() else {
+            return Ok(false);
+        };
+        let Some(status) = runtime.try_wait()? else {
+            return Ok(false);
+        };
+
+        Ok(self.record_exit_status(&status))
+    }
+
     pub fn close_runtime(&mut self) -> Result<Option<PtyExitStatus>, AppError> {
         let runtime = self.runtime.take().ok_or(AppError::MissingRuntime)?;
-        runtime.close().map_err(AppError::from)
+        let status = runtime.close().map_err(AppError::from)?;
+        if let Some(status) = status.as_ref() {
+            self.record_exit_status(status);
+        }
+        Ok(status)
     }
 
     fn clamp_scrollback_offset(&mut self) {
         let snapshot = self.snapshot();
         self.scrollback_offset = self.scrollback_offset.min(max_scrollback_offset(&snapshot));
+    }
+
+    fn record_exit_status(&mut self, status: &PtyExitStatus) -> bool {
+        let next = format_exit_status(status);
+        if self.status_line.exit_status.as_deref() == Some(next.as_str()) {
+            return false;
+        }
+
+        self.status_line.exit_status = Some(next);
+        true
     }
 
     fn render_snapshot(&self) -> TerminalSnapshot {
@@ -347,6 +410,7 @@ pub struct DesktopFrame {
     pub surface: LayoutRect,
     pub terminal_size: PtySize,
     pub process_id: Option<u32>,
+    pub status_line: PaneStatusLine,
     pub render_plan: RenderPlan,
 }
 
@@ -661,6 +725,7 @@ impl DesktopApp {
             surface: content_surface,
             terminal_size: pane.terminal_size(),
             process_id: pane.process_id(),
+            status_line: pane.status_line().clone(),
             render_plan: pane.render_plan(
                 pane_surface,
                 content_surface,
@@ -673,6 +738,14 @@ impl DesktopApp {
 
     pub fn close_runtime(&mut self) -> Result<Option<PtyExitStatus>, AppError> {
         self.active_pane_mut().close_runtime()
+    }
+
+    pub fn refresh_runtime_statuses(&mut self) -> Result<bool, AppError> {
+        let mut changed = false;
+        for pane in self.panes.values_mut() {
+            changed |= pane.refresh_exit_status()?;
+        }
+        Ok(changed)
     }
 
     pub fn invalidate_visuals(&mut self) {
@@ -823,6 +896,46 @@ fn full_frame_damage(size: PtySize) -> DamageSet {
     DamageSet {
         dirty_rows: (0..usize::from(size.rows)).collect(),
         full_frame: true,
+    }
+}
+
+fn command_shell_label(command: &PtyCommand) -> String {
+    Path::new(command.program())
+        .file_name()
+        .unwrap_or(command.program())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn detect_git_branch(cwd: &Path) -> Option<String> {
+    for args in [
+        ["symbolic-ref", "--quiet", "--short", "HEAD"].as_slice(),
+        ["rev-parse", "--abbrev-ref", "HEAD"].as_slice(),
+    ] {
+        let output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            continue;
+        }
+
+        let branch = String::from_utf8(output.stdout).ok()?;
+        let branch = branch.trim();
+        if !branch.is_empty() && branch != "HEAD" {
+            return Some(branch.to_string());
+        }
+    }
+
+    None
+}
+
+fn format_exit_status(status: &PtyExitStatus) -> String {
+    match status.signal() {
+        Some(signal) => format!("signal {signal}"),
+        None => format!("code {}", status.exit_code()),
     }
 }
 
@@ -1006,7 +1119,11 @@ fn inset_layout_rect(rect: LayoutRect, insets: EdgeInsets) -> LayoutRect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::error::Error as StdError;
+    use std::{
+        error::Error as StdError,
+        fs, thread,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn shellless_app_builds_single_pane_frame() {
@@ -1024,12 +1141,80 @@ mod tests {
         assert_eq!(frame.surface, LayoutRect::new(0, 0, 120, 80));
         assert_eq!(frame.terminal_size, PtySize::new(10, 3));
         assert!(frame.process_id.is_none());
+        assert_eq!(frame.status_line, PaneStatusLine::default());
         assert_eq!(frame.render_plan.rows.len(), 3);
         assert!(frame.render_plan.damage.full_frame);
         assert_eq!(frame.render_plan.damage.dirty_rows, vec![0, 1, 2]);
         assert_eq!(frame.render_plan.scrollback_rows, 0);
         assert!(frame.render_plan.active);
         assert!(frame.render_plan.selection.is_none());
+    }
+
+    #[test]
+    fn spawned_shell_frame_exposes_status_line_metadata() -> Result<(), Box<dyn StdError>> {
+        let repo_dir = temp_git_repo("status-line", "status-line-test")?;
+        let mut command = PtyCommand::shell();
+        command.cwd_path(&repo_dir);
+        let mut app = DesktopApp::spawn(
+            LayoutRect::new(0, 0, 120, 40),
+            command,
+            PtySize::new(80, 24),
+        )?;
+
+        let frame = app.frame();
+        assert_eq!(frame.status_line.cwd.as_deref(), Some(repo_dir.as_path()));
+        assert_eq!(
+            frame.status_line.git_branch.as_deref(),
+            Some("status-line-test")
+        );
+        assert!(
+            frame
+                .status_line
+                .shell
+                .as_deref()
+                .is_some_and(|shell| !shell.is_empty())
+        );
+        assert!(frame.status_line.exit_status.is_none());
+
+        let _ = app.close_runtime()?;
+        let _ = fs::remove_dir_all(repo_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_runtime_statuses_caches_exit_code() -> Result<(), Box<dyn StdError>> {
+        let mut app = DesktopApp::spawn(
+            LayoutRect::new(0, 0, 120, 40),
+            exit_status_probe_command(7),
+            PtySize::new(80, 24),
+        )?;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut observed = false;
+        while Instant::now() < deadline {
+            if app.refresh_runtime_statuses()? {
+                observed = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            observed,
+            "runtime exit status was not observed before timeout"
+        );
+        assert_eq!(
+            app.frame().status_line.exit_status.as_deref(),
+            Some("code 7")
+        );
+
+        let status = app.close_runtime()?;
+        assert_eq!(status.as_ref().map(PtyExitStatus::exit_code), Some(7));
+        assert_eq!(
+            app.frame().status_line.exit_status.as_deref(),
+            Some("code 7")
+        );
+        Ok(())
     }
 
     #[test]
@@ -1630,11 +1815,58 @@ mod tests {
         b"exit\r\n".to_vec()
     }
 
+    fn exit_status_probe_command(code: u32) -> PtyCommand {
+        #[cfg(windows)]
+        {
+            let mut command = PtyCommand::new("cmd.exe");
+            command.args(["/C", &format!("exit {code}")]);
+            command
+        }
+
+        #[cfg(not(windows))]
+        {
+            let mut command = PtyCommand::new("sh");
+            command.args(["-lc", &format!("exit {code}")]);
+            command
+        }
+    }
+
     fn render_row_text(row: &noctrail_render::RenderRow) -> String {
         row.glyphs
             .iter()
             .map(|glyph| glyph.text.as_str())
             .collect::<String>()
+    }
+
+    fn temp_git_repo(label: &str, branch: &str) -> Result<PathBuf, Box<dyn StdError>> {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let repo_dir = std::env::temp_dir().join(format!("noctrail-{label}-{unique}"));
+        fs::create_dir_all(&repo_dir)?;
+
+        let init = ProcessCommand::new("git")
+            .arg("init")
+            .arg(&repo_dir)
+            .output()?;
+        if !init.status.success() {
+            return Err(
+                format!("git init failed: {}", String::from_utf8_lossy(&init.stderr)).into(),
+            );
+        }
+
+        let checkout = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&repo_dir)
+            .args(["checkout", "-b", branch])
+            .output()?;
+        if !checkout.status.success() {
+            return Err(format!(
+                "git checkout -b failed: {}",
+                String::from_utf8_lossy(&checkout.stderr)
+            )
+            .into());
+        }
+
+        Ok(repo_dir)
     }
 
     #[cfg(not(windows))]

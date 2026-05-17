@@ -1,7 +1,7 @@
 use std::{
     error::Error,
     io::Read,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     sync::mpsc::{self, Receiver, TryRecvError},
     thread::{self, JoinHandle},
@@ -122,14 +122,36 @@ pub(crate) fn frame_title(frame: &DesktopFrame, cursor_visible: bool) -> String 
         format!("pane {}", frame.pane_id.0)
     };
 
-    format!(
+    let mut title = format!(
         "Noctrail | {pane_label} | pid {pid} | {}x{} px | {}x{} cells | rows {} | {backend} | cursor {cursor}",
         frame.surface.width,
         frame.surface.height,
         frame.terminal_size.cols,
         frame.terminal_size.rows,
         frame.render_plan.rows.len(),
-    )
+    );
+    if let Some(shell) = frame.status_line.shell.as_deref() {
+        title.push_str(" | shell ");
+        title.push_str(shell);
+    }
+    if let Some(cwd) = frame.status_line.cwd.as_deref() {
+        title.push_str(" | cwd ");
+        title.push_str(&display_status_path(cwd));
+    }
+    if let Some(branch) = frame.status_line.git_branch.as_deref() {
+        title.push_str(" | git ");
+        title.push_str(branch);
+    }
+    if let Some(exit_status) = frame.status_line.exit_status.as_deref() {
+        title.push_str(" | exit ");
+        title.push_str(exit_status);
+    }
+
+    title
+}
+
+fn display_status_path(path: &Path) -> String {
+    path.display().to_string()
 }
 
 fn saturating_u32_to_u16(value: u32) -> u16 {
@@ -1407,6 +1429,9 @@ impl ApplicationHandler for GuiApp {
 
         let _ = self.poll_config_reload();
         let _ = self.drain_output_events();
+        if matches!(self.app.refresh_runtime_statuses(), Ok(true)) {
+            self.update_title();
+        }
         if self.advance_transition(Instant::now()) {
             self.update_title();
             self.request_redraw();
@@ -1461,6 +1486,12 @@ mod tests {
             surface: LayoutRect::new(0, 0, 120, 80),
             terminal_size: PtySize::new(80, 24),
             process_id: Some(1234),
+            status_line: crate::PaneStatusLine {
+                shell: Some("zsh".to_string()),
+                cwd: Some(PathBuf::from("/tmp/noctrail")),
+                git_branch: Some("main".to_string()),
+                exit_status: Some("code 0".to_string()),
+            },
             render_plan: RenderPlan {
                 backend: RenderBackend::Gpu,
                 pane_rect: RenderRect::new(0, 0, 120, 80),
@@ -1486,6 +1517,10 @@ mod tests {
         assert!(title.contains("rows 0"));
         assert!(title.contains("gpu"));
         assert!(title.contains("cursor on"));
+        assert!(title.contains("shell zsh"));
+        assert!(title.contains("cwd /tmp/noctrail"));
+        assert!(title.contains("git main"));
+        assert!(title.contains("exit code 0"));
     }
 
     #[test]
