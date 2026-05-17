@@ -9,7 +9,10 @@ use std::{
 };
 
 use noctrail_agent::{CommandPermission, CommandProposal, CommandRisk, ProviderRequestPreview};
-use noctrail_config::{AgentConfig, ConfigReloader, FontConfig, ThemeConfig};
+use noctrail_config::{
+    AgentConfig, ConfigReloader, FontConfig, KeymapConfig, LayoutConfig, LayoutSplitAxis,
+    ThemeConfig,
+};
 use noctrail_layout::{FocusDirection, LayoutRect, SplitAxis, WorkspaceId};
 use noctrail_pty::{PtyOutputReader, PtySize};
 use noctrail_render::{FontPreferences, GpuRenderer, PaneBorderStyle, RenderBackend, Rgba};
@@ -29,7 +32,6 @@ const DEFAULT_WINDOW_WIDTH: u32 = 1280;
 const DEFAULT_WINDOW_HEIGHT: u32 = 800;
 const DEFAULT_CELL_WIDTH: u32 = 8;
 const DEFAULT_CELL_HEIGHT: u32 = 16;
-const PALETTE_RESIZE_DELTA: u16 = 5;
 const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -60,6 +62,8 @@ pub struct GuiLaunchOptions {
     pub config_path: Option<PathBuf>,
     pub theme: ThemeConfig,
     pub font: FontConfig,
+    pub keymap: KeymapConfig,
+    pub layout: LayoutConfig,
     pub agent: AgentConfig,
 }
 
@@ -71,6 +75,8 @@ impl Default for GuiLaunchOptions {
             config_path: None,
             theme: ThemeConfig::default(),
             font: FontConfig::default(),
+            keymap: KeymapConfig::default(),
+            layout: LayoutConfig::default(),
             agent: AgentConfig::default(),
         }
     }
@@ -571,7 +577,7 @@ impl PaletteCommand {
             .all(|token| haystack.contains(&token.to_ascii_lowercase()))
     }
 
-    fn execute(self, app: &mut DesktopApp) -> Result<(), Box<dyn Error>> {
+    fn execute(self, app: &mut DesktopApp, resize_step: u16) -> Result<(), Box<dyn Error>> {
         match self {
             Self::NewPane => {
                 let _ = app.split_active_pane_shell()?;
@@ -586,7 +592,7 @@ impl PaletteCommand {
                 let _ = app.focus_direction(direction)?;
             }
             Self::Resize(direction) => {
-                app.resize_active_split(direction, PALETTE_RESIZE_DELTA)?;
+                app.resize_active_split(direction, resize_step)?;
             }
             Self::Swap(direction) => {
                 let _ = app.swap_active_pane(direction)?;
@@ -733,8 +739,18 @@ impl GuiApp {
             .and_then(|path| ConfigReloader::from_path(path).ok());
         let theme = launch_options.theme.clone();
         let font = launch_options.font.clone();
+        app.set_default_split_axis(split_axis_from_config(
+            launch_options.layout.default_split_axis,
+        ));
+        app.set_scratch_height_percent(launch_options.layout.scratch_height_percent)
+            .expect("app should accept scratch height updates");
         app.set_pane_chrome(pane_chrome_from_theme(&theme))
             .expect("app should accept pane chrome updates");
+        if launch_options.layout.startup_workspace != 1 {
+            let _ = app
+                .switch_workspace(WorkspaceId::new(launch_options.layout.startup_workspace))
+                .expect("validated startup workspace should switch cleanly");
+        }
         Self {
             app,
             launch_options,
@@ -827,9 +843,13 @@ impl GuiApp {
 
     fn apply_palette_command(&mut self, command: PaletteCommand) -> Result<(), Box<dyn Error>> {
         let before = self.transition_snapshot();
-        command.execute(&mut self.app)?;
+        command.execute(&mut self.app, self.launch_options.layout.resize_step)?;
         self.start_transition(command.transition_kind(), before);
         Ok(())
+    }
+
+    fn shortcut_action(&self, logical_key: &winit::keyboard::Key) -> Option<input::ShortcutAction> {
+        input::shortcut_action(logical_key, self.modifiers, &self.launch_options.keymap)
     }
 
     fn start_transition(&mut self, kind: Option<TransitionKind>, before: TransitionSnapshot) {
@@ -2035,6 +2055,14 @@ fn direction_name(direction: FocusDirection) -> &'static str {
     }
 }
 
+fn split_axis_from_config(axis: LayoutSplitAxis) -> Option<SplitAxis> {
+    match axis {
+        LayoutSplitAxis::Auto => None,
+        LayoutSplitAxis::Horizontal => Some(SplitAxis::Horizontal),
+        LayoutSplitAxis::Vertical => Some(SplitAxis::Vertical),
+    }
+}
+
 fn font_preferences_from_config(config: &FontConfig) -> FontPreferences {
     FontPreferences {
         family: config.family.clone(),
@@ -2313,42 +2341,42 @@ impl ApplicationHandler for GuiApp {
                     return;
                 }
                 if matches!(
-                    input::shortcut_action(&event.logical_key, self.modifiers),
+                    self.shortcut_action(&event.logical_key),
                     Some(input::ShortcutAction::ToggleAgentAuditBrowser)
                 ) {
                     self.toggle_agent_audit_browser();
                     return;
                 }
                 if matches!(
-                    input::shortcut_action(&event.logical_key, self.modifiers),
+                    self.shortcut_action(&event.logical_key),
                     Some(input::ShortcutAction::ToggleAgentContextPreview)
                 ) {
                     self.toggle_agent_context_preview();
                     return;
                 }
                 if matches!(
-                    input::shortcut_action(&event.logical_key, self.modifiers),
+                    self.shortcut_action(&event.logical_key),
                     Some(input::ShortcutAction::ToggleBlockBrowser)
                 ) {
                     self.toggle_block_browser();
                     return;
                 }
                 if matches!(
-                    input::shortcut_action(&event.logical_key, self.modifiers),
+                    self.shortcut_action(&event.logical_key),
                     Some(input::ShortcutAction::TogglePatchPreview)
                 ) {
                     self.toggle_patch_preview_browser();
                     return;
                 }
                 if matches!(
-                    input::shortcut_action(&event.logical_key, self.modifiers),
+                    self.shortcut_action(&event.logical_key),
                     Some(input::ShortcutAction::ToggleReviewPanel)
                 ) {
                     self.toggle_review_panel();
                     return;
                 }
                 if matches!(
-                    input::shortcut_action(&event.logical_key, self.modifiers),
+                    self.shortcut_action(&event.logical_key),
                     Some(input::ShortcutAction::ToggleCommandPalette)
                 ) {
                     self.toggle_command_palette();
@@ -2394,7 +2422,7 @@ impl ApplicationHandler for GuiApp {
                         return;
                     }
                 }
-                if let Some(action) = input::shortcut_action(&event.logical_key, self.modifiers) {
+                if let Some(action) = self.shortcut_action(&event.logical_key) {
                     match action {
                         input::ShortcutAction::ToggleAgentAuditBrowser => unreachable!(),
                         input::ShortcutAction::ToggleAgentContextPreview => unreachable!(),
@@ -3089,7 +3117,8 @@ mod tests {
             },
         );
 
-        PaletteCommand::SplitHorizontal.execute(&mut gui.app)?;
+        PaletteCommand::SplitHorizontal
+            .execute(&mut gui.app, gui.launch_options.layout.resize_step)?;
 
         assert_eq!(
             gui.app.frame_for_pane(PaneId::new(1))?.surface,
@@ -3117,10 +3146,12 @@ mod tests {
         let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
         let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
 
-        PaletteCommand::Workspace(WorkspaceId::new(2)).execute(&mut gui.app)?;
+        PaletteCommand::Workspace(WorkspaceId::new(2))
+            .execute(&mut gui.app, gui.launch_options.layout.resize_step)?;
         assert_eq!(gui.app.active_workspace_id(), WorkspaceId::new(2));
 
-        PaletteCommand::ToggleScratch.execute(&mut gui.app)?;
+        PaletteCommand::ToggleScratch
+            .execute(&mut gui.app, gui.launch_options.layout.resize_step)?;
         assert!(gui.app.scratch_visible());
         assert!(gui.app.frame().is_scratch);
 

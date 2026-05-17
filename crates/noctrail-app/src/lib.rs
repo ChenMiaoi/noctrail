@@ -29,9 +29,9 @@ use thiserror::Error;
 use toml::Value as TomlValue;
 
 const ROOT_PANE_ID: PaneId = PaneId::new(1);
-const SCRATCH_HEIGHT_DIVISOR: u16 = 3;
 const MAX_COMMAND_BLOCKS: usize = 100;
 const MAX_AUDIT_ENTRIES: usize = 200;
+const DEFAULT_SCRATCH_HEIGHT_PERCENT: u8 = 33;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PaneChromeConfig {
@@ -1114,6 +1114,8 @@ pub struct DesktopApp {
     terminal_size: PtySize,
     backend: RenderBackend,
     pane_chrome: PaneChromeConfig,
+    default_split_axis: Option<SplitAxis>,
+    scratch_height_percent: u8,
     workspaces: WorkspaceSet,
     scratch_pane_id: Option<PaneId>,
     scratch_visible: bool,
@@ -1173,6 +1175,28 @@ impl DesktopApp {
         self.sync_pane_terminal_sizes()?;
         self.invalidate_visuals();
         Ok(())
+    }
+
+    pub fn set_default_split_axis(&mut self, axis: Option<SplitAxis>) {
+        self.default_split_axis = axis;
+    }
+
+    pub fn default_split_axis(&self) -> Option<SplitAxis> {
+        self.default_split_axis
+    }
+
+    pub fn set_scratch_height_percent(
+        &mut self,
+        scratch_height_percent: u8,
+    ) -> Result<(), AppError> {
+        self.scratch_height_percent = scratch_height_percent.max(1);
+        self.sync_pane_terminal_sizes()?;
+        self.invalidate_visuals();
+        Ok(())
+    }
+
+    pub fn scratch_height_percent(&self) -> u8 {
+        self.scratch_height_percent
     }
 
     pub fn surface(&self) -> LayoutRect {
@@ -1325,6 +1349,10 @@ impl DesktopApp {
     }
 
     pub fn split_active_pane_with(&mut self, command: PtyCommand) -> Result<PaneId, AppError> {
+        if let Some(axis) = self.default_split_axis {
+            return self.split_active_pane_with_axis(command, axis);
+        }
+
         let new_pane_id = self.allocate_pane_id()?;
         let terminal_size = self.active_pane_ref().terminal_size();
         let pane = TerminalPane::spawn(new_pane_id, command, terminal_size)?;
@@ -1611,7 +1639,12 @@ impl DesktopApp {
             let pane_id = self.allocate_pane_id()?;
             let pane = TerminalPane::spawn_shell(
                 pane_id,
-                scratch_terminal_size(self.surface, self.terminal_size, self.pane_chrome),
+                scratch_terminal_size(
+                    self.surface,
+                    self.terminal_size,
+                    self.pane_chrome,
+                    self.scratch_height_percent,
+                ),
             )?;
             self.panes.insert(pane_id, pane);
             self.scratch_pane_id = Some(pane_id);
@@ -1662,7 +1695,7 @@ impl DesktopApp {
             .ok_or(AppError::PaneNotFound(pane_id))?;
         let is_scratch = self.scratch_pane_id == Some(pane_id);
         let pane_surface = if is_scratch {
-            scratch_surface(self.surface)
+            scratch_surface(self.surface, self.scratch_height_percent)
         } else {
             self.pane_layouts()
                 .into_iter()
@@ -1769,6 +1802,8 @@ impl DesktopApp {
             terminal_size,
             backend: RenderBackend::default(),
             pane_chrome: PaneChromeConfig::default(),
+            default_split_axis: None,
+            scratch_height_percent: DEFAULT_SCRATCH_HEIGHT_PERCENT,
             workspaces: WorkspaceSet::new(ROOT_PANE_ID),
             scratch_pane_id: None,
             scratch_visible: false,
@@ -1827,8 +1862,12 @@ impl DesktopApp {
         }
 
         if let Some(scratch_pane_id) = self.scratch_pane_id {
-            let pane_size =
-                scratch_terminal_size(self.surface, self.terminal_size, self.pane_chrome);
+            let pane_size = scratch_terminal_size(
+                self.surface,
+                self.terminal_size,
+                self.pane_chrome,
+                self.scratch_height_percent,
+            );
             self.pane_mut_by_id(scratch_pane_id)
                 .ok_or(AppError::PaneNotFound(scratch_pane_id))?
                 .resize(pane_size)?;
@@ -2275,8 +2314,10 @@ fn pane_terminal_size(
     PtySize::new(cols, rows)
 }
 
-fn scratch_surface(surface: LayoutRect) -> LayoutRect {
-    let height = (surface.height / SCRATCH_HEIGHT_DIVISOR).max(1);
+fn scratch_surface(surface: LayoutRect, scratch_height_percent: u8) -> LayoutRect {
+    let height = ((u32::from(surface.height) * u32::from(scratch_height_percent.max(1))) / 100)
+        .max(1)
+        .min(u32::from(surface.height)) as u16;
     LayoutRect::new(surface.x, surface.y, surface.width, height)
 }
 
@@ -2284,11 +2325,15 @@ fn scratch_terminal_size(
     surface: LayoutRect,
     terminal_size: PtySize,
     pane_chrome: PaneChromeConfig,
+    scratch_height_percent: u8,
 ) -> PtySize {
     pane_terminal_size(
         surface,
         terminal_size,
-        pane_content_surface(scratch_surface(surface), pane_chrome),
+        pane_content_surface(
+            scratch_surface(surface, scratch_height_percent),
+            pane_chrome,
+        ),
     )
 }
 
@@ -2518,6 +2563,20 @@ mod tests {
         assert!(!original_frame.render_plan.active);
         assert!(new_frame.render_plan.active);
         assert_eq!(app.frame().pane_id, new_pane);
+        Ok(())
+    }
+
+    #[test]
+    fn configured_split_axis_overrides_auto_split() -> Result<(), Box<dyn StdError>> {
+        let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(80, 24));
+        app.set_default_split_axis(Some(SplitAxis::Horizontal));
+
+        let new_pane = app.split_active_pane_shell()?;
+        let original_frame = app.frame_for_pane(PaneId::new(1))?;
+        let new_frame = app.frame_for_pane(new_pane)?;
+
+        assert_eq!(original_frame.surface, LayoutRect::new(0, 0, 120, 20));
+        assert_eq!(new_frame.surface, LayoutRect::new(0, 20, 120, 20));
         Ok(())
     }
 
@@ -3403,7 +3462,10 @@ mod tests {
         assert_eq!(app.scratch_pane_id(), Some(scratch));
         assert_eq!(app.active_pane_id(), Some(scratch));
         assert_eq!(app.pane_layouts(), main_layouts);
-        assert_eq!(app.frame().surface, scratch_surface(app.surface()));
+        assert_eq!(
+            app.frame().surface,
+            scratch_surface(app.surface(), app.scratch_height_percent())
+        );
         assert!(app.frame().is_scratch);
 
         let restored = app.toggle_scratch()?;
@@ -3430,6 +3492,21 @@ mod tests {
             .close_runtime()?;
         assert!(scratch_status.is_some());
         assert!(main_status.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn scratch_height_percent_changes_visible_scratch_surface() -> Result<(), Box<dyn StdError>> {
+        let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 60), PtySize::new(12, 6));
+        app.set_scratch_height_percent(50)?;
+
+        let _ = app.toggle_scratch()?;
+
+        assert_eq!(
+            app.frame().pane_surface,
+            scratch_surface(app.surface(), app.scratch_height_percent())
+        );
+        assert_eq!(app.frame().pane_surface.height, 30);
         Ok(())
     }
 

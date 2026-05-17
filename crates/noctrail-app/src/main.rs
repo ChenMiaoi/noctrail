@@ -14,10 +14,10 @@ use noctrail_app::{
     input, redaction,
 };
 use noctrail_config::{
-    AgentConfig, AgentProviderConfig, AgentProviderKind, Config, ConfigError,
-    RendererBackend as ConfigRendererBackend, ThemeConfig,
+    AgentConfig, AgentProviderConfig, AgentProviderKind, Config, ConfigError, LayoutConfig,
+    LayoutSplitAxis, RendererBackend as ConfigRendererBackend, ThemeConfig,
 };
-use noctrail_layout::{FocusDirection, LayoutRect, SplitAxis};
+use noctrail_layout::{FocusDirection, LayoutRect, SplitAxis, WorkspaceId};
 use noctrail_pty::{PtyCommand, PtySize};
 use noctrail_render::{PaneBorderStyle, RenderBackend, Rgba};
 use noctrail_term::{Position, SelectionMode};
@@ -349,6 +349,8 @@ fn resolve_launch_options(options: &StartupOptions) -> Result<GuiLaunchOptions, 
         config_path: options.config_path.clone(),
         theme: config.theme,
         font: config.font,
+        keymap: config.keymap,
+        layout: config.layout,
         agent: config.agent,
     })
 }
@@ -370,6 +372,26 @@ fn load_config(options: &StartupOptions) -> Result<Config, StartupError> {
 
 fn run_gui(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>> {
     gui::run_with_options(resolve_launch_options(options)?)?;
+    Ok(())
+}
+
+fn split_axis_from_config(axis: LayoutSplitAxis) -> Option<SplitAxis> {
+    match axis {
+        LayoutSplitAxis::Auto => None,
+        LayoutSplitAxis::Horizontal => Some(SplitAxis::Horizontal),
+        LayoutSplitAxis::Vertical => Some(SplitAxis::Vertical),
+    }
+}
+
+fn apply_launch_layout(
+    app: &mut DesktopApp,
+    layout: &LayoutConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    app.set_default_split_axis(split_axis_from_config(layout.default_split_axis));
+    app.set_scratch_height_percent(layout.scratch_height_percent)?;
+    if layout.startup_workspace != 1 {
+        let _ = app.switch_workspace(WorkspaceId::new(layout.startup_workspace))?;
+    }
     Ok(())
 }
 
@@ -1043,13 +1065,15 @@ fn run_smoke(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>>
     let launch_options = resolve_launch_options(options)?;
     let mut app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24))?;
     app.set_backend(launch_options.renderer_backend);
+    apply_launch_layout(&mut app, &launch_options.layout)?;
     app.set_pane_chrome(pane_chrome_from_theme(&launch_options.theme))?;
     let effects = visual_effects_mode(&launch_options);
 
     let frame = app.frame();
     println!(
-        "pane={:?} pid={:?} backend={:?} pane={}x{} content={}x{} terminal={}x{} rows={} status_shell={} status_cwd={} status_git={} status_exit={} font={} size={} low_power={} opacity={} requested_opacity={} transparency_fallback={} blur={} blur_fallback={} animation={} animation_duration_ms={}",
+        "pane={:?} workspace={} pid={:?} backend={:?} pane={}x{} content={}x{} terminal={}x{} rows={} status_shell={} status_cwd={} status_git={} status_exit={} font={} size={} low_power={} opacity={} requested_opacity={} transparency_fallback={} blur={} blur_fallback={} animation={} animation_duration_ms={} split_axis={} resize_step={} scratch_height_percent={} copy_shortcuts={}",
         frame.pane_id,
+        frame.workspace_id.0,
         frame.process_id,
         frame.render_plan.backend,
         frame.pane_surface.width,
@@ -1073,6 +1097,10 @@ fn run_smoke(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>>
         effects.blur_fallback_reason.unwrap_or("none"),
         on_off(animations_enabled(&launch_options.theme)),
         launch_options.theme.animation.duration_ms,
+        split_axis_label(launch_options.layout.default_split_axis),
+        launch_options.layout.resize_step,
+        launch_options.layout.scratch_height_percent,
+        launch_options.keymap.copy.join(","),
     );
 
     app.write_input(shell_marker_command("NOCTRAIL_APP_SMOKE_WRITE").as_bytes())?;
@@ -1107,6 +1135,14 @@ fn run_smoke(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>>
             .unwrap_or("none"),
     );
     Ok(())
+}
+
+fn split_axis_label(axis: LayoutSplitAxis) -> &'static str {
+    match axis {
+        LayoutSplitAxis::Auto => "auto",
+        LayoutSplitAxis::Horizontal => "horizontal",
+        LayoutSplitAxis::Vertical => "vertical",
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2010,7 +2046,7 @@ mod tests {
         let path = temp_config_path("theme-font");
         fs::write(
             &path,
-            "[font]\nfamily = \"Iosevka\"\nsize = 15.5\n\n[theme]\nopacity = 0.85\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.blur]\nenabled = true\nfallback-tint-opacity = 0.94\n\n[theme.animation]\nenabled = false\nduration-ms = 180\n\n[theme.low-power]\nenabled = true\n\n[theme.cursor]\nblink-interval-ms = 420\n\n[agent]\nenabled = true\nread-env = true\nread-history = false\n\n[agent.provider]\ntype = \"local\"\nmodel = \"llama\"\n",
+            "[font]\nfamily = \"Iosevka\"\nsize = 15.5\n\n[theme]\nopacity = 0.85\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.blur]\nenabled = true\nfallback-tint-opacity = 0.94\n\n[theme.animation]\nenabled = false\nduration-ms = 180\n\n[theme.low-power]\nenabled = true\n\n[theme.cursor]\nblink-interval-ms = 420\n\n[layout]\ndefault-split-axis = \"vertical\"\nresize-step = 9\nscratch-height-percent = 45\nstartup-workspace = 3\n\n[keymap]\ncopy = [\"ctrl-shift-y\"]\npaste = [\"ctrl-shift-u\"]\nfocus-left = [\"alt-a\"]\nfocus-right = [\"alt-d\"]\nfocus-up = [\"alt-w\"]\nfocus-down = [\"alt-s\"]\n\n[agent]\nenabled = true\nread-env = true\nread-history = false\n\n[agent.provider]\ntype = \"local\"\nmodel = \"llama\"\n",
         )
         .expect("write config");
         let options = StartupOptions {
@@ -2032,6 +2068,12 @@ mod tests {
         assert_eq!(launch.theme.animation.duration_ms, 180);
         assert!(launch.theme.low_power.enabled);
         assert_eq!(launch.theme.cursor.blink_interval_ms, 420);
+        assert_eq!(launch.layout.default_split_axis, LayoutSplitAxis::Vertical);
+        assert_eq!(launch.layout.resize_step, 9);
+        assert_eq!(launch.layout.scratch_height_percent, 45);
+        assert_eq!(launch.layout.startup_workspace, 3);
+        assert_eq!(launch.keymap.copy, vec!["ctrl-shift-y".to_string()]);
+        assert_eq!(launch.keymap.focus_left, vec!["alt-a".to_string()]);
         assert!(launch.agent.enabled);
         assert!(launch.agent.read_env);
         assert!(!launch.agent.read_history);

@@ -1,3 +1,4 @@
+use noctrail_config::KeymapConfig;
 use noctrail_layout::FocusDirection;
 use winit::{
     event::ElementState,
@@ -34,50 +35,64 @@ pub enum MouseReportKind {
     WheelDown,
 }
 
-pub fn shortcut_action(logical_key: &Key, modifiers: ModifiersState) -> Option<ShortcutAction> {
-    if modifiers.super_key() {
-        return None;
-    }
+pub fn shortcut_action(
+    logical_key: &Key,
+    modifiers: ModifiersState,
+    keymap: &KeymapConfig,
+) -> Option<ShortcutAction> {
+    let binding = shortcut_binding_string(logical_key, modifiers)?;
 
-    if modifiers.alt_key() && !modifiers.control_key() && !modifiers.shift_key() {
-        return match logical_key.as_ref() {
-            Key::Character(text) => match text.to_ascii_lowercase().as_str() {
-                "h" => Some(ShortcutAction::Focus(FocusDirection::Left)),
-                "j" => Some(ShortcutAction::Focus(FocusDirection::Down)),
-                "k" => Some(ShortcutAction::Focus(FocusDirection::Up)),
-                "l" => Some(ShortcutAction::Focus(FocusDirection::Right)),
-                _ => None,
-            },
-            _ => None,
-        };
-    }
-
-    if modifiers.alt_key() {
-        return None;
-    }
-
-    match logical_key.as_ref() {
-        Key::Character(text) if modifiers.control_key() && modifiers.shift_key() => {
-            match text.to_ascii_lowercase().as_str() {
-                "a" => Some(ShortcutAction::ToggleAgentContextPreview),
-                "b" => Some(ShortcutAction::ToggleBlockBrowser),
-                "c" => Some(ShortcutAction::Copy),
-                "d" => Some(ShortcutAction::TogglePatchPreview),
-                "l" => Some(ShortcutAction::ToggleAgentAuditBrowser),
-                "p" => Some(ShortcutAction::ToggleCommandPalette),
-                "r" => Some(ShortcutAction::ToggleReviewPanel),
-                "v" => Some(ShortcutAction::Paste),
-                _ => None,
-            }
-        }
-        Key::Named(NamedKey::Insert) if modifiers.shift_key() && !modifiers.control_key() => {
-            Some(ShortcutAction::Paste)
-        }
-        Key::Named(NamedKey::Insert) if modifiers.control_key() && !modifiers.shift_key() => {
-            Some(ShortcutAction::Copy)
-        }
-        _ => None,
-    }
+    [
+        (ShortcutAction::Copy, keymap.copy.as_slice()),
+        (ShortcutAction::Paste, keymap.paste.as_slice()),
+        (
+            ShortcutAction::ToggleCommandPalette,
+            keymap.command_palette.as_slice(),
+        ),
+        (
+            ShortcutAction::ToggleBlockBrowser,
+            keymap.block_browser.as_slice(),
+        ),
+        (
+            ShortcutAction::TogglePatchPreview,
+            keymap.patch_preview.as_slice(),
+        ),
+        (
+            ShortcutAction::ToggleReviewPanel,
+            keymap.review_panel.as_slice(),
+        ),
+        (
+            ShortcutAction::ToggleAgentContextPreview,
+            keymap.agent_context.as_slice(),
+        ),
+        (
+            ShortcutAction::ToggleAgentAuditBrowser,
+            keymap.agent_audit.as_slice(),
+        ),
+        (
+            ShortcutAction::Focus(FocusDirection::Left),
+            keymap.focus_left.as_slice(),
+        ),
+        (
+            ShortcutAction::Focus(FocusDirection::Right),
+            keymap.focus_right.as_slice(),
+        ),
+        (
+            ShortcutAction::Focus(FocusDirection::Up),
+            keymap.focus_up.as_slice(),
+        ),
+        (
+            ShortcutAction::Focus(FocusDirection::Down),
+            keymap.focus_down.as_slice(),
+        ),
+    ]
+    .into_iter()
+    .find_map(|(action, bindings)| {
+        bindings
+            .iter()
+            .any(|candidate| candidate.trim().eq_ignore_ascii_case(&binding))
+            .then_some(action)
+    })
 }
 
 pub fn key_to_pty_bytes(
@@ -173,6 +188,31 @@ fn character_bytes(ch: &str, text: Option<&str>, modifiers: ModifiersState) -> O
     } else {
         Some(text.as_bytes().to_vec())
     }
+}
+
+fn shortcut_binding_string(logical_key: &Key, modifiers: ModifiersState) -> Option<String> {
+    if modifiers.super_key() {
+        return None;
+    }
+
+    let key = match logical_key.as_ref() {
+        Key::Character(text) if text.chars().count() == 1 => text.to_ascii_lowercase(),
+        Key::Named(NamedKey::Insert) => "insert".to_string(),
+        _ => return None,
+    };
+
+    let mut parts = Vec::new();
+    if modifiers.control_key() {
+        parts.push("ctrl".to_string());
+    }
+    if modifiers.alt_key() {
+        parts.push("alt".to_string());
+    }
+    if modifiers.shift_key() {
+        parts.push("shift".to_string());
+    }
+    parts.push(key);
+    Some(parts.join("-"))
 }
 
 fn control_text_bytes(text: &str) -> Option<Vec<u8>> {
@@ -284,6 +324,10 @@ fn named_key_bytes(named: NamedKey, modifiers: ModifiersState) -> Option<Vec<u8>
 mod tests {
     use super::*;
 
+    fn default_keymap() -> KeymapConfig {
+        KeymapConfig::default()
+    }
+
     #[test]
     fn printable_text_is_forwarded() {
         let bytes = key_to_pty_bytes(
@@ -386,6 +430,7 @@ mod tests {
             shortcut_action(
                 &Key::Character("b".into()),
                 ModifiersState::CONTROL | ModifiersState::SHIFT,
+                &default_keymap(),
             ),
             Some(ShortcutAction::ToggleBlockBrowser)
         );
@@ -393,6 +438,7 @@ mod tests {
             shortcut_action(
                 &Key::Character("c".into()),
                 ModifiersState::CONTROL | ModifiersState::SHIFT,
+                &default_keymap(),
             ),
             Some(ShortcutAction::Copy)
         );
@@ -400,17 +446,23 @@ mod tests {
             shortcut_action(
                 &Key::Character("v".into()),
                 ModifiersState::CONTROL | ModifiersState::SHIFT,
+                &default_keymap(),
             ),
             Some(ShortcutAction::Paste)
         );
         assert_eq!(
-            shortcut_action(&Key::Named(NamedKey::Insert), ModifiersState::SHIFT),
+            shortcut_action(
+                &Key::Named(NamedKey::Insert),
+                ModifiersState::SHIFT,
+                &default_keymap(),
+            ),
             Some(ShortcutAction::Paste)
         );
         assert_eq!(
             shortcut_action(
                 &Key::Character("d".into()),
                 ModifiersState::CONTROL | ModifiersState::SHIFT,
+                &default_keymap(),
             ),
             Some(ShortcutAction::TogglePatchPreview)
         );
@@ -418,6 +470,7 @@ mod tests {
             shortcut_action(
                 &Key::Character("p".into()),
                 ModifiersState::CONTROL | ModifiersState::SHIFT,
+                &default_keymap(),
             ),
             Some(ShortcutAction::ToggleCommandPalette)
         );
@@ -425,6 +478,7 @@ mod tests {
             shortcut_action(
                 &Key::Character("r".into()),
                 ModifiersState::CONTROL | ModifiersState::SHIFT,
+                &default_keymap(),
             ),
             Some(ShortcutAction::ToggleReviewPanel)
         );
@@ -435,11 +489,11 @@ mod tests {
         let modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
 
         assert_eq!(
-            shortcut_action(&Key::Character("a".into()), modifiers),
+            shortcut_action(&Key::Character("a".into()), modifiers, &default_keymap()),
             Some(ShortcutAction::ToggleAgentContextPreview)
         );
         assert_eq!(
-            shortcut_action(&Key::Character("l".into()), modifiers),
+            shortcut_action(&Key::Character("l".into()), modifiers, &default_keymap()),
             Some(ShortcutAction::ToggleAgentAuditBrowser)
         );
     }
@@ -447,20 +501,66 @@ mod tests {
     #[test]
     fn shortcut_actions_cover_directional_focus() {
         assert_eq!(
-            shortcut_action(&Key::Character("h".into()), ModifiersState::ALT),
+            shortcut_action(
+                &Key::Character("h".into()),
+                ModifiersState::ALT,
+                &default_keymap(),
+            ),
             Some(ShortcutAction::Focus(FocusDirection::Left))
         );
         assert_eq!(
-            shortcut_action(&Key::Character("j".into()), ModifiersState::ALT),
+            shortcut_action(
+                &Key::Character("j".into()),
+                ModifiersState::ALT,
+                &default_keymap(),
+            ),
             Some(ShortcutAction::Focus(FocusDirection::Down))
         );
         assert_eq!(
-            shortcut_action(&Key::Character("k".into()), ModifiersState::ALT),
+            shortcut_action(
+                &Key::Character("k".into()),
+                ModifiersState::ALT,
+                &default_keymap(),
+            ),
             Some(ShortcutAction::Focus(FocusDirection::Up))
         );
         assert_eq!(
-            shortcut_action(&Key::Character("l".into()), ModifiersState::ALT),
+            shortcut_action(
+                &Key::Character("l".into()),
+                ModifiersState::ALT,
+                &default_keymap(),
+            ),
             Some(ShortcutAction::Focus(FocusDirection::Right))
+        );
+    }
+
+    #[test]
+    fn shortcut_actions_follow_custom_keymap_bindings() {
+        let keymap = KeymapConfig {
+            copy: vec!["ctrl-shift-y".to_string()],
+            focus_left: vec!["alt-a".to_string()],
+            ..KeymapConfig::default()
+        };
+
+        assert_eq!(
+            shortcut_action(
+                &Key::Character("y".into()),
+                ModifiersState::CONTROL | ModifiersState::SHIFT,
+                &keymap,
+            ),
+            Some(ShortcutAction::Copy)
+        );
+        assert_eq!(
+            shortcut_action(&Key::Character("a".into()), ModifiersState::ALT, &keymap,),
+            Some(ShortcutAction::Focus(FocusDirection::Left))
+        );
+        assert_eq!(
+            shortcut_action(
+                &Key::Character("c".into()),
+                ModifiersState::CONTROL | ModifiersState::SHIFT,
+                &keymap,
+            ),
+            None
         );
     }
 }

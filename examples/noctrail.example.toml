@@ -1,0 +1,72 @@
+[renderer]
+backend = "gpu"
+
+[font]
+family = "Iosevka"
+size = 15.0
+fallback = ["Noto Sans CJK SC", "Noto Color Emoji"]
+
+[theme]
+opacity = 0.92
+
+[theme.color]
+background = "#081018"
+foreground = "#d5def5"
+
+[theme.border]
+active = "#7aa2f7"
+inactive = "#334155"
+width = 1
+
+[theme.pane]
+gap = 6
+padding = 3
+radius = 10
+
+[theme.blur]
+enabled = true
+fallback-tint-opacity = 0.94
+
+[theme.animation]
+enabled = true
+duration-ms = 140
+
+[theme.low-power]
+enabled = false
+
+[theme.cursor]
+color = "#ffd580"
+blink-interval-ms = 500
+
+[theme.selection]
+background = "#264f78cc"
+foreground = "#ffffff"
+
+[keymap]
+copy = ["ctrl-shift-y", "ctrl-insert"]
+paste = ["ctrl-shift-u", "shift-insert"]
+command-palette = ["ctrl-shift-p"]
+block-browser = ["ctrl-shift-b"]
+patch-preview = ["ctrl-shift-d"]
+review-panel = ["ctrl-shift-r"]
+agent-context = ["ctrl-shift-a"]
+agent-audit = ["ctrl-shift-l"]
+focus-left = ["alt-a"]
+focus-right = ["alt-d"]
+focus-up = ["alt-w"]
+focus-down = ["alt-s"]
+
+[layout]
+default-split-axis = "vertical"
+resize-step = 9
+scratch-height-percent = 40
+startup-workspace = 3
+
+[agent]
+enabled = false
+read-env = false
+read-history = false
+
+[agent.provider]
+type = "local"
+model = "llama"

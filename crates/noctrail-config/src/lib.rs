@@ -23,6 +23,11 @@ const DEFAULT_PANE_PADDING: u16 = 2;
 const DEFAULT_PANE_RADIUS: u16 = 8;
 const DEFAULT_BLUR_FALLBACK_TINT_OPACITY: f32 = 0.92;
 const DEFAULT_ANIMATION_DURATION_MS: u64 = 120;
+const DEFAULT_LAYOUT_RESIZE_STEP: u16 = 5;
+const DEFAULT_SCRATCH_HEIGHT_PERCENT: u8 = 33;
+const DEFAULT_STARTUP_WORKSPACE: u8 = 1;
+const MIN_WORKSPACE_ID: u8 = 1;
+const MAX_WORKSPACE_ID: u8 = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -258,7 +263,88 @@ pub struct Config {
     pub renderer: RendererConfig,
     pub font: FontConfig,
     pub theme: ThemeConfig,
+    pub keymap: KeymapConfig,
+    pub layout: LayoutConfig,
     pub agent: AgentConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum LayoutSplitAxis {
+    #[default]
+    Auto,
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct LayoutConfig {
+    #[serde(rename = "default-split-axis")]
+    pub default_split_axis: LayoutSplitAxis,
+    #[serde(rename = "resize-step")]
+    pub resize_step: u16,
+    #[serde(rename = "scratch-height-percent")]
+    pub scratch_height_percent: u8,
+    #[serde(rename = "startup-workspace")]
+    pub startup_workspace: u8,
+}
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        Self {
+            default_split_axis: LayoutSplitAxis::Auto,
+            resize_step: DEFAULT_LAYOUT_RESIZE_STEP,
+            scratch_height_percent: DEFAULT_SCRATCH_HEIGHT_PERCENT,
+            startup_workspace: DEFAULT_STARTUP_WORKSPACE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct KeymapConfig {
+    pub copy: Vec<String>,
+    pub paste: Vec<String>,
+    #[serde(rename = "command-palette")]
+    pub command_palette: Vec<String>,
+    #[serde(rename = "block-browser")]
+    pub block_browser: Vec<String>,
+    #[serde(rename = "patch-preview")]
+    pub patch_preview: Vec<String>,
+    #[serde(rename = "review-panel")]
+    pub review_panel: Vec<String>,
+    #[serde(rename = "agent-context")]
+    pub agent_context: Vec<String>,
+    #[serde(rename = "agent-audit")]
+    pub agent_audit: Vec<String>,
+    #[serde(rename = "focus-left")]
+    pub focus_left: Vec<String>,
+    #[serde(rename = "focus-right")]
+    pub focus_right: Vec<String>,
+    #[serde(rename = "focus-up")]
+    pub focus_up: Vec<String>,
+    #[serde(rename = "focus-down")]
+    pub focus_down: Vec<String>,
+}
+
+impl Default for KeymapConfig {
+    fn default() -> Self {
+        Self {
+            copy: vec!["ctrl-shift-c".to_string(), "ctrl-insert".to_string()],
+            paste: vec!["ctrl-shift-v".to_string(), "shift-insert".to_string()],
+            command_palette: vec!["ctrl-shift-p".to_string()],
+            block_browser: vec!["ctrl-shift-b".to_string()],
+            patch_preview: vec!["ctrl-shift-d".to_string()],
+            review_panel: vec!["ctrl-shift-r".to_string()],
+            agent_context: vec!["ctrl-shift-a".to_string()],
+            agent_audit: vec!["ctrl-shift-l".to_string()],
+            focus_left: vec!["alt-h".to_string()],
+            focus_right: vec!["alt-l".to_string()],
+            focus_up: vec!["alt-k".to_string()],
+            focus_down: vec!["alt-j".to_string()],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -407,6 +493,31 @@ fn validate_config(path: &Path, config: &Config) -> Result<(), ConfigError> {
             reason: "theme.animation.duration-ms must be greater than 0".to_string(),
         });
     }
+    if config.layout.resize_step == 0 {
+        return Err(ConfigError::Validation {
+            path: path.to_path_buf(),
+            reason: "layout.resize-step must be greater than 0".to_string(),
+        });
+    }
+    if !(1..=100).contains(&config.layout.scratch_height_percent) {
+        return Err(ConfigError::Validation {
+            path: path.to_path_buf(),
+            reason: format!(
+                "layout.scratch-height-percent must be within 1..=100, got {}",
+                config.layout.scratch_height_percent
+            ),
+        });
+    }
+    if !(MIN_WORKSPACE_ID..=MAX_WORKSPACE_ID).contains(&config.layout.startup_workspace) {
+        return Err(ConfigError::Validation {
+            path: path.to_path_buf(),
+            reason: format!(
+                "layout.startup-workspace must be within {}..={}, got {}",
+                MIN_WORKSPACE_ID, MAX_WORKSPACE_ID, config.layout.startup_workspace
+            ),
+        });
+    }
+    validate_keymap(path, &config.keymap)?;
     if config.agent.enabled && config.agent.provider.is_none() {
         return Err(ConfigError::Validation {
             path: path.to_path_buf(),
@@ -462,6 +573,109 @@ fn validate_config(path: &Path, config: &Config) -> Result<(), ConfigError> {
         }
     }
     Ok(())
+}
+
+fn validate_keymap(path: &Path, keymap: &KeymapConfig) -> Result<(), ConfigError> {
+    use std::collections::BTreeMap;
+
+    let actions = [
+        ("keymap.copy", &keymap.copy),
+        ("keymap.paste", &keymap.paste),
+        ("keymap.command-palette", &keymap.command_palette),
+        ("keymap.block-browser", &keymap.block_browser),
+        ("keymap.patch-preview", &keymap.patch_preview),
+        ("keymap.review-panel", &keymap.review_panel),
+        ("keymap.agent-context", &keymap.agent_context),
+        ("keymap.agent-audit", &keymap.agent_audit),
+        ("keymap.focus-left", &keymap.focus_left),
+        ("keymap.focus-right", &keymap.focus_right),
+        ("keymap.focus-up", &keymap.focus_up),
+        ("keymap.focus-down", &keymap.focus_down),
+    ];
+    let mut seen = BTreeMap::<String, &'static str>::new();
+
+    for (action, bindings) in actions {
+        for binding in bindings {
+            let normalized =
+                parse_shortcut_binding(binding).map_err(|reason| ConfigError::Validation {
+                    path: path.to_path_buf(),
+                    reason: format!("{action} contains invalid shortcut {binding:?}: {reason}"),
+                })?;
+            if let Some(previous) = seen.insert(normalized.clone(), action) {
+                return Err(ConfigError::Validation {
+                    path: path.to_path_buf(),
+                    reason: format!(
+                        "shortcut {binding:?} is assigned to both {previous} and {action}"
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_shortcut_binding(raw: &str) -> Result<String, String> {
+    let binding = raw.trim().to_ascii_lowercase();
+    if binding.is_empty() {
+        return Err("shortcut may not be empty".to_string());
+    }
+
+    let mut ctrl = false;
+    let mut alt = false;
+    let mut shift = false;
+    let mut key = None::<String>;
+
+    for token in binding.split('-') {
+        match token {
+            "ctrl" | "control" => {
+                if ctrl {
+                    return Err("duplicate ctrl modifier".to_string());
+                }
+                ctrl = true;
+            }
+            "alt" => {
+                if alt {
+                    return Err("duplicate alt modifier".to_string());
+                }
+                alt = true;
+            }
+            "shift" => {
+                if shift {
+                    return Err("duplicate shift modifier".to_string());
+                }
+                shift = true;
+            }
+            "insert" => {
+                if key.replace("insert".to_string()).is_some() {
+                    return Err("shortcut must contain exactly one key".to_string());
+                }
+            }
+            value if value.chars().count() == 1 => {
+                if key.replace(value.to_string()).is_some() {
+                    return Err("shortcut must contain exactly one key".to_string());
+                }
+            }
+            "super" | "cmd" | "meta" => {
+                return Err("super/cmd/meta shortcuts are not supported".to_string());
+            }
+            other => return Err(format!("unknown shortcut token {other:?}")),
+        }
+    }
+
+    let key = key.ok_or_else(|| "shortcut must contain a key token".to_string())?;
+    let mut normalized = Vec::new();
+    if ctrl {
+        normalized.push("ctrl".to_string());
+    }
+    if alt {
+        normalized.push("alt".to_string());
+    }
+    if shift {
+        normalized.push("shift".to_string());
+    }
+    normalized.push(key);
+    Ok(normalized.join("-"))
 }
 
 fn parse_rgba_color(raw: &str) -> Result<RgbaColor, String> {
@@ -531,6 +745,15 @@ mod tests {
             DEFAULT_ANIMATION_DURATION_MS
         );
         assert!(!config.theme.low_power.enabled);
+        assert_eq!(config.layout.default_split_axis, LayoutSplitAxis::Auto);
+        assert_eq!(config.layout.resize_step, DEFAULT_LAYOUT_RESIZE_STEP);
+        assert_eq!(
+            config.layout.scratch_height_percent,
+            DEFAULT_SCRATCH_HEIGHT_PERCENT
+        );
+        assert_eq!(config.layout.startup_workspace, DEFAULT_STARTUP_WORKSPACE);
+        assert_eq!(config.keymap.copy, vec!["ctrl-shift-c", "ctrl-insert"]);
+        assert_eq!(config.keymap.paste, vec!["ctrl-shift-v", "shift-insert"]);
         assert!(!config.agent.enabled);
         assert!(!config.agent.read_env);
         assert!(!config.agent.read_history);
@@ -542,7 +765,7 @@ mod tests {
         let path = temp_config_path("theme-load");
         fs::write(
             &path,
-            "[renderer]\nbackend = \"software\"\n\n[font]\nfamily = \"Iosevka\"\nsize = 16.5\nfallback = [\"Noto Sans CJK SC\"]\n\n[theme]\nopacity = 0.8\n\n[theme.color]\nbackground = \"#112233\"\nforeground = \"#abcdef\"\n\n[theme.border]\nactive = \"#7aa2f7\"\ninactive = \"#3b4261\"\nwidth = 2\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.blur]\nenabled = true\nfallback-tint-opacity = 0.94\n\n[theme.animation]\nenabled = false\nduration-ms = 180\n\n[theme.low-power]\nenabled = true\n\n[theme.cursor]\ncolor = \"#ffeeaa\"\nblink-interval-ms = 450\n\n[theme.selection]\nbackground = \"#264f78cc\"\nforeground = \"#ffffff\"\n\n[agent]\nenabled = true\nread-env = true\nread-history = true\n\n[agent.provider]\ntype = \"openai-compatible\"\nmodel = \"gpt-5\"\nendpoint = \"https://example.invalid/v1\"\n",
+            "[renderer]\nbackend = \"software\"\n\n[font]\nfamily = \"Iosevka\"\nsize = 16.5\nfallback = [\"Noto Sans CJK SC\"]\n\n[theme]\nopacity = 0.8\n\n[theme.color]\nbackground = \"#112233\"\nforeground = \"#abcdef\"\n\n[theme.border]\nactive = \"#7aa2f7\"\ninactive = \"#3b4261\"\nwidth = 2\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.blur]\nenabled = true\nfallback-tint-opacity = 0.94\n\n[theme.animation]\nenabled = false\nduration-ms = 180\n\n[theme.low-power]\nenabled = true\n\n[theme.cursor]\ncolor = \"#ffeeaa\"\nblink-interval-ms = 450\n\n[theme.selection]\nbackground = \"#264f78cc\"\nforeground = \"#ffffff\"\n\n[layout]\ndefault-split-axis = \"horizontal\"\nresize-step = 7\nscratch-height-percent = 40\nstartup-workspace = 3\n\n[keymap]\ncopy = [\"ctrl-shift-y\"]\npaste = [\"ctrl-shift-u\"]\nfocus-left = [\"alt-a\"]\nfocus-right = [\"alt-d\"]\nfocus-up = [\"alt-w\"]\nfocus-down = [\"alt-s\"]\n\n[agent]\nenabled = true\nread-env = true\nread-history = true\n\n[agent.provider]\ntype = \"openai-compatible\"\nmodel = \"gpt-5\"\nendpoint = \"https://example.invalid/v1\"\n",
         )
         .expect("write config");
 
@@ -565,6 +788,15 @@ mod tests {
         assert!(!config.theme.animation.enabled);
         assert_eq!(config.theme.animation.duration_ms, 180);
         assert!(config.theme.low_power.enabled);
+        assert_eq!(
+            config.layout.default_split_axis,
+            LayoutSplitAxis::Horizontal
+        );
+        assert_eq!(config.layout.resize_step, 7);
+        assert_eq!(config.layout.scratch_height_percent, 40);
+        assert_eq!(config.layout.startup_workspace, 3);
+        assert_eq!(config.keymap.copy, vec!["ctrl-shift-y".to_string()]);
+        assert_eq!(config.keymap.focus_left, vec!["alt-a".to_string()]);
         assert_eq!(
             config.theme.cursor.color,
             RgbaColor::from_rgb(0xff, 0xee, 0xaa)
@@ -672,6 +904,46 @@ mod tests {
         match error {
             ConfigError::Validation { reason, .. } => {
                 assert!(reason.contains("agent.provider.command"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn invalid_layout_values_are_rejected() {
+        let path = temp_config_path("layout-invalid");
+        fs::write(
+            &path,
+            "[layout]\nresize-step = 0\nscratch-height-percent = 101\n",
+        )
+        .expect("write config");
+
+        let error = Config::load_from_path(&path).expect_err("config should fail");
+        match error {
+            ConfigError::Validation { reason, .. } => {
+                assert!(reason.contains("layout.resize-step"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn duplicate_keymap_bindings_are_rejected() {
+        let path = temp_config_path("keymap-duplicate");
+        fs::write(
+            &path,
+            "[keymap]\ncopy = [\"ctrl-shift-c\"]\npaste = [\"ctrl-shift-c\"]\n",
+        )
+        .expect("write config");
+
+        let error = Config::load_from_path(&path).expect_err("config should fail");
+        match error {
+            ConfigError::Validation { reason, .. } => {
+                assert!(reason.contains("assigned to both"));
             }
             other => panic!("unexpected error: {other:?}"),
         }

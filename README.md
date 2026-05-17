@@ -52,6 +52,13 @@ Run the development CLI:
 cargo run -p noctrail-cli -- doctor
 ```
 
+## Configuration
+
+Noctrail reads an optional TOML config with `noctrail-app --config <path>`.
+The schema reference lives in [docs/config-reference.md](docs/config-reference.md),
+and a runnable example lives at
+[examples/noctrail.example.toml](examples/noctrail.example.toml).
+
 ## License
 
 Licensed under the GNU Lesser General Public License, version 3 or later
