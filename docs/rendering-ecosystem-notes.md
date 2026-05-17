@@ -1,5 +1,9 @@
 # Noctrail 渲染架构与技术选型
 
+> 当前正式决策请以
+> [`docs/adr/0002-renderer-wgpu-text-stack.md`](adr/0002-renderer-wgpu-text-stack.md)
+> 为准。本文保留更长的背景说明、对比和后续评估线索。
+
 > 建议文件路径：`docs/rendering-architecture-and-selection.md`
 > 建议替代或扩展：`docs/rendering-ecosystem-notes.md`
 > 状态：Proposed ADR / Architecture Note
