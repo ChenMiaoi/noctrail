@@ -64,6 +64,15 @@ impl PaneRuntime {
         self.session.try_wait()
     }
 
+    pub fn kill(mut self) -> Result<Option<PtyExitStatus>, PtyError> {
+        if let Some(status) = self.session.try_wait()? {
+            return Ok(Some(status));
+        }
+
+        self.session.kill()?;
+        self.session.close()
+    }
+
     pub fn close(self) -> Result<Option<PtyExitStatus>, PtyError> {
         self.session.close()
     }
@@ -340,6 +349,13 @@ impl PaneRuntimeRegistry {
         previous.close().map_err(Into::into)
     }
 
+    pub fn kill(&mut self, pane_id: PaneId) -> Result<Option<PtyExitStatus>, RuntimeError> {
+        let pane = self
+            .remove(pane_id)
+            .ok_or(RuntimeError::PaneNotFound(pane_id))?;
+        pane.kill().map_err(Into::into)
+    }
+
     pub fn close(&mut self, pane_id: PaneId) -> Result<Option<PtyExitStatus>, RuntimeError> {
         let pane = self
             .remove(pane_id)
@@ -479,6 +495,28 @@ mod tests {
         let after_text = String::from_utf8_lossy(&after);
         assert!(after_text.contains("after-restart"));
         assert!(registry.close(pane_id)?.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn registry_kill_terminates_running_pane() -> Result<(), Box<dyn StdError>> {
+        let mut registry = PaneRuntimeRegistry::new();
+        let pane_id = registry.spawn_shell(PtySize::new(80, 24))?;
+
+        assert!(
+            registry
+                .get(pane_id)
+                .expect("pane should be present before kill")
+                .process_id()
+                .is_some(),
+            "running pane should report a process id before kill"
+        );
+
+        let status = registry.kill(pane_id)?;
+        assert!(status.is_some(), "kill should reap the child process");
+        assert!(!registry.contains(pane_id));
+        assert!(registry.is_empty());
 
         Ok(())
     }
