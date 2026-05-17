@@ -537,6 +537,7 @@ struct ShellProbeReport {
 enum PromptCapability {
     Layout,
     Escape,
+    Hook,
 }
 
 impl PromptCapability {
@@ -544,6 +545,7 @@ impl PromptCapability {
         match self {
             Self::Layout => "layout",
             Self::Escape => "escape",
+            Self::Hook => "hook",
         }
     }
 }
@@ -565,9 +567,12 @@ struct PromptProbe {
     command: noctrail_pty::PtyCommand,
     initial_size: PtySize,
     prompt_lines: Vec<String>,
+    bootstrap_bytes: Vec<u8>,
     input_line: String,
+    submit_bytes: Vec<u8>,
     input_row: usize,
     expected_result: String,
+    expected_cwd: String,
     required: &'static [PromptCapability],
     cleanup_paths: Vec<PathBuf>,
 }
@@ -576,6 +581,7 @@ struct PromptProbe {
 struct ObservedPromptCapabilities {
     layout: bool,
     escape: bool,
+    hook: bool,
 }
 
 impl ObservedPromptCapabilities {
@@ -583,12 +589,17 @@ impl ObservedPromptCapabilities {
         match capability {
             PromptCapability::Layout => self.layout,
             PromptCapability::Escape => self.escape,
+            PromptCapability::Hook => self.hook,
         }
     }
 
     fn labels(self) -> Vec<&'static str> {
         let mut labels = Vec::new();
-        for capability in [PromptCapability::Layout, PromptCapability::Escape] {
+        for capability in [
+            PromptCapability::Layout,
+            PromptCapability::Escape,
+            PromptCapability::Hook,
+        ] {
             if self.contains(capability) {
                 labels.push(capability.label());
             }
@@ -1293,10 +1304,16 @@ fn run_prompt_probe(probe: &PromptProbe) -> Result<ObservedPromptCapabilities, S
     let _ = terminal.grid_mut().take_dirty_rows();
     let mut observed = ObservedPromptCapabilities::default();
     let mut input_sent = false;
+    let mut exit_requested = false;
     let mut prompt_ready = false;
     let mut exit_seen = false;
+    let mut ready_snapshot = None;
     let started_at = Instant::now();
     let timeout = Duration::from_secs(4);
+
+    session
+        .write(&probe.bootstrap_bytes)
+        .map_err(|error| format!("failed to bootstrap {} prompt probe: {error}", probe.target))?;
 
     while started_at.elapsed() <= timeout {
         match rx.recv_timeout(Duration::from_millis(20)) {
@@ -1304,15 +1321,25 @@ fn run_prompt_probe(probe: &PromptProbe) -> Result<ObservedPromptCapabilities, S
                 terminal.advance_bytes(&bytes);
                 if !input_sent && prompt_is_ready(&terminal.snapshot(), probe) {
                     prompt_ready = true;
-                    session
-                        .write(probe.input_line.as_bytes())
-                        .map_err(|error| {
-                            format!("failed to write {} prompt input: {error}", probe.target)
-                        })?;
-                    session.write(b"\r").map_err(|error| {
-                        format!("failed to submit {} prompt input: {error}", probe.target)
+                    ready_snapshot = Some(terminal.snapshot());
+                    session.write(&probe.submit_bytes).map_err(|error| {
+                        format!("failed to write {} prompt input: {error}", probe.target)
                     })?;
                     input_sent = true;
+                }
+                if input_sent
+                    && !exit_requested
+                    && terminal
+                        .snapshot()
+                        .rows
+                        .iter()
+                        .map(ScreenRowSnapshot::rendered_text)
+                        .any(|row| row.contains(&probe.expected_result))
+                {
+                    session.write(b"exit\r").map_err(|error| {
+                        format!("failed to exit {} prompt probe: {error}", probe.target)
+                    })?;
+                    exit_requested = true;
                 }
             }
             Ok(TuiProbeReaderEvent::Eof) => {
@@ -1346,57 +1373,83 @@ fn run_prompt_probe(probe: &PromptProbe) -> Result<ObservedPromptCapabilities, S
         return Err(format!("{} prompt probe timed out", probe.target));
     }
 
-    let snapshot = terminal.snapshot();
+    let ready_snapshot = ready_snapshot.unwrap_or_else(|| terminal.snapshot());
+    let events = terminal.drain_shell_integration_events();
+    let ready_rows = ready_snapshot
+        .rows
+        .iter()
+        .map(ScreenRowSnapshot::rendered_text)
+        .collect::<Vec<_>>();
+    observed.layout = prompt_ready && prompt_rows_match_at_anchor(&ready_rows, probe);
+    observed.escape = prompt_escape_is_clean(&ready_snapshot, &ready_rows, probe);
+    observed.hook = prompt_hook_events_match(&events, probe);
+
+    Ok(observed)
+}
+
+fn prompt_hook_events_match(events: &[ShellIntegrationEvent], probe: &PromptProbe) -> bool {
+    events
+        .iter()
+        .any(|event| matches!(event, ShellIntegrationEvent::Prompt))
+        && events.iter().any(|event| {
+            matches!(
+                event,
+                ShellIntegrationEvent::CommandText(text) if text.contains(&probe.input_line)
+            )
+        })
+        && events
+            .iter()
+            .any(|event| matches!(event, ShellIntegrationEvent::CommandStart))
+        && events
+            .iter()
+            .any(|event| matches!(event, ShellIntegrationEvent::CommandEnd))
+        && events.iter().any(|event| {
+            matches!(
+                event,
+                ShellIntegrationEvent::Cwd(cwd) if cwd == &probe.expected_cwd
+            )
+        })
+        && events
+            .iter()
+            .any(|event| matches!(event, ShellIntegrationEvent::ExitCode(0)))
+        && events
+            .iter()
+            .any(|event| matches!(event, ShellIntegrationEvent::DurationMs(_)))
+}
+
+fn prompt_is_ready(snapshot: &TerminalSnapshot, probe: &PromptProbe) -> bool {
     let rendered_rows = snapshot
         .rows
         .iter()
         .map(ScreenRowSnapshot::rendered_text)
         .collect::<Vec<_>>();
-    observed.layout = prompt_ready && prompt_layout_matches(&rendered_rows, probe);
-    observed.escape = prompt_escape_is_clean(&snapshot, &rendered_rows, probe);
-
-    Ok(observed)
-}
-
-fn prompt_is_ready(snapshot: &TerminalSnapshot, probe: &PromptProbe) -> bool {
-    if snapshot.cursor.row != probe.input_row {
+    if prompt_anchor(&rendered_rows, &probe.prompt_lines).is_none() {
         return false;
     }
-    if snapshot.cursor.col != probe.prompt_lines.last().map_or(0, String::len) {
+    let Some(current_row) = rendered_rows.get(snapshot.cursor.row) else {
         return false;
-    }
+    };
 
-    prompt_rows_match(
-        &snapshot
-            .rows
-            .iter()
-            .map(ScreenRowSnapshot::rendered_text)
-            .collect::<Vec<_>>(),
-        probe,
-    )
+    current_row.starts_with(&probe.prompt_lines[probe.input_row])
+        && snapshot.cursor.col >= probe.prompt_lines[probe.input_row].len()
 }
 
-fn prompt_layout_matches(rendered_rows: &[String], probe: &PromptProbe) -> bool {
-    prompt_rows_match(rendered_rows, probe)
-        && rendered_rows.get(probe.input_row).is_some_and(|row| {
-            row.starts_with(&format!(
-                "{}{}",
-                probe.prompt_lines[probe.input_row], probe.input_line
-            ))
-        })
-        && rendered_rows
-            .iter()
-            .any(|row| row.contains(&probe.expected_result))
+fn prompt_rows_match_at_anchor(rendered_rows: &[String], probe: &PromptProbe) -> bool {
+    let Some(anchor) = prompt_anchor(rendered_rows, &probe.prompt_lines) else {
+        return false;
+    };
+
+    prompt_rows_match(rendered_rows, probe, anchor)
 }
 
-fn prompt_rows_match(rendered_rows: &[String], probe: &PromptProbe) -> bool {
+fn prompt_rows_match(rendered_rows: &[String], probe: &PromptProbe, anchor: usize) -> bool {
     probe
         .prompt_lines
         .iter()
         .enumerate()
         .all(|(index, expected)| {
             rendered_rows
-                .get(index)
+                .get(anchor + index)
                 .is_some_and(|row| row.starts_with(expected))
         })
 }
@@ -1410,16 +1463,25 @@ fn prompt_escape_is_clean(
         return false;
     }
 
-    prompt_rows_match(rendered_rows, probe) && prompt_has_non_default_style(snapshot, probe)
+    let Some(anchor) = prompt_anchor(rendered_rows, &probe.prompt_lines) else {
+        return false;
+    };
+
+    prompt_rows_match(rendered_rows, probe, anchor)
+        && prompt_has_non_default_style(snapshot, probe, anchor)
 }
 
-fn prompt_has_non_default_style(snapshot: &TerminalSnapshot, probe: &PromptProbe) -> bool {
+fn prompt_has_non_default_style(
+    snapshot: &TerminalSnapshot,
+    probe: &PromptProbe,
+    anchor: usize,
+) -> bool {
     probe
         .prompt_lines
         .iter()
         .enumerate()
         .all(|(row_index, expected)| {
-            let Some(row) = snapshot.rows.get(row_index) else {
+            let Some(row) = snapshot.rows.get(anchor + row_index) else {
                 return false;
             };
             row.cells
@@ -1428,6 +1490,29 @@ fn prompt_has_non_default_style(snapshot: &TerminalSnapshot, probe: &PromptProbe
                 .filter(|cell| !cell.text.is_empty())
                 .any(|cell| !cell.style.is_default())
         })
+}
+
+fn prompt_anchor(rendered_rows: &[String], prompt_lines: &[String]) -> Option<usize> {
+    prompt_anchors(rendered_rows, prompt_lines)
+        .into_iter()
+        .next()
+}
+
+fn prompt_anchors(rendered_rows: &[String], prompt_lines: &[String]) -> Vec<usize> {
+    if prompt_lines.is_empty() || prompt_lines.len() > rendered_rows.len() {
+        return Vec::new();
+    }
+
+    (0..=rendered_rows.len() - prompt_lines.len())
+        .rev()
+        .filter(|start| {
+            prompt_lines.iter().enumerate().all(|(offset, expected)| {
+                rendered_rows
+                    .get(start + offset)
+                    .is_some_and(|row| row.starts_with(expected))
+            })
+        })
+        .collect()
 }
 
 fn cleanup_prompt_probe(probe: &PromptProbe) {
@@ -1492,19 +1577,31 @@ fn prompt_target_specs() -> Vec<PromptTargetSpec> {
         PromptTargetSpec {
             name: "starship",
             build_probe: prompt_probe_builder(starship_prompt_probe),
-            required: &[PromptCapability::Layout, PromptCapability::Escape],
+            required: &[
+                PromptCapability::Layout,
+                PromptCapability::Escape,
+                PromptCapability::Hook,
+            ],
             skip_hint: "prompt emulation is unavailable on this platform",
         },
         PromptTargetSpec {
             name: "oh-my-zsh",
             build_probe: prompt_probe_builder(oh_my_zsh_prompt_probe),
-            required: &[PromptCapability::Layout, PromptCapability::Escape],
+            required: &[
+                PromptCapability::Layout,
+                PromptCapability::Escape,
+                PromptCapability::Hook,
+            ],
             skip_hint: "prompt emulation is unavailable on this platform",
         },
         PromptTargetSpec {
             name: "powerlevel10k",
             build_probe: prompt_probe_builder(powerlevel10k_prompt_probe),
-            required: &[PromptCapability::Layout, PromptCapability::Escape],
+            required: &[
+                PromptCapability::Layout,
+                PromptCapability::Escape,
+                PromptCapability::Hook,
+            ],
             skip_hint: "prompt emulation is unavailable on this platform",
         },
     ]
@@ -1522,73 +1619,84 @@ fn prompt_probe_builder(_builder: PromptProbeBuilder) -> Option<PromptProbeBuild
 
 #[cfg(not(windows))]
 fn starship_prompt_probe() -> Result<PromptProbe, String> {
-    prompt_script_probe(
+    hooked_bash_prompt_probe(
         "starship",
-        "printf '\\033[32mSTARSHIP\\033[0m \\033[34mPROMPT\\033[0m > '\n",
+        r#"PS1=$'\[\e[32m\]STARSHIP\[\e[0m\] \[\e[34m\]PROMPT\[\e[0m\] > '"#,
         vec!["STARSHIP PROMPT > ".to_string()],
         0,
-        "status",
+        "printf 'RESULT:status\\n'",
     )
 }
 
 #[cfg(not(windows))]
 fn oh_my_zsh_prompt_probe() -> Result<PromptProbe, String> {
-    prompt_script_probe(
+    hooked_bash_prompt_probe(
         "oh-my-zsh",
-        "printf '\\033[35mOHMYZSH\\033[0m \\033[33m%%\\033[0m '\n",
+        r#"PS1=$'\[\e[35m\]OHMYZSH\[\e[0m\] \[\e[33m\]%\[\e[0m\] '"#,
         vec!["OHMYZSH % ".to_string()],
         0,
-        "pwd",
+        "printf 'RESULT:pwd\\n'",
     )
 }
 
 #[cfg(not(windows))]
 fn powerlevel10k_prompt_probe() -> Result<PromptProbe, String> {
-    prompt_script_probe(
+    hooked_bash_prompt_probe(
         "powerlevel10k",
-        "printf '\\033[36mP10K-L1\\033[0m\\n\\033[35mP10K>\\033[0m '\n",
-        vec!["P10K-L1".to_string(), "P10K> ".to_string()],
-        1,
-        "build",
+        r#"PS1=$'\[\e[36m\]P10K-L1\[\e[0m\] \[\e[35m\]P10K>\[\e[0m\] '"#,
+        vec!["P10K-L1 P10K> ".to_string()],
+        0,
+        "printf 'RESULT:build\\n'",
     )
 }
 
 #[cfg(not(windows))]
-fn prompt_script_probe(
+fn hooked_bash_prompt_probe(
     target: &'static str,
-    prompt_body: &str,
+    prompt_setup: &str,
     prompt_lines: Vec<String>,
     input_row: usize,
     input_line: &str,
 ) -> Result<PromptProbe, String> {
-    let script_path = temp_fixture_path(target, "sh");
-    fs::write(
-        &script_path,
-        format!(
-            "#!/bin/sh\n{prompt_body}IFS= read -r line || exit 1\nprintf '\\nRESULT:%s\\n' \"$line\"\n"
-        ),
-    )
-    .map_err(|error| format!("failed to write {target} prompt script: {error}"))?;
-    make_executable_path(&script_path)?;
+    let cwd = env::current_dir()
+        .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
+    let program_path = find_executable(&["bash"])
+        .ok_or_else(|| "install bash to run prompt-matrix".to_string())?;
+    let hook_path = temp_fixture_path(&format!("{target}-prompt-hook"), "sh");
+    fs::write(&hook_path, render_bash_hook())
+        .map_err(|error| format!("failed to write {target} prompt hook: {error}"))?;
+    make_executable_path(&hook_path)?;
 
-    let mut command = noctrail_pty::PtyCommand::new("/bin/sh");
-    command.arg(&script_path);
-    command.cwd_path(
-        env::current_dir()
-            .map_err(|error| format!("failed to resolve current working directory: {error}"))?,
-    );
+    let mut command = noctrail_pty::PtyCommand::new(program_path.as_os_str());
+    command.args(["--noprofile", "--norc", "-i"]);
+    command.cwd_path(&cwd);
 
     Ok(PromptProbe {
         target,
-        source: format!("builtin:{}", script_path.display()),
+        source: format!(
+            "program:{}+hook:{}",
+            program_path.display(),
+            hook_path.display()
+        ),
         command,
         initial_size: PtySize::new(120, 24),
         prompt_lines,
+        bootstrap_bytes: format!(". '{}'\r{prompt_setup}\r", hook_path.display()).into_bytes(),
         input_line: input_line.to_string(),
+        submit_bytes: format!("{input_line}\r").into_bytes(),
         input_row,
-        expected_result: format!("RESULT:{input_line}"),
-        required: &[PromptCapability::Layout, PromptCapability::Escape],
-        cleanup_paths: vec![script_path],
+        expected_result: input_line
+            .strip_prefix("printf '")
+            .and_then(|text| text.strip_suffix("\\n'"))
+            .unwrap_or("RESULT")
+            .to_string(),
+        expected_cwd: cwd.display().to_string(),
+        required: &[
+            PromptCapability::Layout,
+            PromptCapability::Escape,
+            PromptCapability::Hook,
+        ],
+        cleanup_paths: vec![hook_path],
     })
 }
 
