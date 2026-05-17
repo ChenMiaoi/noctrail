@@ -11,6 +11,7 @@ mod clipboard;
 
 pub mod gui;
 pub mod input;
+pub mod redaction;
 
 use noctrail_layout::{
     FocusDirection, LayoutError, LayoutRect, PaneLayout, SplitAxis, WorkspaceId, WorkspaceSet,

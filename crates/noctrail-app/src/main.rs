@@ -9,7 +9,7 @@ use std::{
 use noctrail_app::{
     DesktopApp, PaneChromeConfig,
     gui::{self, GuiLaunchOptions},
-    input,
+    input, redaction,
 };
 use noctrail_config::{
     AgentConfig, AgentProviderConfig, AgentProviderKind, Config, ConfigError,
@@ -35,6 +35,7 @@ Commands:
   failure-block-smoke Run the non-zero exit block probe
   gui       Open the GUI shell window (default)
   perf-smoke Run the performance smoke probe
+  redaction-smoke Run the secret redaction corpus probe
   soak-smoke Run the split/close/resize soak probe
   smoke     Spawn a shell, build the single-pane frame, and shut it down
   structured-output-smoke Run the structured output lens probe
@@ -62,6 +63,7 @@ enum StartupCommand {
     FailureBlockSmoke,
     Gui,
     PerfSmoke,
+    RedactionSmoke,
     SoakSmoke,
     Smoke,
     StructuredOutputSmoke,
@@ -141,6 +143,12 @@ fn main() {
                 process::exit(1);
             }
         }
+        StartupCommand::RedactionSmoke => {
+            if let Err(error) = run_redaction_smoke() {
+                eprintln!("{error}");
+                process::exit(1);
+            }
+        }
         StartupCommand::FailureBlockSmoke => {
             if let Err(error) = run_failure_block_smoke() {
                 eprintln!("{error}");
@@ -203,6 +211,10 @@ fn parse_startup_options(args: &[String]) -> Result<StartupOptions, StartupError
             }
             "crash-smoke" if !command_set => {
                 command = StartupCommand::CrashSmoke;
+                command_set = true;
+            }
+            "redaction-smoke" if !command_set => {
+                command = StartupCommand::RedactionSmoke;
                 command_set = true;
             }
             "failure-block-smoke" if !command_set => {
@@ -324,6 +336,83 @@ fn run_crash_smoke() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("crash_diagnostic={}", diagnostic_path.display());
     println!("crash smoke ok");
+    Ok(())
+}
+
+fn run_redaction_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    let corpus = concat!(
+        "token=abc123 ",
+        "password=hunter2 ",
+        "Authorization=Bearer super-secret-token ",
+        "gh=ghp_exampletoken1234567890 ",
+        "openai=sk-live-secretvalue12345 ",
+        "jwt=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.signaturepart ",
+        "aws=AKIAIOSFODNN7EXAMPLE ",
+        "gcp=AIzaSy012345678901234567890123456789012 ",
+        "AccountKey=azure-storage-secret==\n",
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBrW5kW9fNivfK4hY9Dc1Rc1j8G3kQ== user@host\n",
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+        "super secret private key body\n",
+        "-----END OPENSSH PRIVATE KEY-----\n"
+    );
+    let redacted = redaction::redact_secret_text(corpus);
+    for secret in [
+        "abc123",
+        "hunter2",
+        "super-secret-token",
+        "ghp_exampletoken1234567890",
+        "sk-live-secretvalue12345",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.signaturepart",
+        "AKIAIOSFODNN7EXAMPLE",
+        "AIzaSy012345678901234567890123456789012",
+        "azure-storage-secret==",
+        "AAAAC3NzaC1lZDI1NTE5AAAAIBrW5kW9fNivfK4hY9Dc1Rc1j8G3kQ==",
+        "super secret private key body",
+    ] {
+        if redacted.contains(secret) {
+            return Err(format!("redaction leaked {secret:?}").into());
+        }
+    }
+    if !redacted.contains("[REDACTED]") {
+        return Err("redaction smoke did not redact any secret token".into());
+    }
+    if !redacted.contains("[REDACTED PRIVATE KEY]") {
+        return Err("redaction smoke did not redact the private key block".into());
+    }
+
+    let preview = noctrail_app::AgentContextPreview {
+        current_block: Some(noctrail_app::AgentContextBlock {
+            command: Some("echo sk-live-secretvalue12345".to_string()),
+            output: "token=abc123".to_string(),
+            exit_code: Some(0),
+        }),
+        selection: Some("Bearer super-secret-token".to_string()),
+        cwd: Some(PathBuf::from("/tmp/noctrail-agent")),
+        explicit_files: vec![PathBuf::from("/tmp/noctrail/Cargo.toml")],
+    };
+    let redacted_preview = redaction::redact_agent_context_preview(&preview);
+    if redacted_preview
+        .current_block
+        .as_ref()
+        .and_then(|block| block.command.as_deref())
+        .is_some_and(|command| command.contains("sk-live-secretvalue12345"))
+    {
+        return Err("redacted preview leaked an OpenAI token".into());
+    }
+    if redacted_preview
+        .selection
+        .as_deref()
+        .is_some_and(|selection| selection.contains("super-secret-token"))
+    {
+        return Err("redacted preview leaked a bearer token".into());
+    }
+
+    println!(
+        "redacted_len={} preview_selection={}",
+        redacted.len(),
+        redacted_preview.selection.as_deref().unwrap_or("none")
+    );
+    println!("redaction smoke ok");
     Ok(())
 }
 
@@ -928,12 +1017,12 @@ fn write_crash_diagnostic(
     path: &std::path::Path,
     info: &panic::PanicHookInfo<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let message = redact_diagnostic_text(&panic_payload_text(info));
+    let message = redaction::redact_secret_text(&panic_payload_text(info));
     let location = info
         .location()
         .map(|location| format!("{}:{}", location.file(), location.line()))
         .unwrap_or_else(|| "unknown".to_string());
-    let command_line = redact_diagnostic_text(&env::args().collect::<Vec<_>>().join(" "));
+    let command_line = redaction::redact_secret_text(&env::args().collect::<Vec<_>>().join(" "));
     let diagnostic = format!(
         "pid={}\nlocation={}\nmessage={}\ncommand={}\n",
         process::id(),
@@ -954,43 +1043,6 @@ fn panic_payload_text(info: &panic::PanicHookInfo<'_>) -> String {
     }
 
     "non-string panic payload".to_string()
-}
-
-fn redact_diagnostic_text(text: &str) -> String {
-    let mut redacted = text.to_string();
-    for marker in [
-        "token=",
-        "password=",
-        "secret=",
-        "api_key=",
-        "authorization=",
-        "Bearer ",
-        "sk-",
-        "ghp_",
-    ] {
-        redacted = redact_after_marker(&redacted, marker);
-    }
-    redacted
-}
-
-fn redact_after_marker(text: &str, marker: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut cursor = 0;
-
-    while let Some(found) = text[cursor..].find(marker) {
-        let start = cursor + found;
-        let value_start = start + marker.len();
-        result.push_str(&text[cursor..value_start]);
-        let value_end = text[value_start..]
-            .find(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | '"' | '\''))
-            .map(|offset| value_start + offset)
-            .unwrap_or(text.len());
-        result.push_str("[REDACTED]");
-        cursor = value_end;
-    }
-
-    result.push_str(&text[cursor..]);
-    result
 }
 
 fn read_all_runtime_output(app: &mut DesktopApp) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -1399,6 +1451,16 @@ mod tests {
     }
 
     #[test]
+    fn parses_redaction_smoke_command() {
+        let options =
+            parse_startup_options(&["redaction-smoke".to_string()]).expect("options should parse");
+
+        assert_eq!(options.command, StartupCommand::RedactionSmoke);
+        assert_eq!(options.config_path, None);
+        assert!(!options.safe_mode);
+    }
+
+    #[test]
     fn parses_agent_context_smoke_command() {
         let options = parse_startup_options(&["agent-context-smoke".to_string()])
             .expect("options should parse");
@@ -1724,8 +1786,9 @@ mod tests {
 
     #[test]
     fn redaction_masks_secret_markers() {
-        let redacted =
-            redact_diagnostic_text("token=abc password=hunter2 Bearer ghp_example sk-live-secret");
+        let redacted = redaction::redact_secret_text(
+            "token=abc password=hunter2 Bearer ghp_example sk-live-secret",
+        );
 
         assert!(!redacted.contains("hunter2"));
         assert!(!redacted.contains("ghp_example"));

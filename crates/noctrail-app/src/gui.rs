@@ -879,7 +879,8 @@ impl GuiApp {
             }
         }
         if self.agent_context_browser.is_some() {
-            let preview = self.app.agent_context_preview();
+            let preview =
+                crate::redaction::redact_agent_context_preview(&self.app.agent_context_preview());
             title.push_str(" | agent-context");
             if let Some(block) = preview.current_block.as_ref() {
                 if let Some(command) = block.command.as_deref() {
