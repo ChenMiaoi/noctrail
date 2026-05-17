@@ -715,10 +715,13 @@ fn resolve_primary_family(
 }
 
 fn default_font_fallbacks() -> Vec<String> {
-    let mut fallback = DEFAULT_FONT_FALLBACKS
+    let fallback = DEFAULT_FONT_FALLBACKS
         .iter()
         .map(|family| (*family).to_string())
         .collect::<Vec<_>>();
+
+    #[cfg(any(target_os = "macos", windows))]
+    let mut fallback = fallback;
 
     #[cfg(target_os = "macos")]
     fallback.insert(1, "PingFang SC".to_string());
