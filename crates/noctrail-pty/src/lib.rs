@@ -152,10 +152,10 @@ impl PtyError {
 }
 
 pub struct PtySession {
-    master: Box<dyn MasterPty + Send>,
-    child: Box<dyn Child + Send>,
-    reader: Box<dyn Read + Send>,
-    writer: Box<dyn Write + Send>,
+    master: Option<Box<dyn MasterPty + Send>>,
+    child: Option<Box<dyn Child + Send>>,
+    reader: Option<Box<dyn Read + Send>>,
+    writer: Option<Box<dyn Write + Send>>,
     size: PtySize,
     closed: bool,
 }
@@ -190,10 +190,10 @@ impl PtySession {
             .map_err(|error| PtyError::context("failed to take PTY writer", error))?;
 
         Ok(Self {
-            master: pair.master,
-            child,
-            reader,
-            writer,
+            master: Some(pair.master),
+            child: Some(child),
+            reader: Some(reader),
+            writer: Some(writer),
             size,
             closed: false,
         })
@@ -208,39 +208,58 @@ impl PtySession {
     }
 
     pub fn process_id(&self) -> Option<u32> {
-        self.child.process_id()
+        self.child.as_ref().and_then(|child| child.process_id())
     }
 
     pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, PtyError> {
-        self.reader.read(buf).map_err(PtyError::Read)
+        match self.reader.as_mut() {
+            Some(reader) => reader.read(buf).map_err(PtyError::Read),
+            None => Err(closed_error("read from")),
+        }
     }
 
     pub fn write(&mut self, bytes: &[u8]) -> Result<usize, PtyError> {
-        self.writer
+        let writer = match self.writer.as_mut() {
+            Some(writer) => writer,
+            None => return Err(closed_error("write to")),
+        };
+        writer
             .write_all(bytes)
-            .and_then(|()| self.writer.flush())
+            .and_then(|()| writer.flush())
             .map_err(PtyError::Write)?;
         Ok(bytes.len())
     }
 
     pub fn resize(&mut self, size: PtySize) -> Result<(), PtyError> {
-        self.master
-            .resize(size.to_portable())
-            .map_err(|error| PtyError::context("failed to resize PTY", error))?;
+        match self.master.as_ref() {
+            Some(master) => master
+                .resize(size.to_portable())
+                .map_err(|error| PtyError::context("failed to resize PTY", error))?,
+            None => return Err(closed_error("resize")),
+        }
         self.size = size;
         Ok(())
     }
 
     pub fn try_wait(&mut self) -> Result<Option<PtyExitStatus>, PtyError> {
-        self.child.try_wait().map_err(PtyError::Wait)
+        match self.child.as_mut() {
+            Some(child) => child.try_wait().map_err(PtyError::Wait),
+            None => Err(closed_error("wait on")),
+        }
     }
 
     pub fn wait(&mut self) -> Result<PtyExitStatus, PtyError> {
-        self.child.wait().map_err(PtyError::Wait)
+        match self.child.as_mut() {
+            Some(child) => child.wait().map_err(PtyError::Wait),
+            None => Err(closed_error("wait on")),
+        }
     }
 
     pub fn kill(&mut self) -> Result<(), PtyError> {
-        self.child.kill().map_err(PtyError::Kill)
+        match self.child.as_mut() {
+            Some(child) => child.kill().map_err(PtyError::Kill),
+            None => Err(closed_error("wait on")),
+        }
     }
 
     pub fn close(mut self) -> Result<Option<PtyExitStatus>, PtyError> {
@@ -254,12 +273,22 @@ impl PtySession {
 
         self.closed = true;
 
-        if let Some(status) = self.child.try_wait().map_err(PtyError::Wait)? {
+        if let Some(status) = self.try_wait()? {
             return Ok(Some(status));
         }
 
-        let _ = self.child.kill();
-        self.child.wait().map(Some).map_err(PtyError::Wait)
+        // Drop master-side PTY handles before forcing shutdown so shells
+        // that are already unwinding can observe hangup/EOF promptly.
+        self.writer.take();
+        self.reader.take();
+        self.master.take();
+
+        if let Some(status) = self.try_wait()? {
+            return Ok(Some(status));
+        }
+
+        let _ = self.kill();
+        self.wait().map(Some)
     }
 }
 
@@ -283,6 +312,13 @@ fn resolve_default_shell_program() -> OsString {
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| OsString::from("/bin/sh"))
     }
+}
+
+fn closed_error(action: &'static str) -> PtyError {
+    PtyError::context(
+        "PTY session already closed",
+        format!("cannot {action} a closed PTY session"),
+    )
 }
 
 #[cfg(test)]
