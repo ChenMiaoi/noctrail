@@ -52,6 +52,10 @@ impl PaneRuntime {
         self.session.write(bytes)
     }
 
+    pub fn read_output(&mut self, buf: &mut [u8]) -> Result<usize, PtyError> {
+        self.session.read(buf)
+    }
+
     pub fn resize(&mut self, size: PtySize) -> Result<(), PtyError> {
         self.session.resize(size)
     }
@@ -160,6 +164,13 @@ impl PaneRuntimeRegistry {
         pane.resize(size).map_err(Into::into)
     }
 
+    pub fn read_output(&mut self, pane_id: PaneId, buf: &mut [u8]) -> Result<usize, RuntimeError> {
+        let pane = self
+            .get_mut(pane_id)
+            .ok_or(RuntimeError::PaneNotFound(pane_id))?;
+        pane.read_output(buf).map_err(Into::into)
+    }
+
     pub fn close(&mut self, pane_id: PaneId) -> Result<Option<PtyExitStatus>, RuntimeError> {
         let pane = self
             .remove(pane_id)
@@ -236,5 +247,70 @@ mod tests {
         assert_eq!(next, PaneId::new(8));
         let _ = registry.close(PaneId::new(7));
         let _ = registry.close(next);
+    }
+
+    #[test]
+    fn registry_reads_four_panes_without_cross_talk() -> Result<(), Box<dyn StdError>> {
+        let mut registry = PaneRuntimeRegistry::new();
+        let markers = ["pane-one", "pane-two", "pane-three", "pane-four"];
+        let mut pane_ids = Vec::new();
+
+        for marker in markers {
+            let pane_id = registry.spawn(smoke_command(marker), PtySize::new(80, 24))?;
+            pane_ids.push((pane_id, marker));
+        }
+
+        for (pane_id, marker) in pane_ids {
+            let output = read_all_output(&mut registry, pane_id)?;
+            let text = String::from_utf8_lossy(&output);
+            assert!(
+                text.contains(marker),
+                "expected output for {pane_id:?} to contain {marker:?}, got {text:?}"
+            );
+            assert!(
+                !markers
+                    .iter()
+                    .filter(|other| **other != marker)
+                    .any(|other| text.contains(other)),
+                "pane {pane_id:?} output leaked another marker: {text:?}"
+            );
+            assert!(registry.close(pane_id)?.is_some());
+        }
+
+        Ok(())
+    }
+
+    fn read_all_output(
+        registry: &mut PaneRuntimeRegistry,
+        pane_id: PaneId,
+    ) -> Result<Vec<u8>, RuntimeError> {
+        let mut output = Vec::new();
+        let mut chunk = [0_u8; 1024];
+
+        loop {
+            let count = registry.read_output(pane_id, &mut chunk)?;
+            if count == 0 {
+                break;
+            }
+            output.extend_from_slice(&chunk[..count]);
+        }
+
+        Ok(output)
+    }
+
+    fn smoke_command(marker: &str) -> PtyCommand {
+        #[cfg(windows)]
+        {
+            let mut command = PtyCommand::new("cmd.exe");
+            command.args(["/C", "echo", marker]);
+            command
+        }
+
+        #[cfg(not(windows))]
+        {
+            let mut command = PtyCommand::new("sh");
+            command.args(["-lc", &format!("printf '{marker}'")]);
+            command
+        }
     }
 }
