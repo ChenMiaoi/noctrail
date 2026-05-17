@@ -7,7 +7,7 @@ mod clipboard;
 pub mod gui;
 pub mod input;
 
-use noctrail_layout::{LayoutError, LayoutRect, LayoutTree, PaneLayout};
+use noctrail_layout::{FocusDirection, LayoutError, LayoutRect, LayoutTree, PaneLayout};
 use noctrail_pty::{PtyCommand, PtyError, PtyExitStatus, PtySize};
 use noctrail_render::{RenderBackend, RenderInput, RenderPlan, RenderRect};
 use noctrail_runtime::{PaneId, PaneRuntime};
@@ -227,7 +227,12 @@ impl TerminalPane {
         self.last_damage = full_frame_damage(self.terminal_size);
     }
 
-    pub fn render_plan(&self, surface: LayoutRect, backend: RenderBackend) -> RenderPlan {
+    pub fn render_plan(
+        &self,
+        surface: LayoutRect,
+        backend: RenderBackend,
+        active: bool,
+    ) -> RenderPlan {
         let snapshot = self.render_snapshot();
         RenderPlan::from_input(RenderInput {
             viewport: RenderRect::new(
@@ -239,7 +244,7 @@ impl TerminalPane {
             backend,
             snapshot: &snapshot,
             damage: &self.last_damage,
-            active: true,
+            active,
         })
     }
 
@@ -387,6 +392,10 @@ impl DesktopApp {
         self.panes.get_mut(&pane_id)
     }
 
+    pub fn focus_direction(&mut self, direction: FocusDirection) -> Result<PaneId, AppError> {
+        Ok(self.layout.focus_direction(direction, self.surface)?)
+    }
+
     pub fn split_active_pane_shell(&mut self) -> Result<PaneId, AppError> {
         self.split_active_pane_with(PtyCommand::shell())
     }
@@ -459,6 +468,7 @@ impl DesktopApp {
     }
 
     pub fn frame_for_pane(&self, pane_id: PaneId) -> Result<DesktopFrame, AppError> {
+        let active_pane = self.active_pane_id().ok_or(AppError::MissingActivePane)?;
         let pane = self
             .pane_by_id(pane_id)
             .ok_or(AppError::PaneNotFound(pane_id))?;
@@ -474,7 +484,7 @@ impl DesktopApp {
             surface: pane_surface,
             terminal_size: pane.terminal_size(),
             process_id: pane.process_id(),
-            render_plan: pane.render_plan(pane_surface, self.backend),
+            render_plan: pane.render_plan(pane_surface, self.backend, pane_id == active_pane),
         })
     }
 
@@ -672,6 +682,8 @@ mod tests {
         let new_frame = app.frame_for_pane(new_pane)?;
         assert_eq!(original_frame.surface, LayoutRect::new(0, 0, 60, 40));
         assert_eq!(new_frame.surface, LayoutRect::new(60, 0, 60, 40));
+        assert!(!original_frame.render_plan.active);
+        assert!(new_frame.render_plan.active);
         assert_eq!(app.frame().pane_id, new_pane);
         Ok(())
     }
@@ -831,6 +843,21 @@ mod tests {
             .close_runtime()?;
         assert!(root_status.is_some());
         assert!(split_status.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn focus_direction_switches_the_active_pane() -> Result<(), Box<dyn StdError>> {
+        let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24));
+        let second = app.split_active_pane_shell()?;
+        let third = app.split_active_pane_shell()?;
+
+        assert_eq!(app.active_pane_id(), Some(third));
+        assert_eq!(app.focus_direction(FocusDirection::Left)?, PaneId::new(1));
+        assert_eq!(app.active_pane_id(), Some(PaneId::new(1)));
+        assert_eq!(app.focus_direction(FocusDirection::Right)?, second);
+        assert_eq!(app.focus_direction(FocusDirection::Down)?, third);
+        assert_eq!(app.active_pane_id(), Some(third));
         Ok(())
     }
 

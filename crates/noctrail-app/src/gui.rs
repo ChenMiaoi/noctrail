@@ -631,6 +631,15 @@ impl ApplicationHandler for GuiApp {
                                 self.update_title();
                             }
                         }
+                        input::ShortcutAction::Focus(direction) => {
+                            if self.app.focus_direction(direction).is_err() {
+                                event_loop.exit();
+                                return;
+                            }
+                            self.touch_cursor_blink();
+                            self.request_redraw();
+                            self.update_title();
+                        }
                     }
                     return;
                 }

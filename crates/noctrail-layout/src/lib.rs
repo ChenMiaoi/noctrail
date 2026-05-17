@@ -11,6 +11,14 @@ pub enum SplitAxis {
     Vertical,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 impl SplitAxis {
     fn from_rect(rect: LayoutRect) -> Self {
         if rect.width >= rect.height {
@@ -41,6 +49,22 @@ impl LayoutRect {
 
     pub fn area(self) -> u32 {
         u32::from(self.width) * u32::from(self.height)
+    }
+
+    fn x_end(self) -> u16 {
+        self.x.saturating_add(self.width)
+    }
+
+    fn y_end(self) -> u16 {
+        self.y.saturating_add(self.height)
+    }
+
+    fn center_x(self) -> i32 {
+        i32::from(self.x) + i32::from(self.width) / 2
+    }
+
+    fn center_y(self) -> i32 {
+        i32::from(self.y) + i32::from(self.height) / 2
     }
 
     fn split_vertical(self, left_width: u16) -> (Self, Self) {
@@ -357,6 +381,33 @@ impl LayoutTree {
         Ok(())
     }
 
+    pub fn focus_direction(
+        &mut self,
+        direction: FocusDirection,
+        surface: LayoutRect,
+    ) -> Result<PaneId, LayoutError> {
+        let active = self.active.ok_or(LayoutError::Empty)?;
+        let layouts = self.arrange(surface);
+        let current = layouts
+            .iter()
+            .find(|layout| layout.pane_id == active)
+            .ok_or(LayoutError::PaneNotFound(active))?;
+
+        let next = layouts
+            .iter()
+            .filter(|layout| layout.pane_id != active)
+            .filter_map(|candidate| {
+                focus_candidate_score(current.rect, candidate.rect, direction)
+                    .map(|score| (score, candidate.pane_id))
+            })
+            .min_by_key(|(score, _)| *score)
+            .map(|(_, pane_id)| pane_id)
+            .unwrap_or(active);
+
+        self.active = Some(next);
+        Ok(next)
+    }
+
     pub fn arrange(&self, surface: LayoutRect) -> Vec<PaneLayout> {
         let mut out = Vec::new();
         if let Some(root) = &self.root {
@@ -453,6 +504,77 @@ fn split_dimension(total: u16, ratio: u16) -> u16 {
     let ratio = ratio.clamp(1, 99);
     let preferred = (u32::from(total) * u32::from(ratio) / 100) as u16;
     clamp_split_dimension(total, preferred)
+}
+
+fn overlap_1d(start_a: u16, end_a: u16, start_b: u16, end_b: u16) -> u16 {
+    end_a.min(end_b).saturating_sub(start_a.max(start_b))
+}
+
+fn focus_candidate_score(
+    current: LayoutRect,
+    candidate: LayoutRect,
+    direction: FocusDirection,
+) -> Option<(u16, u16, u16)> {
+    match direction {
+        FocusDirection::Left => {
+            if candidate.x_end() > current.x {
+                return None;
+            }
+            Some((
+                axis_gap(candidate.x_end(), current.x),
+                orthogonal_gap(current.y, current.y_end(), candidate.y, candidate.y_end()),
+                center_distance(current.center_y(), candidate.center_y()),
+            ))
+        }
+        FocusDirection::Right => {
+            if candidate.x < current.x_end() {
+                return None;
+            }
+            Some((
+                axis_gap(current.x_end(), candidate.x),
+                orthogonal_gap(current.y, current.y_end(), candidate.y, candidate.y_end()),
+                center_distance(current.center_y(), candidate.center_y()),
+            ))
+        }
+        FocusDirection::Up => {
+            if candidate.y_end() > current.y {
+                return None;
+            }
+            Some((
+                axis_gap(candidate.y_end(), current.y),
+                orthogonal_gap(current.x, current.x_end(), candidate.x, candidate.x_end()),
+                center_distance(current.center_x(), candidate.center_x()),
+            ))
+        }
+        FocusDirection::Down => {
+            if candidate.y < current.y_end() {
+                return None;
+            }
+            Some((
+                axis_gap(current.y_end(), candidate.y),
+                orthogonal_gap(current.x, current.x_end(), candidate.x, candidate.x_end()),
+                center_distance(current.center_x(), candidate.center_x()),
+            ))
+        }
+    }
+}
+
+fn axis_gap(near_edge: u16, far_edge: u16) -> u16 {
+    far_edge.saturating_sub(near_edge)
+}
+
+fn orthogonal_gap(start_a: u16, end_a: u16, start_b: u16, end_b: u16) -> u16 {
+    if overlap_1d(start_a, end_a, start_b, end_b) > 0 {
+        0
+    } else if end_a <= start_b {
+        start_b.saturating_sub(end_a)
+    } else {
+        start_a.saturating_sub(end_b)
+    }
+}
+
+fn center_distance(center_a: i32, center_b: i32) -> u16 {
+    center_a.abs_diff(center_b).min(u16::MAX as u32) as u16
 }
 
 #[cfg(test)]
@@ -561,6 +683,55 @@ mod tests {
         );
         assert_eq!(tree.active_pane(), Some(PaneId::new(3)));
         assert_eq!(tree.pane_count(), 2);
+    }
+
+    #[test]
+    fn directional_focus_finds_the_adjacent_pane() {
+        let mut tree = LayoutTree::new(PaneId::new(1));
+        let surface = LayoutRect::new(0, 0, 120, 80);
+        tree.split_active(PaneId::new(2), surface)
+            .expect("first split should succeed");
+        tree.split_active(PaneId::new(3), surface)
+            .expect("second split should succeed");
+
+        assert_eq!(tree.active_pane(), Some(PaneId::new(3)));
+        assert_eq!(
+            tree.focus_direction(FocusDirection::Left, surface)
+                .expect("focus should succeed"),
+            PaneId::new(1)
+        );
+        assert_eq!(
+            tree.focus_direction(FocusDirection::Right, surface)
+                .expect("focus should succeed"),
+            PaneId::new(2)
+        );
+        assert_eq!(
+            tree.focus_direction(FocusDirection::Down, surface)
+                .expect("focus should succeed"),
+            PaneId::new(3)
+        );
+        assert_eq!(
+            tree.focus_direction(FocusDirection::Up, surface)
+                .expect("focus should succeed"),
+            PaneId::new(2)
+        );
+    }
+
+    #[test]
+    fn directional_focus_stays_on_current_pane_at_the_edge() {
+        let mut tree = LayoutTree::new(PaneId::new(1));
+        let surface = LayoutRect::new(0, 0, 120, 40);
+        tree.split_active(PaneId::new(2), surface)
+            .expect("split should succeed");
+        tree.set_active_pane(PaneId::new(1))
+            .expect("active pane should exist");
+
+        assert_eq!(
+            tree.focus_direction(FocusDirection::Left, surface)
+                .expect("focus should succeed"),
+            PaneId::new(1)
+        );
+        assert_eq!(tree.active_pane(), Some(PaneId::new(1)));
     }
 
     #[test]

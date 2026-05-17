@@ -1,3 +1,4 @@
+use noctrail_layout::FocusDirection;
 use winit::{
     event::ElementState,
     keyboard::{Key, ModifiersState, NamedKey},
@@ -7,6 +8,7 @@ use winit::{
 pub enum ShortcutAction {
     Copy,
     Paste,
+    Focus(FocusDirection),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,7 +29,24 @@ pub enum MouseReportKind {
 }
 
 pub fn shortcut_action(logical_key: &Key, modifiers: ModifiersState) -> Option<ShortcutAction> {
-    if modifiers.alt_key() || modifiers.super_key() {
+    if modifiers.super_key() {
+        return None;
+    }
+
+    if modifiers.alt_key() && !modifiers.control_key() && !modifiers.shift_key() {
+        return match logical_key.as_ref() {
+            Key::Character(text) => match text.to_ascii_lowercase().as_str() {
+                "h" => Some(ShortcutAction::Focus(FocusDirection::Left)),
+                "j" => Some(ShortcutAction::Focus(FocusDirection::Down)),
+                "k" => Some(ShortcutAction::Focus(FocusDirection::Up)),
+                "l" => Some(ShortcutAction::Focus(FocusDirection::Right)),
+                _ => None,
+            },
+            _ => None,
+        };
+    }
+
+    if modifiers.alt_key() {
         return None;
     }
 
@@ -368,6 +387,26 @@ mod tests {
         assert_eq!(
             shortcut_action(&Key::Named(NamedKey::Insert), ModifiersState::SHIFT),
             Some(ShortcutAction::Paste)
+        );
+    }
+
+    #[test]
+    fn shortcut_actions_cover_directional_focus() {
+        assert_eq!(
+            shortcut_action(&Key::Character("h".into()), ModifiersState::ALT),
+            Some(ShortcutAction::Focus(FocusDirection::Left))
+        );
+        assert_eq!(
+            shortcut_action(&Key::Character("j".into()), ModifiersState::ALT),
+            Some(ShortcutAction::Focus(FocusDirection::Down))
+        );
+        assert_eq!(
+            shortcut_action(&Key::Character("k".into()), ModifiersState::ALT),
+            Some(ShortcutAction::Focus(FocusDirection::Up))
+        );
+        assert_eq!(
+            shortcut_action(&Key::Character("l".into()), ModifiersState::ALT),
+            Some(ShortcutAction::Focus(FocusDirection::Right))
         );
     }
 }
