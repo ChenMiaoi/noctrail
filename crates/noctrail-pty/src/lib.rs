@@ -421,6 +421,7 @@ where
     }
 }
 
+#[cfg(not(windows))]
 fn detect_unix_shell_program<I>(env_vars: I) -> (OsString, ShellSource)
 where
     I: IntoIterator<Item = (OsString, OsString)>,
