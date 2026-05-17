@@ -1091,6 +1091,15 @@ impl GpuRenderer {
         &self.diagnostics
     }
 
+    pub fn set_clear_color(&mut self, red: f64, green: f64, blue: f64, alpha: f64) {
+        self.clear_color = wgpu::Color {
+            r: red.clamp(0.0, 1.0),
+            g: green.clamp(0.0, 1.0),
+            b: blue.clamp(0.0, 1.0),
+            a: alpha.clamp(0.0, 1.0),
+        };
+    }
+
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
         self.surface_config.width = size.width.max(1);
         self.surface_config.height = size.height.max(1);

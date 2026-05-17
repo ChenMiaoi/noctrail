@@ -253,6 +253,10 @@ impl TerminalPane {
         })
     }
 
+    pub fn invalidate_full_frame(&mut self) {
+        self.last_damage = full_frame_damage(self.terminal_size);
+    }
+
     pub fn close_runtime(&mut self) -> Result<Option<PtyExitStatus>, AppError> {
         let runtime = self.runtime.take().ok_or(AppError::MissingRuntime)?;
         runtime.close().map_err(AppError::from)
@@ -619,6 +623,12 @@ impl DesktopApp {
 
     pub fn close_runtime(&mut self) -> Result<Option<PtyExitStatus>, AppError> {
         self.active_pane_mut().close_runtime()
+    }
+
+    pub fn invalidate_visuals(&mut self) {
+        for pane in self.panes.values_mut() {
+            pane.invalidate_full_frame();
+        }
     }
 
     pub fn close_active_pane(&mut self) -> Result<(PaneId, Option<PtyExitStatus>), AppError> {

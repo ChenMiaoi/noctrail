@@ -1,15 +1,17 @@
 use std::{
     error::Error,
     io::Read,
+    path::PathBuf,
     sync::Arc,
     sync::mpsc::{self, Receiver, TryRecvError},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
+use noctrail_config::{ConfigReloader, FontConfig, ThemeConfig};
 use noctrail_layout::{FocusDirection, LayoutRect, SplitAxis, WorkspaceId};
 use noctrail_pty::{PtyOutputReader, PtySize};
-use noctrail_render::{GpuRenderer, RenderBackend};
+use noctrail_render::{FontPreferences, GpuRenderer, RenderBackend};
 use noctrail_term::{MouseTrackingMode, Position, SelectionMode};
 use winit::{
     application::ApplicationHandler,
@@ -26,17 +28,19 @@ const DEFAULT_WINDOW_WIDTH: u32 = 1280;
 const DEFAULT_WINDOW_HEIGHT: u32 = 800;
 const DEFAULT_CELL_WIDTH: u32 = 8;
 const DEFAULT_CELL_HEIGHT: u32 = 16;
-const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(600);
 const PALETTE_RESIZE_DELTA: u16 = 5;
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     run_with_options(GuiLaunchOptions::default())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GuiLaunchOptions {
     pub safe_mode: bool,
     pub renderer_backend: RenderBackend,
+    pub config_path: Option<PathBuf>,
+    pub theme: ThemeConfig,
+    pub font: FontConfig,
 }
 
 impl Default for GuiLaunchOptions {
@@ -44,6 +48,9 @@ impl Default for GuiLaunchOptions {
         Self {
             safe_mode: false,
             renderer_backend: RenderBackend::Gpu,
+            config_path: None,
+            theme: ThemeConfig::default(),
+            font: FontConfig::default(),
         }
     }
 }
@@ -292,9 +299,14 @@ impl CommandPalette {
 struct GuiApp {
     app: DesktopApp,
     launch_options: GuiLaunchOptions,
+    config_reloader: Option<ConfigReloader>,
     window: Option<Arc<Window>>,
     renderer: Option<GpuRenderer>,
     gpu_fallback_error: Option<String>,
+    theme_reload_error: Option<String>,
+    theme: ThemeConfig,
+    font: FontConfig,
+    font_preferences: FontPreferences,
     ime_preedit: Option<String>,
     command_palette: Option<CommandPalette>,
     mouse_position: Option<PhysicalPosition<f64>>,
@@ -313,12 +325,23 @@ struct GuiApp {
 impl GuiApp {
     fn new(app: DesktopApp, launch_options: GuiLaunchOptions) -> Self {
         let now = Instant::now();
+        let config_reloader = launch_options
+            .config_path
+            .as_ref()
+            .and_then(|path| ConfigReloader::from_path(path).ok());
+        let theme = launch_options.theme.clone();
+        let font = launch_options.font.clone();
         Self {
             app,
             launch_options,
+            config_reloader,
             window: None,
             renderer: None,
             gpu_fallback_error: None,
+            theme_reload_error: None,
+            theme: theme.clone(),
+            font: font.clone(),
+            font_preferences: font_preferences_from_config(&font),
             ime_preedit: None,
             command_palette: None,
             mouse_position: None,
@@ -326,9 +349,9 @@ impl GuiApp {
             mouse_button: None,
             output_rx: None,
             output_thread: None,
-            next_cursor_blink_at: now + CURSOR_BLINK_INTERVAL,
+            next_cursor_blink_at: now + Duration::from_millis(theme.cursor.blink_interval_ms),
             cursor_visible: true,
-            frame_interval: CURSOR_BLINK_INTERVAL,
+            frame_interval: Duration::from_millis(theme.cursor.blink_interval_ms),
             window_focused: true,
             modifiers: ModifiersState::empty(),
             clipboard: ClipboardBridge::new(),
@@ -366,7 +389,8 @@ impl GuiApp {
                 f64::from(DEFAULT_WINDOW_WIDTH),
                 f64::from(DEFAULT_WINDOW_HEIGHT),
             ))
-            .with_resizable(true);
+            .with_resizable(true)
+            .with_transparent(self.theme.opacity < 1.0);
         let window = Arc::new(event_loop.create_window(attributes)?);
         let size = window.inner_size();
         self.sync_surface(size)?;
@@ -380,6 +404,7 @@ impl GuiApp {
                     self.renderer = Some(renderer);
                     self.gpu_fallback_error = None;
                     self.app.set_backend(RenderBackend::Gpu);
+                    self.apply_theme_visuals();
                 }
                 Err(error) => {
                     self.record_gpu_fallback(error.to_string());
@@ -391,6 +416,7 @@ impl GuiApp {
             self.app.set_backend(RenderBackend::Software);
         }
         self.window = Some(window);
+        self.apply_theme_visuals();
         self.update_title();
         self.request_redraw();
         Ok(())
@@ -409,8 +435,18 @@ impl GuiApp {
     fn update_title(&self) {
         if let Some(window) = self.window.as_ref() {
             let mut title = frame_title(&self.app.frame(), self.cursor_visible);
+            title.push_str(" | font ");
+            title.push_str(&self.font.family);
+            title.push(' ');
+            title.push_str(&format!("{:.1}", self.font.size));
+            title.push_str(" | opacity ");
+            title.push_str(&format!("{:.2}", self.theme.opacity));
             if let Some(error) = self.gpu_fallback_error.as_deref() {
                 title.push_str(" | gpu-fallback ");
+                title.push_str(error);
+            }
+            if let Some(error) = self.theme_reload_error.as_deref() {
+                title.push_str(" | theme-reload ");
                 title.push_str(error);
             }
             if let Some(preedit) = self.ime_preedit.as_deref()
@@ -432,6 +468,23 @@ impl GuiApp {
                 }
             }
             window.set_title(&title);
+        }
+    }
+
+    fn apply_theme_visuals(&mut self) {
+        self.frame_interval = Duration::from_millis(self.theme.cursor.blink_interval_ms);
+        self.app.invalidate_visuals();
+        if let Some(window) = self.window.as_ref() {
+            window.set_transparent(self.theme.opacity < 1.0);
+        }
+        if let Some(renderer) = self.renderer.as_mut() {
+            let background = self.theme.color.background;
+            renderer.set_clear_color(
+                srgb_component(background.red),
+                srgb_component(background.green),
+                srgb_component(background.blue),
+                f64::from(self.theme.opacity) * background.alpha_factor(),
+            );
         }
     }
 
@@ -688,6 +741,32 @@ impl GuiApp {
         Ok(())
     }
 
+    fn poll_config_reload(&mut self) -> bool {
+        let Some(reloader) = self.config_reloader.as_mut() else {
+            return false;
+        };
+
+        match reloader.reload_if_changed() {
+            Ok(Some(config)) => {
+                self.theme = config.theme;
+                self.font = config.font;
+                self.font_preferences = font_preferences_from_config(&self.font);
+                self.theme_reload_error = None;
+                self.apply_theme_visuals();
+                self.touch_cursor_blink();
+                self.update_title();
+                self.request_redraw();
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                self.theme_reload_error = Some(error.to_string());
+                self.update_title();
+                false
+            }
+        }
+    }
+
     fn toggle_command_palette(&mut self) {
         if self.command_palette.is_some() {
             self.command_palette = None;
@@ -764,6 +843,18 @@ fn direction_name(direction: FocusDirection) -> &'static str {
         FocusDirection::Up => "up",
         FocusDirection::Down => "down",
     }
+}
+
+fn font_preferences_from_config(config: &FontConfig) -> FontPreferences {
+    FontPreferences {
+        family: config.family.clone(),
+        size: config.size,
+        fallback: config.fallback.clone(),
+    }
+}
+
+fn srgb_component(value: u8) -> f64 {
+    f64::from(value) / f64::from(u8::MAX)
 }
 
 enum OutputPumpEvent {
@@ -979,6 +1070,7 @@ impl ApplicationHandler for GuiApp {
             return;
         }
 
+        let _ = self.poll_config_reload();
         let _ = self.drain_output_events();
         if self.advance_cursor_blink(Instant::now()) {
             self.update_title();
@@ -1003,6 +1095,10 @@ mod tests {
     use noctrail_layout::WorkspaceId;
     use noctrail_render::{RenderBackend, RenderPlan, RenderRect};
     use noctrail_runtime::PaneId;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn surface_size_is_clamped_to_terminal_cells() {
@@ -1070,6 +1166,9 @@ mod tests {
             GuiLaunchOptions {
                 safe_mode: true,
                 renderer_backend: RenderBackend::Gpu,
+                config_path: None,
+                theme: ThemeConfig::default(),
+                font: FontConfig::default(),
             },
         );
 
@@ -1084,10 +1183,52 @@ mod tests {
             GuiLaunchOptions {
                 safe_mode: false,
                 renderer_backend: RenderBackend::Software,
+                config_path: None,
+                theme: ThemeConfig::default(),
+                font: FontConfig::default(),
             },
         );
 
         assert!(!gui.should_attempt_gpu_renderer());
+    }
+
+    #[test]
+    fn config_reload_updates_theme_font_and_cursor_timing() {
+        let path = temp_config_path("theme-reload");
+        fs::write(
+            &path,
+            "[font]\nfamily = \"JetBrainsMono Nerd Font\"\nsize = 14.0\n\n[theme]\nopacity = 1.0\n\n[theme.cursor]\nblink-interval-ms = 600\n",
+        )
+        .expect("write initial config");
+
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
+        let mut gui = GuiApp::new(
+            app,
+            GuiLaunchOptions {
+                safe_mode: false,
+                renderer_backend: RenderBackend::Software,
+                config_path: Some(path.clone()),
+                theme: ThemeConfig::default(),
+                font: FontConfig::default(),
+            },
+        );
+
+        fs::write(
+            &path,
+            "[font]\nfamily = \"Iosevka\"\nsize = 16.0\nfallback = [\"Noto Sans CJK SC\"]\n\n[theme]\nopacity = 0.75\n\n[theme.cursor]\nblink-interval-ms = 250\n",
+        )
+        .expect("write changed config");
+
+        assert!(gui.poll_config_reload());
+        assert_eq!(gui.font.family, "Iosevka");
+        assert_eq!(gui.font.size, 16.0);
+        assert_eq!(gui.font_preferences.family, "Iosevka");
+        assert_eq!(gui.frame_interval, Duration::from_millis(250));
+        assert_eq!(gui.theme.opacity, 0.75);
+        assert!(gui.theme_reload_error.is_none());
+        assert!(!gui.poll_config_reload());
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -1415,5 +1556,13 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn temp_config_path(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("noctrail-gui-{label}-{unique}.toml"))
     }
 }

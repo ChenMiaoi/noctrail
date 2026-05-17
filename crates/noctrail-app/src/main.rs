@@ -144,6 +144,9 @@ fn resolve_launch_options(options: &StartupOptions) -> Result<GuiLaunchOptions, 
     Ok(GuiLaunchOptions {
         safe_mode: options.safe_mode,
         renderer_backend,
+        config_path: options.config_path.clone(),
+        theme: config.theme,
+        font: config.font,
     })
 }
 
@@ -174,7 +177,7 @@ fn run_smoke(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>>
 
     let frame = app.frame();
     println!(
-        "pane={:?} pid={:?} backend={:?} surface={}x{} terminal={}x{} rows={}",
+        "pane={:?} pid={:?} backend={:?} surface={}x{} terminal={}x{} rows={} font={} size={} opacity={}",
         frame.pane_id,
         frame.process_id,
         frame.render_plan.backend,
@@ -182,7 +185,10 @@ fn run_smoke(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>>
         frame.surface.height,
         frame.terminal_size.cols,
         frame.terminal_size.rows,
-        frame.render_plan.rows.len()
+        frame.render_plan.rows.len(),
+        launch_options.font.family,
+        launch_options.font.size,
+        launch_options.theme.opacity,
     );
 
     app.write_input(shell_marker_command("NOCTRAIL_APP_SMOKE_WRITE").as_bytes())?;
@@ -309,6 +315,30 @@ mod tests {
         let launch = resolve_launch_options(&options).expect("config should load");
         assert_eq!(launch.renderer_backend, RenderBackend::Software);
         assert!(!launch.safe_mode);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn theme_and_font_are_loaded_into_launch_options() {
+        let path = temp_config_path("theme-font");
+        fs::write(
+            &path,
+            "[font]\nfamily = \"Iosevka\"\nsize = 15.5\n\n[theme]\nopacity = 0.85\n\n[theme.cursor]\nblink-interval-ms = 420\n",
+        )
+        .expect("write config");
+        let options = StartupOptions {
+            command: StartupCommand::Gui,
+            config_path: Some(path.clone()),
+            safe_mode: false,
+        };
+
+        let launch = resolve_launch_options(&options).expect("config should load");
+        assert_eq!(launch.font.family, "Iosevka");
+        assert_eq!(launch.font.size, 15.5);
+        assert_eq!(launch.theme.opacity, 0.85);
+        assert_eq!(launch.theme.cursor.blink_interval_ms, 420);
+        assert_eq!(launch.config_path, Some(path.clone()));
 
         let _ = fs::remove_file(path);
     }

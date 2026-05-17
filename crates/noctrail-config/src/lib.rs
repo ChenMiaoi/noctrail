@@ -5,8 +5,19 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use thiserror::Error;
+
+const DEFAULT_THEME_OPACITY: f32 = 1.0;
+const DEFAULT_FONT_FAMILY: &str = "JetBrainsMono Nerd Font";
+const DEFAULT_FONT_SIZE: f32 = 14.0;
+const DEFAULT_FONT_FALLBACKS: [&str; 4] = [
+    "Noto Sans CJK SC",
+    "Noto Color Emoji",
+    "Apple Color Emoji",
+    "Segoe UI Emoji",
+];
+const DEFAULT_CURSOR_BLINK_INTERVAL_MS: u64 = 600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -22,10 +33,159 @@ pub struct RendererConfig {
     pub backend: RendererBackend,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RgbaColor {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub alpha: u8,
+}
+
+impl RgbaColor {
+    pub const fn from_rgba(red: u8, green: u8, blue: u8, alpha: u8) -> Self {
+        Self {
+            red,
+            green,
+            blue,
+            alpha,
+        }
+    }
+
+    pub const fn from_rgb(red: u8, green: u8, blue: u8) -> Self {
+        Self::from_rgba(red, green, blue, u8::MAX)
+    }
+
+    pub fn alpha_factor(self) -> f64 {
+        f64::from(self.alpha) / f64::from(u8::MAX)
+    }
+}
+
+impl<'de> Deserialize<'de> for RgbaColor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        parse_rgba_color(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct FontConfig {
+    pub family: String,
+    pub size: f32,
+    pub fallback: Vec<String>,
+}
+
+impl Default for FontConfig {
+    fn default() -> Self {
+        Self {
+            family: DEFAULT_FONT_FAMILY.to_string(),
+            size: DEFAULT_FONT_SIZE,
+            fallback: DEFAULT_FONT_FALLBACKS
+                .iter()
+                .map(|family| (*family).to_string())
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct ThemeColors {
+    pub background: RgbaColor,
+    pub foreground: RgbaColor,
+}
+
+impl Default for ThemeColors {
+    fn default() -> Self {
+        Self {
+            background: RgbaColor::from_rgb(0x05, 0x0a, 0x0f),
+            foreground: RgbaColor::from_rgb(0xc0, 0xca, 0xf5),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct BorderTheme {
+    pub active: RgbaColor,
+    pub inactive: RgbaColor,
+    pub width: u16,
+}
+
+impl Default for BorderTheme {
+    fn default() -> Self {
+        Self {
+            active: RgbaColor::from_rgb(0x7a, 0xa2, 0xf7),
+            inactive: RgbaColor::from_rgb(0x3b, 0x42, 0x61),
+            width: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct CursorTheme {
+    pub color: RgbaColor,
+    #[serde(rename = "blink-interval-ms")]
+    pub blink_interval_ms: u64,
+}
+
+impl Default for CursorTheme {
+    fn default() -> Self {
+        Self {
+            color: RgbaColor::from_rgb(0xc0, 0xca, 0xf5),
+            blink_interval_ms: DEFAULT_CURSOR_BLINK_INTERVAL_MS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct SelectionTheme {
+    pub background: RgbaColor,
+    pub foreground: RgbaColor,
+}
+
+impl Default for SelectionTheme {
+    fn default() -> Self {
+        Self {
+            background: RgbaColor::from_rgb(0x26, 0x4f, 0x78),
+            foreground: RgbaColor::from_rgb(0xff, 0xff, 0xff),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct ThemeConfig {
+    pub opacity: f32,
+    pub color: ThemeColors,
+    pub border: BorderTheme,
+    pub cursor: CursorTheme,
+    pub selection: SelectionTheme,
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self {
+            opacity: DEFAULT_THEME_OPACITY,
+            color: ThemeColors::default(),
+            border: BorderTheme::default(),
+            cursor: CursorTheme::default(),
+            selection: SelectionTheme::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
     pub renderer: RendererConfig,
+    pub font: FontConfig,
+    pub theme: ThemeConfig,
 }
 
 #[derive(Debug, Error)]
@@ -42,28 +202,122 @@ pub enum ConfigError {
         #[source]
         source: toml::de::Error,
     },
+    #[error("invalid config at {path}: {reason}")]
+    Validation { path: PathBuf, reason: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfigReloader {
+    path: PathBuf,
+    last_raw: String,
 }
 
 impl Config {
-    pub const fn new() -> Self {
-        Self {
-            renderer: RendererConfig {
-                backend: RendererBackend::Gpu,
-            },
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
-        let raw = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        let raw = read_config_raw(path)?;
+        parse_config_raw(path, &raw)
+    }
+}
+
+impl ConfigReloader {
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let path = path.as_ref();
+        let raw = read_config_raw(path)?;
+        Ok(Self {
             path: path.to_path_buf(),
-            source,
-        })?;
-        toml::from_str(&raw).map_err(|source| ConfigError::Parse {
-            path: path.to_path_buf(),
-            source,
+            last_raw: raw,
         })
     }
+
+    pub fn reload_if_changed(&mut self) -> Result<Option<Config>, ConfigError> {
+        let raw = read_config_raw(&self.path)?;
+        if raw == self.last_raw {
+            return Ok(None);
+        }
+
+        let config = parse_config_raw(&self.path, &raw)?;
+        self.last_raw = raw;
+        Ok(Some(config))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn read_config_raw(path: &Path) -> Result<String, ConfigError> {
+    fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn parse_config_raw(path: &Path, raw: &str) -> Result<Config, ConfigError> {
+    let config = toml::from_str::<Config>(raw).map_err(|source| ConfigError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    validate_config(path, &config)?;
+    Ok(config)
+}
+
+fn validate_config(path: &Path, config: &Config) -> Result<(), ConfigError> {
+    if !(0.0..=1.0).contains(&config.theme.opacity) {
+        return Err(ConfigError::Validation {
+            path: path.to_path_buf(),
+            reason: format!(
+                "theme.opacity must be within 0.0..=1.0, got {}",
+                config.theme.opacity
+            ),
+        });
+    }
+    if config.font.size <= 0.0 {
+        return Err(ConfigError::Validation {
+            path: path.to_path_buf(),
+            reason: format!("font.size must be greater than 0, got {}", config.font.size),
+        });
+    }
+    if config.theme.cursor.blink_interval_ms == 0 {
+        return Err(ConfigError::Validation {
+            path: path.to_path_buf(),
+            reason: "theme.cursor.blink-interval-ms must be greater than 0".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn parse_rgba_color(raw: &str) -> Result<RgbaColor, String> {
+    let trimmed = raw.trim();
+    let hex = trimmed
+        .strip_prefix('#')
+        .ok_or_else(|| format!("colors must start with '#', got {trimmed:?}"))?;
+
+    match hex.len() {
+        6 => Ok(RgbaColor::from_rgb(
+            parse_hex_component(&hex[0..2])?,
+            parse_hex_component(&hex[2..4])?,
+            parse_hex_component(&hex[4..6])?,
+        )),
+        8 => Ok(RgbaColor::from_rgba(
+            parse_hex_component(&hex[0..2])?,
+            parse_hex_component(&hex[2..4])?,
+            parse_hex_component(&hex[4..6])?,
+            parse_hex_component(&hex[6..8])?,
+        )),
+        _ => Err(format!(
+            "colors must be in #RRGGBB or #RRGGBBAA form, got {trimmed:?}"
+        )),
+    }
+}
+
+fn parse_hex_component(raw: &str) -> Result<u8, String> {
+    u8::from_str_radix(raw, 16)
+        .map_err(|_| format!("invalid hex component {raw:?} in color literal"))
 }
 
 #[cfg(test)]
@@ -75,17 +329,67 @@ mod tests {
     };
 
     #[test]
-    fn defaults_to_gpu_backend() {
-        assert_eq!(Config::default().renderer.backend, RendererBackend::Gpu);
+    fn defaults_cover_renderer_font_and_theme() {
+        let config = Config::default();
+
+        assert_eq!(config.renderer.backend, RendererBackend::Gpu);
+        assert_eq!(config.font.family, DEFAULT_FONT_FAMILY);
+        assert_eq!(config.font.size, DEFAULT_FONT_SIZE);
+        assert_eq!(config.theme.opacity, DEFAULT_THEME_OPACITY);
+        assert_eq!(
+            config.theme.cursor.blink_interval_ms,
+            DEFAULT_CURSOR_BLINK_INTERVAL_MS
+        );
+        assert_eq!(
+            config.theme.color.background,
+            RgbaColor::from_rgb(0x05, 0x0a, 0x0f)
+        );
     }
 
     #[test]
-    fn loads_renderer_backend_from_toml() {
-        let path = temp_config_path("backend-software");
-        fs::write(&path, "[renderer]\nbackend = \"software\"\n").expect("write config");
+    fn loads_theme_and_font_fields_from_toml() {
+        let path = temp_config_path("theme-load");
+        fs::write(
+            &path,
+            "[renderer]\nbackend = \"software\"\n\n[font]\nfamily = \"Iosevka\"\nsize = 16.5\nfallback = [\"Noto Sans CJK SC\"]\n\n[theme]\nopacity = 0.8\n\n[theme.color]\nbackground = \"#112233\"\nforeground = \"#abcdef\"\n\n[theme.border]\nactive = \"#7aa2f7\"\ninactive = \"#3b4261\"\nwidth = 2\n\n[theme.cursor]\ncolor = \"#ffeeaa\"\nblink-interval-ms = 450\n\n[theme.selection]\nbackground = \"#264f78cc\"\nforeground = \"#ffffff\"\n",
+        )
+        .expect("write config");
 
         let config = Config::load_from_path(&path).expect("load config");
         assert_eq!(config.renderer.backend, RendererBackend::Software);
+        assert_eq!(config.font.family, "Iosevka");
+        assert_eq!(config.font.size, 16.5);
+        assert_eq!(config.font.fallback, vec!["Noto Sans CJK SC".to_string()]);
+        assert_eq!(config.theme.opacity, 0.8);
+        assert_eq!(
+            config.theme.color.background,
+            RgbaColor::from_rgb(0x11, 0x22, 0x33)
+        );
+        assert_eq!(config.theme.border.width, 2);
+        assert_eq!(
+            config.theme.cursor.color,
+            RgbaColor::from_rgb(0xff, 0xee, 0xaa)
+        );
+        assert_eq!(
+            config.theme.selection.background,
+            RgbaColor::from_rgba(0x26, 0x4f, 0x78, 0xcc)
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_errors_keep_the_config_path() {
+        let path = temp_config_path("invalid-opacity");
+        fs::write(&path, "[theme]\nopacity = 1.5\n").expect("write config");
+
+        let error = Config::load_from_path(&path).expect_err("config should fail");
+        match error {
+            ConfigError::Validation {
+                path: error_path, ..
+            } => assert_eq!(error_path, path),
+            other => panic!("unexpected error: {other:?}"),
+        }
 
         let _ = fs::remove_file(path);
     }
@@ -93,7 +397,7 @@ mod tests {
     #[test]
     fn parse_errors_keep_the_config_path() {
         let path = temp_config_path("parse-error");
-        fs::write(&path, "[renderer\nbackend = \"gpu\"\n").expect("write config");
+        fs::write(&path, "[theme\nopacity = 0.9\n").expect("write config");
 
         let error = Config::load_from_path(&path).expect_err("config should fail");
         match error {
@@ -104,6 +408,38 @@ mod tests {
         }
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reloader_only_returns_changed_configs() {
+        let path = temp_config_path("reloader");
+        fs::write(&path, "[theme]\nopacity = 1.0\n").expect("write initial config");
+
+        let mut reloader = ConfigReloader::from_path(&path).expect("watch config");
+        assert_eq!(reloader.reload_if_changed().expect("same config"), None);
+
+        fs::write(&path, "[theme]\nopacity = 0.7\n").expect("write changed config");
+        let changed = reloader
+            .reload_if_changed()
+            .expect("changed config should load")
+            .expect("config should be marked changed");
+        assert_eq!(changed.theme.opacity, 0.7);
+        assert_eq!(
+            reloader.reload_if_changed().expect("same changed config"),
+            None
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn color_literals_require_hash_prefixed_hex() {
+        assert_eq!(
+            parse_rgba_color("#112233").expect("rgb should parse"),
+            RgbaColor::from_rgb(0x11, 0x22, 0x33)
+        );
+        assert!(parse_rgba_color("112233").is_err());
+        assert!(parse_rgba_color("#12345").is_err());
     }
 
     fn temp_config_path(label: &str) -> PathBuf {
