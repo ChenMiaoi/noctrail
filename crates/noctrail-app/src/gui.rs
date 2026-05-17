@@ -2279,6 +2279,12 @@ fn scroll_lines(delta: MouseScrollDelta) -> i32 {
     }
 }
 
+fn exit_on_error<T, E>(event_loop: &ActiveEventLoop, result: Result<T, E>) {
+    if result.is_err() {
+        event_loop.exit();
+    }
+}
+
 impl ApplicationHandler for GuiApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() && self.create_window(event_loop).is_err() {
@@ -2312,25 +2318,15 @@ impl ApplicationHandler for GuiApp {
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
             }
-            WindowEvent::Ime(ime) => {
-                if self.handle_ime_event(ime).is_err() {
-                    event_loop.exit();
-                }
-            }
+            WindowEvent::Ime(ime) => exit_on_error(event_loop, self.handle_ime_event(ime)),
             WindowEvent::CursorMoved { position, .. } => {
-                if self.handle_cursor_moved(position).is_err() {
-                    event_loop.exit();
-                }
+                exit_on_error(event_loop, self.handle_cursor_moved(position));
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if self.handle_mouse_input(state, button).is_err() {
-                    event_loop.exit();
-                }
+                exit_on_error(event_loop, self.handle_mouse_input(state, button));
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if self.handle_mouse_wheel(delta).is_err() {
-                    event_loop.exit();
-                }
+                exit_on_error(event_loop, self.handle_mouse_wheel(delta));
             }
             WindowEvent::KeyboardInput {
                 event,
