@@ -18,6 +18,9 @@ const DEFAULT_FONT_FALLBACKS: [&str; 4] = [
     "Segoe UI Emoji",
 ];
 const DEFAULT_CURSOR_BLINK_INTERVAL_MS: u64 = 600;
+const DEFAULT_PANE_GAP: u16 = 4;
+const DEFAULT_PANE_PADDING: u16 = 2;
+const DEFAULT_PANE_RADIUS: u16 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -158,12 +161,31 @@ impl Default for SelectionTheme {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct PaneTheme {
+    pub gap: u16,
+    pub padding: u16,
+    pub radius: u16,
+}
+
+impl Default for PaneTheme {
+    fn default() -> Self {
+        Self {
+            gap: DEFAULT_PANE_GAP,
+            padding: DEFAULT_PANE_PADDING,
+            radius: DEFAULT_PANE_RADIUS,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct ThemeConfig {
     pub opacity: f32,
     pub color: ThemeColors,
     pub border: BorderTheme,
+    pub pane: PaneTheme,
     pub cursor: CursorTheme,
     pub selection: SelectionTheme,
 }
@@ -174,6 +196,7 @@ impl Default for ThemeConfig {
             opacity: DEFAULT_THEME_OPACITY,
             color: ThemeColors::default(),
             border: BorderTheme::default(),
+            pane: PaneTheme::default(),
             cursor: CursorTheme::default(),
             selection: SelectionTheme::default(),
         }
@@ -344,6 +367,9 @@ mod tests {
             config.theme.color.background,
             RgbaColor::from_rgb(0x05, 0x0a, 0x0f)
         );
+        assert_eq!(config.theme.pane.gap, DEFAULT_PANE_GAP);
+        assert_eq!(config.theme.pane.padding, DEFAULT_PANE_PADDING);
+        assert_eq!(config.theme.pane.radius, DEFAULT_PANE_RADIUS);
     }
 
     #[test]
@@ -351,7 +377,7 @@ mod tests {
         let path = temp_config_path("theme-load");
         fs::write(
             &path,
-            "[renderer]\nbackend = \"software\"\n\n[font]\nfamily = \"Iosevka\"\nsize = 16.5\nfallback = [\"Noto Sans CJK SC\"]\n\n[theme]\nopacity = 0.8\n\n[theme.color]\nbackground = \"#112233\"\nforeground = \"#abcdef\"\n\n[theme.border]\nactive = \"#7aa2f7\"\ninactive = \"#3b4261\"\nwidth = 2\n\n[theme.cursor]\ncolor = \"#ffeeaa\"\nblink-interval-ms = 450\n\n[theme.selection]\nbackground = \"#264f78cc\"\nforeground = \"#ffffff\"\n",
+            "[renderer]\nbackend = \"software\"\n\n[font]\nfamily = \"Iosevka\"\nsize = 16.5\nfallback = [\"Noto Sans CJK SC\"]\n\n[theme]\nopacity = 0.8\n\n[theme.color]\nbackground = \"#112233\"\nforeground = \"#abcdef\"\n\n[theme.border]\nactive = \"#7aa2f7\"\ninactive = \"#3b4261\"\nwidth = 2\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.cursor]\ncolor = \"#ffeeaa\"\nblink-interval-ms = 450\n\n[theme.selection]\nbackground = \"#264f78cc\"\nforeground = \"#ffffff\"\n",
         )
         .expect("write config");
 
@@ -366,6 +392,9 @@ mod tests {
             RgbaColor::from_rgb(0x11, 0x22, 0x33)
         );
         assert_eq!(config.theme.border.width, 2);
+        assert_eq!(config.theme.pane.gap, 10);
+        assert_eq!(config.theme.pane.padding, 4);
+        assert_eq!(config.theme.pane.radius, 12);
         assert_eq!(
             config.theme.cursor.color,
             RgbaColor::from_rgb(0xff, 0xee, 0xaa)

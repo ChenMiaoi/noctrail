@@ -503,6 +503,12 @@ fn run_render_fixture(path: &Path) -> Result<(), String> {
         FixtureBackend::Software => RenderBackend::Software,
     };
     let plan = RenderPlan::from_input(noctrail_render::RenderInput {
+        pane_rect: RenderRect::new(
+            fixture.surface.x,
+            fixture.surface.y,
+            fixture.surface.width,
+            fixture.surface.height,
+        ),
         viewport: RenderRect::new(
             fixture.surface.x,
             fixture.surface.y,
@@ -518,6 +524,7 @@ fn run_render_fixture(path: &Path) -> Result<(), String> {
             active: fixture.border.active.into(),
             inactive: fixture.border.inactive.into(),
         },
+        corner_radius: 0,
     });
     let prepared = prepare_render_frame(
         &plan,

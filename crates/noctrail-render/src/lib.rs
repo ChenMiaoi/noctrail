@@ -133,17 +133,20 @@ impl RenderRow {
 
 #[derive(Debug, Clone, Copy)]
 pub struct RenderInput<'a> {
+    pub pane_rect: RenderRect,
     pub viewport: RenderRect,
     pub backend: RenderBackend,
     pub snapshot: &'a TerminalSnapshot,
     pub damage: &'a DamageSet,
     pub active: bool,
     pub border: PaneBorderStyle,
+    pub corner_radius: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RenderPlan {
     pub backend: RenderBackend,
+    pub pane_rect: RenderRect,
     pub viewport: RenderRect,
     pub damage: DamageSet,
     pub scrollback_rows: usize,
@@ -152,6 +155,7 @@ pub struct RenderPlan {
     pub selection: Option<Selection>,
     pub active: bool,
     pub border: PaneBorderStyle,
+    pub corner_radius: usize,
     pub rows: Vec<RenderRow>,
 }
 
@@ -166,6 +170,7 @@ impl RenderPlan {
         snapshot: &TerminalSnapshot,
     ) -> Self {
         Self::from_input(RenderInput {
+            pane_rect: viewport,
             viewport,
             backend,
             snapshot,
@@ -175,12 +180,14 @@ impl RenderPlan {
             },
             active: true,
             border: PaneBorderStyle::default(),
+            corner_radius: 0,
         })
     }
 
     pub fn from_input(input: RenderInput<'_>) -> Self {
         Self {
             backend: input.backend,
+            pane_rect: input.pane_rect,
             viewport: input.viewport,
             damage: input.damage.clone(),
             scrollback_rows: input.snapshot.scrollback.len(),
@@ -189,6 +196,7 @@ impl RenderPlan {
             selection: input.snapshot.selection.clone(),
             active: input.active,
             border: input.border,
+            corner_radius: input.corner_radius,
             rows: input
                 .snapshot
                 .rows
@@ -387,6 +395,7 @@ pub struct BorderSegment {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BorderFrame {
+    pub corner_radius: usize,
     pub segments: Vec<BorderSegment>,
 }
 
@@ -530,15 +539,15 @@ pub fn prepare_cell_paint_frame(plan: &RenderPlan) -> CellPaintFrame {
 }
 
 pub fn prepare_border_frame(plan: &RenderPlan) -> BorderFrame {
-    if !plan.border.enabled() || plan.viewport.width == 0 || plan.viewport.height == 0 {
+    if !plan.border.enabled() || plan.pane_rect.width == 0 || plan.pane_rect.height == 0 {
         return BorderFrame::default();
     }
 
     let thickness = plan
         .border
         .width
-        .min(plan.viewport.width)
-        .min(plan.viewport.height);
+        .min(plan.pane_rect.width)
+        .min(plan.pane_rect.height);
     if thickness == 0 {
         return BorderFrame::default();
     }
@@ -546,42 +555,45 @@ pub fn prepare_border_frame(plan: &RenderPlan) -> BorderFrame {
     let mut segments = Vec::with_capacity(4);
     let color = plan.border.color_for(plan.active);
     segments.push(BorderSegment {
-        x: plan.viewport.x,
-        y: plan.viewport.y,
-        width: plan.viewport.width,
+        x: plan.pane_rect.x,
+        y: plan.pane_rect.y,
+        width: plan.pane_rect.width,
         height: thickness,
         color,
     });
     segments.push(BorderSegment {
-        x: plan.viewport.x,
-        y: plan.viewport.y + plan.viewport.height.saturating_sub(thickness),
-        width: plan.viewport.width,
+        x: plan.pane_rect.x,
+        y: plan.pane_rect.y + plan.pane_rect.height.saturating_sub(thickness),
+        width: plan.pane_rect.width,
         height: thickness,
         color,
     });
 
     let side_height = plan
-        .viewport
+        .pane_rect
         .height
         .saturating_sub(thickness.saturating_mul(2));
     if side_height > 0 {
         segments.push(BorderSegment {
-            x: plan.viewport.x,
-            y: plan.viewport.y + thickness,
+            x: plan.pane_rect.x,
+            y: plan.pane_rect.y + thickness,
             width: thickness,
             height: side_height,
             color,
         });
         segments.push(BorderSegment {
-            x: plan.viewport.x + plan.viewport.width.saturating_sub(thickness),
-            y: plan.viewport.y + thickness,
+            x: plan.pane_rect.x + plan.pane_rect.width.saturating_sub(thickness),
+            y: plan.pane_rect.y + thickness,
             width: thickness,
             height: side_height,
             color,
         });
     }
 
-    BorderFrame { segments }
+    BorderFrame {
+        corner_radius: plan.corner_radius,
+        segments,
+    }
 }
 
 fn collect_font_diagnostics(
@@ -1378,6 +1390,7 @@ mod tests {
             RenderPlan::from_terminal(RenderRect::new(1, 2, 80, 24), RenderBackend::Gpu, &snapshot);
 
         assert_eq!(plan.backend, RenderBackend::Gpu);
+        assert_eq!(plan.pane_rect, RenderRect::new(1, 2, 80, 24));
         assert_eq!(plan.viewport, RenderRect::new(1, 2, 80, 24));
         assert!(plan.damage.full_frame);
         assert_eq!(plan.damage.dirty_rows, vec![0]);
@@ -1386,6 +1399,7 @@ mod tests {
         assert!(plan.alternate_screen);
         assert_eq!(plan.selection, snapshot.selection);
         assert!(plan.active);
+        assert_eq!(plan.corner_radius, 0);
         assert_eq!(plan.rows.len(), 1);
         assert_eq!(plan.rows[0].row, 0);
         assert!(!plan.rows[0].wrapped);
@@ -1669,12 +1683,14 @@ mod tests {
             full_frame: false,
         };
         let plan = RenderPlan::from_input(RenderInput {
+            pane_rect: RenderRect::new(0, 0, 2, 3),
             viewport: RenderRect::new(0, 0, 2, 3),
             backend: RenderBackend::Software,
             snapshot: &snapshot,
             damage: &damage,
             active: true,
             border: PaneBorderStyle::default(),
+            corner_radius: 0,
         });
 
         let prepared = prepare_render_frame(&plan, &GlyphRasterConfig::default()).unwrap();
@@ -1731,12 +1747,14 @@ mod tests {
             full_frame: false,
         };
         let plan = RenderPlan::from_input(RenderInput {
+            pane_rect: RenderRect::new(0, 0, 3, 3),
             viewport: RenderRect::new(0, 0, 3, 3),
             backend: RenderBackend::Software,
             snapshot: &snapshot,
             damage: &damage,
             active: true,
             border: PaneBorderStyle::default(),
+            corner_radius: 0,
         });
 
         let prepared = prepare_render_frame(&plan, &GlyphRasterConfig::default()).unwrap();
@@ -1751,6 +1769,7 @@ mod tests {
     fn border_frame_uses_active_color_on_all_edges() {
         let plan = RenderPlan {
             backend: RenderBackend::Software,
+            pane_rect: RenderRect::new(10, 20, 120, 80),
             viewport: RenderRect::new(10, 20, 120, 80),
             damage: DamageSet {
                 dirty_rows: vec![0],
@@ -1766,6 +1785,7 @@ mod tests {
                 active: Rgba::opaque(0x7a, 0xa2, 0xf7),
                 inactive: Rgba::opaque(0x3b, 0x42, 0x61),
             },
+            corner_radius: 6,
             rows: Vec::new(),
         };
 
@@ -1804,12 +1824,14 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(border.corner_radius, 6);
     }
 
     #[test]
     fn border_frame_switches_to_inactive_color() {
         let plan = RenderPlan {
             backend: RenderBackend::Software,
+            pane_rect: RenderRect::new(0, 0, 8, 4),
             viewport: RenderRect::new(0, 0, 8, 4),
             damage: DamageSet {
                 dirty_rows: vec![0],
@@ -1825,6 +1847,7 @@ mod tests {
                 active: Rgba::opaque(0x7a, 0xa2, 0xf7),
                 inactive: Rgba::opaque(0x3b, 0x42, 0x61),
             },
+            corner_radius: 0,
             rows: Vec::new(),
         };
 
@@ -1855,18 +1878,22 @@ mod tests {
         };
 
         let plan = RenderPlan::from_input(RenderInput {
+            pane_rect: RenderRect::new(1, 2, 6, 7),
             viewport: RenderRect::new(4, 5, 6, 7),
             backend: RenderBackend::Software,
             snapshot: &snapshot,
             damage: &damage,
             active: false,
             border: PaneBorderStyle::default(),
+            corner_radius: 9,
         });
 
+        assert_eq!(plan.pane_rect, RenderRect::new(1, 2, 6, 7));
         assert_eq!(plan.viewport, RenderRect::new(4, 5, 6, 7));
         assert_eq!(plan.damage, damage);
         assert!(!plan.active);
         assert_eq!(plan.border, PaneBorderStyle::default());
+        assert_eq!(plan.corner_radius, 9);
         assert_eq!(plan.rows[0].glyphs.len(), 3);
     }
 

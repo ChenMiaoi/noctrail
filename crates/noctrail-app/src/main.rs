@@ -1,13 +1,13 @@
 use std::{env, path::PathBuf, process};
 
 use noctrail_app::{
-    DesktopApp,
+    DesktopApp, PaneChromeConfig,
     gui::{self, GuiLaunchOptions},
 };
-use noctrail_config::{Config, ConfigError, RendererBackend as ConfigRendererBackend};
+use noctrail_config::{Config, ConfigError, RendererBackend as ConfigRendererBackend, ThemeConfig};
 use noctrail_layout::LayoutRect;
 use noctrail_pty::PtySize;
-use noctrail_render::RenderBackend;
+use noctrail_render::{PaneBorderStyle, RenderBackend, Rgba};
 
 const HELP: &str = "\
 Noctrail app smoke harness
@@ -174,13 +174,16 @@ fn run_smoke(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>>
     let launch_options = resolve_launch_options(options)?;
     let mut app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24))?;
     app.set_backend(launch_options.renderer_backend);
+    app.set_pane_chrome(pane_chrome_from_theme(&launch_options.theme))?;
 
     let frame = app.frame();
     println!(
-        "pane={:?} pid={:?} backend={:?} surface={}x{} terminal={}x{} rows={} font={} size={} opacity={}",
+        "pane={:?} pid={:?} backend={:?} pane={}x{} content={}x{} terminal={}x{} rows={} font={} size={} opacity={}",
         frame.pane_id,
         frame.process_id,
         frame.render_plan.backend,
+        frame.pane_surface.width,
+        frame.pane_surface.height,
         frame.surface.width,
         frame.surface.height,
         frame.terminal_size.cols,
@@ -226,6 +229,28 @@ fn read_all_runtime_output(app: &mut DesktopApp) -> Result<Vec<u8>, Box<dyn std:
     }
 
     Ok(output)
+}
+
+fn pane_chrome_from_theme(theme: &ThemeConfig) -> PaneChromeConfig {
+    PaneChromeConfig {
+        border: PaneBorderStyle {
+            width: usize::from(theme.border.width),
+            active: rgba_from_config(theme.border.active),
+            inactive: rgba_from_config(theme.border.inactive),
+        },
+        gap: theme.pane.gap,
+        padding: theme.pane.padding,
+        radius: theme.pane.radius,
+    }
+}
+
+fn rgba_from_config(color: noctrail_config::RgbaColor) -> Rgba {
+    Rgba {
+        red: color.red,
+        green: color.green,
+        blue: color.blue,
+        alpha: color.alpha,
+    }
 }
 
 fn shell_marker_command(marker: &str) -> String {
@@ -324,7 +349,7 @@ mod tests {
         let path = temp_config_path("theme-font");
         fs::write(
             &path,
-            "[font]\nfamily = \"Iosevka\"\nsize = 15.5\n\n[theme]\nopacity = 0.85\n\n[theme.cursor]\nblink-interval-ms = 420\n",
+            "[font]\nfamily = \"Iosevka\"\nsize = 15.5\n\n[theme]\nopacity = 0.85\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.cursor]\nblink-interval-ms = 420\n",
         )
         .expect("write config");
         let options = StartupOptions {
@@ -337,6 +362,9 @@ mod tests {
         assert_eq!(launch.font.family, "Iosevka");
         assert_eq!(launch.font.size, 15.5);
         assert_eq!(launch.theme.opacity, 0.85);
+        assert_eq!(launch.theme.pane.gap, 10);
+        assert_eq!(launch.theme.pane.padding, 4);
+        assert_eq!(launch.theme.pane.radius, 12);
         assert_eq!(launch.theme.cursor.blink_interval_ms, 420);
         assert_eq!(launch.config_path, Some(path.clone()));
 

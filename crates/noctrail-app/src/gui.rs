@@ -11,7 +11,7 @@ use std::{
 use noctrail_config::{ConfigReloader, FontConfig, ThemeConfig};
 use noctrail_layout::{FocusDirection, LayoutRect, SplitAxis, WorkspaceId};
 use noctrail_pty::{PtyOutputReader, PtySize};
-use noctrail_render::{FontPreferences, GpuRenderer, RenderBackend};
+use noctrail_render::{FontPreferences, GpuRenderer, PaneBorderStyle, RenderBackend, Rgba};
 use noctrail_term::{MouseTrackingMode, Position, SelectionMode};
 use winit::{
     application::ApplicationHandler,
@@ -22,7 +22,7 @@ use winit::{
     window::{Window, WindowId},
 };
 
-use crate::{DesktopApp, DesktopFrame, clipboard::ClipboardBridge, input};
+use crate::{DesktopApp, DesktopFrame, PaneChromeConfig, clipboard::ClipboardBridge, input};
 
 const DEFAULT_WINDOW_WIDTH: u32 = 1280;
 const DEFAULT_WINDOW_HEIGHT: u32 = 800;
@@ -323,7 +323,7 @@ struct GuiApp {
 }
 
 impl GuiApp {
-    fn new(app: DesktopApp, launch_options: GuiLaunchOptions) -> Self {
+    fn new(mut app: DesktopApp, launch_options: GuiLaunchOptions) -> Self {
         let now = Instant::now();
         let config_reloader = launch_options
             .config_path
@@ -331,6 +331,8 @@ impl GuiApp {
             .and_then(|path| ConfigReloader::from_path(path).ok());
         let theme = launch_options.theme.clone();
         let font = launch_options.font.clone();
+        app.set_pane_chrome(pane_chrome_from_theme(&theme))
+            .expect("app should accept pane chrome updates");
         Self {
             app,
             launch_options,
@@ -751,6 +753,14 @@ impl GuiApp {
                 self.theme = config.theme;
                 self.font = config.font;
                 self.font_preferences = font_preferences_from_config(&self.font);
+                if let Err(error) = self
+                    .app
+                    .set_pane_chrome(pane_chrome_from_theme(&self.theme))
+                {
+                    self.theme_reload_error = Some(error.to_string());
+                    self.update_title();
+                    return false;
+                }
                 self.theme_reload_error = None;
                 self.apply_theme_visuals();
                 self.touch_cursor_blink();
@@ -855,6 +865,28 @@ fn font_preferences_from_config(config: &FontConfig) -> FontPreferences {
 
 fn srgb_component(value: u8) -> f64 {
     f64::from(value) / f64::from(u8::MAX)
+}
+
+fn pane_chrome_from_theme(theme: &ThemeConfig) -> PaneChromeConfig {
+    PaneChromeConfig {
+        border: PaneBorderStyle {
+            width: usize::from(theme.border.width),
+            active: rgba_from_config(theme.border.active),
+            inactive: rgba_from_config(theme.border.inactive),
+        },
+        gap: theme.pane.gap,
+        padding: theme.pane.padding,
+        radius: theme.pane.radius,
+    }
+}
+
+fn rgba_from_config(color: noctrail_config::RgbaColor) -> Rgba {
+    Rgba {
+        red: color.red,
+        green: color.green,
+        blue: color.blue,
+        alpha: color.alpha,
+    }
 }
 
 enum OutputPumpEvent {
@@ -1118,11 +1150,13 @@ mod tests {
             workspace_id: WorkspaceId::new(1),
             is_scratch: false,
             pane_id: PaneId::new(7),
+            pane_surface: LayoutRect::new(0, 0, 120, 80),
             surface: LayoutRect::new(0, 0, 120, 80),
             terminal_size: PtySize::new(80, 24),
             process_id: Some(1234),
             render_plan: RenderPlan {
                 backend: RenderBackend::Gpu,
+                pane_rect: RenderRect::new(0, 0, 120, 80),
                 viewport: RenderRect::new(0, 0, 120, 80),
                 damage: noctrail_term::DamageSet {
                     dirty_rows: vec![1],
@@ -1134,6 +1168,7 @@ mod tests {
                 selection: None,
                 active: true,
                 border: PaneBorderStyle::default(),
+                corner_radius: 0,
                 rows: Vec::new(),
             },
         };
@@ -1198,7 +1233,7 @@ mod tests {
         let path = temp_config_path("theme-reload");
         fs::write(
             &path,
-            "[font]\nfamily = \"JetBrainsMono Nerd Font\"\nsize = 14.0\n\n[theme]\nopacity = 1.0\n\n[theme.cursor]\nblink-interval-ms = 600\n",
+            "[font]\nfamily = \"JetBrainsMono Nerd Font\"\nsize = 14.0\n\n[theme]\nopacity = 1.0\n\n[theme.pane]\ngap = 8\npadding = 6\nradius = 8\n\n[theme.cursor]\nblink-interval-ms = 600\n",
         )
         .expect("write initial config");
 
@@ -1216,7 +1251,7 @@ mod tests {
 
         fs::write(
             &path,
-            "[font]\nfamily = \"Iosevka\"\nsize = 16.0\nfallback = [\"Noto Sans CJK SC\"]\n\n[theme]\nopacity = 0.75\n\n[theme.cursor]\nblink-interval-ms = 250\n",
+            "[font]\nfamily = \"Iosevka\"\nsize = 16.0\nfallback = [\"Noto Sans CJK SC\"]\n\n[theme]\nopacity = 0.75\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.cursor]\nblink-interval-ms = 250\n",
         )
         .expect("write changed config");
 
@@ -1226,6 +1261,9 @@ mod tests {
         assert_eq!(gui.font_preferences.family, "Iosevka");
         assert_eq!(gui.frame_interval, Duration::from_millis(250));
         assert_eq!(gui.theme.opacity, 0.75);
+        assert_eq!(gui.app.pane_chrome().gap, 10);
+        assert_eq!(gui.app.pane_chrome().padding, 4);
+        assert_eq!(gui.app.pane_chrome().radius, 12);
         assert!(gui.theme_reload_error.is_none());
         assert!(!gui.poll_config_reload());
 
@@ -1246,7 +1284,17 @@ mod tests {
     #[test]
     fn command_palette_executes_split_horizontal() -> Result<(), Box<dyn Error>> {
         let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
-        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
+        let mut theme = ThemeConfig::default();
+        theme.pane.gap = 0;
+        theme.pane.padding = 0;
+        theme.pane.radius = 0;
+        let mut gui = GuiApp::new(
+            app,
+            GuiLaunchOptions {
+                theme,
+                ..GuiLaunchOptions::default()
+            },
+        );
 
         PaletteCommand::SplitHorizontal.execute(&mut gui.app)?;
 
@@ -1363,7 +1411,17 @@ mod tests {
     #[test]
     fn wheel_scroll_moves_scrollback_view() -> Result<(), Box<dyn Error>> {
         let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(8, 2));
-        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
+        let mut theme = ThemeConfig::default();
+        theme.pane.gap = 0;
+        theme.pane.padding = 0;
+        theme.pane.radius = 0;
+        let mut gui = GuiApp::new(
+            app,
+            GuiLaunchOptions {
+                theme,
+                ..GuiLaunchOptions::default()
+            },
+        );
         gui.app.advance_output(b"one\r\ntwo\r\nthree");
 
         gui.handle_mouse_wheel(MouseScrollDelta::LineDelta(0.0, 1.0))?;

@@ -22,6 +22,14 @@ use thiserror::Error;
 const ROOT_PANE_ID: PaneId = PaneId::new(1);
 const SCRATCH_HEIGHT_DIVISOR: u16 = 3;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PaneChromeConfig {
+    pub border: PaneBorderStyle,
+    pub gap: u16,
+    pub padding: u16,
+    pub radius: u16,
+}
+
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("the active pane does not have a runtime")]
@@ -234,23 +242,32 @@ impl TerminalPane {
 
     pub fn render_plan(
         &self,
-        surface: LayoutRect,
+        pane_surface: LayoutRect,
+        content_surface: LayoutRect,
         backend: RenderBackend,
         active: bool,
+        chrome: PaneChromeConfig,
     ) -> RenderPlan {
         let snapshot = self.render_snapshot();
         RenderPlan::from_input(RenderInput {
+            pane_rect: RenderRect::new(
+                usize::from(pane_surface.x),
+                usize::from(pane_surface.y),
+                usize::from(pane_surface.width),
+                usize::from(pane_surface.height),
+            ),
             viewport: RenderRect::new(
-                usize::from(surface.x),
-                usize::from(surface.y),
-                usize::from(surface.width),
-                usize::from(surface.height),
+                usize::from(content_surface.x),
+                usize::from(content_surface.y),
+                usize::from(content_surface.width),
+                usize::from(content_surface.height),
             ),
             backend,
             snapshot: &snapshot,
             damage: &self.last_damage,
             active,
-            border: PaneBorderStyle::default(),
+            border: chrome.border,
+            corner_radius: usize::from(chrome.radius),
         })
     }
 
@@ -326,6 +343,7 @@ pub struct DesktopFrame {
     pub workspace_id: WorkspaceId,
     pub is_scratch: bool,
     pub pane_id: PaneId,
+    pub pane_surface: LayoutRect,
     pub surface: LayoutRect,
     pub terminal_size: PtySize,
     pub process_id: Option<u32>,
@@ -337,6 +355,7 @@ pub struct DesktopApp {
     surface: LayoutRect,
     terminal_size: PtySize,
     backend: RenderBackend,
+    pane_chrome: PaneChromeConfig,
     workspaces: WorkspaceSet,
     scratch_pane_id: Option<PaneId>,
     scratch_visible: bool,
@@ -379,6 +398,21 @@ impl DesktopApp {
 
     pub fn set_backend(&mut self, backend: RenderBackend) {
         self.backend = backend;
+    }
+
+    pub fn pane_chrome(&self) -> PaneChromeConfig {
+        self.pane_chrome
+    }
+
+    pub fn set_pane_chrome(&mut self, pane_chrome: PaneChromeConfig) -> Result<(), AppError> {
+        if self.pane_chrome == pane_chrome {
+            return Ok(());
+        }
+
+        self.pane_chrome = pane_chrome;
+        self.sync_pane_terminal_sizes()?;
+        self.invalidate_visuals();
+        Ok(())
     }
 
     pub fn surface(&self) -> LayoutRect {
@@ -558,7 +592,7 @@ impl DesktopApp {
             let pane_id = self.allocate_pane_id()?;
             let pane = TerminalPane::spawn_shell(
                 pane_id,
-                scratch_terminal_size(self.surface, self.terminal_size),
+                scratch_terminal_size(self.surface, self.terminal_size, self.pane_chrome),
             )?;
             self.panes.insert(pane_id, pane);
             self.scratch_pane_id = Some(pane_id);
@@ -576,7 +610,14 @@ impl DesktopApp {
             pane_id
         } else {
             let pane_id = self.allocate_pane_id()?;
-            let pane = TerminalPane::spawn_shell(pane_id, self.terminal_size)?;
+            let pane = TerminalPane::spawn_shell(
+                pane_id,
+                pane_terminal_size(
+                    self.surface,
+                    self.terminal_size,
+                    pane_content_surface(self.surface, self.pane_chrome),
+                ),
+            )?;
             self.workspaces.active_layout_mut().insert_root(pane_id)?;
             self.panes.insert(pane_id, pane);
             pane_id
@@ -610,15 +651,23 @@ impl DesktopApp {
                 .map(|layout| layout.rect)
                 .ok_or(AppError::PaneNotFound(pane_id))?
         };
+        let content_surface = pane_content_surface(pane_surface, self.pane_chrome);
 
         Ok(DesktopFrame {
             workspace_id,
             is_scratch,
             pane_id,
-            surface: pane_surface,
+            pane_surface,
+            surface: content_surface,
             terminal_size: pane.terminal_size(),
             process_id: pane.process_id(),
-            render_plan: pane.render_plan(pane_surface, self.backend, pane_id == active_pane),
+            render_plan: pane.render_plan(
+                pane_surface,
+                content_surface,
+                self.backend,
+                pane_id == active_pane,
+                self.pane_chrome,
+            ),
         })
     }
 
@@ -691,6 +740,7 @@ impl DesktopApp {
             surface,
             terminal_size,
             backend: RenderBackend::default(),
+            pane_chrome: PaneChromeConfig::default(),
             workspaces: WorkspaceSet::new(ROOT_PANE_ID),
             scratch_pane_id: None,
             scratch_visible: false,
@@ -732,14 +782,19 @@ impl DesktopApp {
     fn sync_pane_terminal_sizes(&mut self) -> Result<(), AppError> {
         let layouts = self.pane_layouts();
         for layout in layouts {
-            let pane_size = pane_terminal_size(self.surface, self.terminal_size, layout.rect);
+            let pane_size = pane_terminal_size(
+                self.surface,
+                self.terminal_size,
+                pane_content_surface(layout.rect, self.pane_chrome),
+            );
             self.pane_mut_by_id(layout.pane_id)
                 .ok_or(AppError::PaneNotFound(layout.pane_id))?
                 .resize(pane_size)?;
         }
 
         if let Some(scratch_pane_id) = self.scratch_pane_id {
-            let pane_size = scratch_terminal_size(self.surface, self.terminal_size);
+            let pane_size =
+                scratch_terminal_size(self.surface, self.terminal_size, self.pane_chrome);
             self.pane_mut_by_id(scratch_pane_id)
                 .ok_or(AppError::PaneNotFound(scratch_pane_id))?
                 .resize(pane_size)?;
@@ -883,8 +938,16 @@ fn scratch_surface(surface: LayoutRect) -> LayoutRect {
     LayoutRect::new(surface.x, surface.y, surface.width, height)
 }
 
-fn scratch_terminal_size(surface: LayoutRect, terminal_size: PtySize) -> PtySize {
-    pane_terminal_size(surface, terminal_size, scratch_surface(surface))
+fn scratch_terminal_size(
+    surface: LayoutRect,
+    terminal_size: PtySize,
+    pane_chrome: PaneChromeConfig,
+) -> PtySize {
+    pane_terminal_size(
+        surface,
+        terminal_size,
+        pane_content_surface(scratch_surface(surface), pane_chrome),
+    )
 }
 
 fn projected_cells(offset: u16, span: u16, total_span: u16, total_cells: u16) -> u16 {
@@ -896,6 +959,48 @@ fn projected_cells(offset: u16, span: u16, total_span: u16, total_cells: u16) ->
     let end =
         (u32::from(offset.saturating_add(span)) * u32::from(total_cells)) / u32::from(total_span);
     end.saturating_sub(start).max(1) as u16
+}
+
+fn pane_content_surface(pane_surface: LayoutRect, pane_chrome: PaneChromeConfig) -> LayoutRect {
+    inset_layout_rect(pane_surface, pane_content_insets(pane_chrome))
+}
+
+fn pane_content_insets(pane_chrome: PaneChromeConfig) -> EdgeInsets {
+    let left_gap = pane_chrome.gap / 2;
+    let right_gap = pane_chrome.gap - left_gap;
+    let top_gap = pane_chrome.gap / 2;
+    let bottom_gap = pane_chrome.gap - top_gap;
+    EdgeInsets {
+        left: left_gap.saturating_add(pane_chrome.padding),
+        right: right_gap.saturating_add(pane_chrome.padding),
+        top: top_gap.saturating_add(pane_chrome.padding),
+        bottom: bottom_gap.saturating_add(pane_chrome.padding),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct EdgeInsets {
+    left: u16,
+    right: u16,
+    top: u16,
+    bottom: u16,
+}
+
+fn inset_layout_rect(rect: LayoutRect, insets: EdgeInsets) -> LayoutRect {
+    let total_horizontal = insets.left.saturating_add(insets.right).min(rect.width);
+    let total_vertical = insets.top.saturating_add(insets.bottom).min(rect.height);
+
+    let width = rect.width.saturating_sub(total_horizontal).max(1);
+    let height = rect.height.saturating_sub(total_vertical).max(1);
+    let left = insets.left.min(rect.width.saturating_sub(width));
+    let top = insets.top.min(rect.height.saturating_sub(height));
+
+    LayoutRect::new(
+        rect.x.saturating_add(left),
+        rect.y.saturating_add(top),
+        width,
+        height,
+    )
 }
 
 #[cfg(test)]
@@ -925,6 +1030,51 @@ mod tests {
         assert_eq!(frame.render_plan.scrollback_rows, 0);
         assert!(frame.render_plan.active);
         assert!(frame.render_plan.selection.is_none());
+    }
+
+    #[test]
+    fn setting_pane_chrome_insets_content_surface_and_terminal_size()
+    -> Result<(), Box<dyn StdError>> {
+        let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(12, 4));
+        let chrome = PaneChromeConfig {
+            border: PaneBorderStyle {
+                width: 2,
+                active: noctrail_render::Rgba::opaque(0x7a, 0xa2, 0xf7),
+                inactive: noctrail_render::Rgba::opaque(0x3b, 0x42, 0x61),
+            },
+            gap: 8,
+            padding: 6,
+            radius: 10,
+        };
+
+        app.set_pane_chrome(chrome)?;
+
+        let frame = app.frame();
+        assert_eq!(frame.pane_surface, LayoutRect::new(0, 0, 120, 80));
+        assert_eq!(frame.surface, LayoutRect::new(10, 10, 100, 60));
+        assert_eq!(frame.terminal_size, PtySize::new(10, 3));
+        assert_eq!(frame.render_plan.pane_rect, RenderRect::new(0, 0, 120, 80));
+        assert_eq!(frame.render_plan.viewport, RenderRect::new(10, 10, 100, 60));
+        assert_eq!(frame.render_plan.border, chrome.border);
+        assert_eq!(frame.render_plan.corner_radius, 10);
+        Ok(())
+    }
+
+    #[test]
+    fn odd_gap_insets_keep_adjacent_panes_aligned() {
+        let chrome = PaneChromeConfig {
+            border: PaneBorderStyle::default(),
+            gap: 3,
+            padding: 2,
+            radius: 8,
+        };
+        let left = pane_content_surface(LayoutRect::new(0, 0, 62, 53), chrome);
+        let right = pane_content_surface(LayoutRect::new(62, 0, 63, 53), chrome);
+
+        assert_eq!(left, LayoutRect::new(3, 3, 55, 46));
+        assert_eq!(right, LayoutRect::new(65, 3, 56, 46));
+        assert!(left.x.saturating_add(left.width) < right.x);
+        assert_eq!(right.x.saturating_add(right.width), 121);
     }
 
     #[test]
