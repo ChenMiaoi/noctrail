@@ -8,7 +8,7 @@ use cosmic_text::{
     fontdb::{self, Query},
 };
 use noctrail_term::{
-    Cell, Cursor, DamageSet, ScreenRowSnapshot, Selection, Style, TerminalSnapshot,
+    Cell, Color, Cursor, DamageSet, ScreenRowSnapshot, Selection, Style, TerminalSnapshot,
 };
 use thiserror::Error;
 use wgpu::CurrentSurfaceTexture;
@@ -312,6 +312,28 @@ pub enum GlyphPrepareError {
     NoFonts,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PaintLayer {
+    Background,
+    Selection,
+    Underline,
+    Cursor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaintRect {
+    pub layer: PaintLayer,
+    pub row: usize,
+    pub col: usize,
+    pub span: usize,
+    pub color: Option<Color>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CellPaintFrame {
+    pub rects: Vec<PaintRect>,
+}
+
 pub fn probe_font_diagnostics(preferences: &FontPreferences) -> FontDiagnostics {
     let mut font_system = FontSystem::new();
     collect_font_diagnostics(&mut font_system, preferences)
@@ -323,6 +345,77 @@ pub fn prepare_glyph_frame(
 ) -> Result<PreparedGlyphFrame, GlyphPrepareError> {
     let mut font_system = FontSystem::new();
     prepare_glyph_frame_with_font_system(&mut font_system, plan, config)
+}
+
+pub fn prepare_cell_paint_frame(plan: &RenderPlan) -> CellPaintFrame {
+    let mut rects = Vec::new();
+
+    for row in &plan.rows {
+        for glyph in &row.glyphs {
+            if glyph.wide_continuation {
+                continue;
+            }
+
+            let span = glyph.span.max(1);
+            if glyph.style.background != Color::Default {
+                push_paint_rect(
+                    &mut rects,
+                    PaintRect {
+                        layer: PaintLayer::Background,
+                        row: row.row,
+                        col: glyph.col,
+                        span,
+                        color: Some(glyph.style.background),
+                    },
+                );
+            }
+
+            if glyph.style.underline {
+                push_paint_rect(
+                    &mut rects,
+                    PaintRect {
+                        layer: PaintLayer::Underline,
+                        row: row.row,
+                        col: glyph.col,
+                        span,
+                        color: Some(glyph.style.foreground),
+                    },
+                );
+            }
+        }
+    }
+
+    if let Some(selection) = plan.selection.as_ref() {
+        let selection = selection.clone().normalized();
+        for (row, start_col, end_col) in selection_ranges(&plan.rows, &selection) {
+            if end_col > start_col {
+                rects.push(PaintRect {
+                    layer: PaintLayer::Selection,
+                    row,
+                    col: start_col,
+                    span: end_col - start_col,
+                    color: None,
+                });
+            }
+        }
+    }
+
+    if let Some(row) = plan.rows.get(plan.cursor.row) {
+        let span = row
+            .glyphs
+            .get(plan.cursor.col)
+            .map(|glyph| glyph.span.max(1))
+            .unwrap_or(1);
+        rects.push(PaintRect {
+            layer: PaintLayer::Cursor,
+            row: plan.cursor.row,
+            col: plan.cursor.col,
+            span,
+            color: None,
+        });
+    }
+
+    CellPaintFrame { rects }
 }
 
 fn collect_font_diagnostics(
@@ -725,6 +818,68 @@ fn shape_cluster(
         .layout_runs()
         .flat_map(|run| run.glyphs.iter().cloned())
         .collect()
+}
+
+fn push_paint_rect(rects: &mut Vec<PaintRect>, next: PaintRect) {
+    if let Some(last) = rects.last_mut()
+        && last.layer == next.layer
+        && last.row == next.row
+        && last.color == next.color
+        && last.col + last.span == next.col
+    {
+        last.span += next.span;
+        return;
+    }
+
+    rects.push(next);
+}
+
+fn selection_ranges(rows: &[RenderRow], selection: &Selection) -> Vec<(usize, usize, usize)> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+
+    let mut start_row = selection.start.row.min(rows.len() - 1);
+    let mut end_row = selection.end.row.min(rows.len() - 1);
+
+    if matches!(selection.mode, noctrail_term::SelectionMode::Line) {
+        while start_row > 0 && rows[start_row].wrapped {
+            start_row -= 1;
+        }
+
+        while end_row + 1 < rows.len() && rows[end_row + 1].wrapped {
+            end_row += 1;
+        }
+    }
+
+    let mut ranges = Vec::new();
+    for (row_idx, row) in rows.iter().enumerate().take(end_row + 1).skip(start_row) {
+        let row_len = row.glyphs.len();
+        let (start_col, end_col) = match selection.mode {
+            noctrail_term::SelectionMode::Block => (
+                selection.start.col.min(selection.end.col),
+                selection.start.col.max(selection.end.col) + 1,
+            ),
+            noctrail_term::SelectionMode::Line => (0, row_len),
+            noctrail_term::SelectionMode::Normal => {
+                if row_idx == start_row && row_idx == end_row {
+                    (
+                        selection.start.col.min(selection.end.col),
+                        selection.start.col.max(selection.end.col) + 1,
+                    )
+                } else if row_idx == start_row {
+                    (selection.start.col, row_len)
+                } else if row_idx == end_row {
+                    (0, selection.end.col + 1)
+                } else {
+                    (0, row_len)
+                }
+            }
+        };
+        ranges.push((row_idx, start_col.min(row_len), end_col.min(row_len)));
+    }
+
+    ranges
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1163,6 +1318,123 @@ mod tests {
         assert_eq!(frame_at_1x.raster_jobs(), 1);
         assert_eq!(frame_at_2x.raster_jobs(), 1);
         assert_ne!(frame_at_1x.unique_cache_keys, frame_at_2x.unique_cache_keys);
+    }
+
+    #[test]
+    fn cell_paint_frame_merges_backgrounds_and_marks_cursor() {
+        let snapshot = TerminalSnapshot {
+            rows: vec![ScreenRowSnapshot {
+                cells: vec![
+                    Cell {
+                        text: "A".to_string(),
+                        style: Style {
+                            foreground: Color::Indexed(7),
+                            background: Color::Indexed(1),
+                            bold: false,
+                            italic: false,
+                            underline: false,
+                        },
+                        wide_continuation: false,
+                    },
+                    Cell {
+                        text: "B".to_string(),
+                        style: Style {
+                            foreground: Color::Indexed(7),
+                            background: Color::Indexed(1),
+                            bold: false,
+                            italic: false,
+                            underline: true,
+                        },
+                        wide_continuation: false,
+                    },
+                    cell("C"),
+                ],
+                wrapped: false,
+            }],
+            cursor: Cursor { row: 0, col: 1 },
+            ..TerminalSnapshot::default()
+        };
+        let plan = RenderPlan::from_terminal(
+            RenderRect::new(0, 0, 3, 1),
+            RenderBackend::Software,
+            &snapshot,
+        );
+
+        let paint = prepare_cell_paint_frame(&plan);
+
+        assert_eq!(
+            paint.rects,
+            vec![
+                PaintRect {
+                    layer: PaintLayer::Background,
+                    row: 0,
+                    col: 0,
+                    span: 2,
+                    color: Some(Color::Indexed(1)),
+                },
+                PaintRect {
+                    layer: PaintLayer::Underline,
+                    row: 0,
+                    col: 1,
+                    span: 1,
+                    color: Some(Color::Indexed(7)),
+                },
+                PaintRect {
+                    layer: PaintLayer::Background,
+                    row: 0,
+                    col: 2,
+                    span: 1,
+                    color: Some(Color::Indexed(0)),
+                },
+                PaintRect {
+                    layer: PaintLayer::Cursor,
+                    row: 0,
+                    col: 1,
+                    span: 1,
+                    color: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn cell_paint_frame_marks_selection_range() {
+        let snapshot = TerminalSnapshot {
+            rows: vec![ScreenRowSnapshot {
+                cells: vec![cell("A"), cell("B"), cell("C"), cell("D")],
+                wrapped: false,
+            }],
+            selection: Some(Selection {
+                mode: noctrail_term::SelectionMode::Normal,
+                start: noctrail_term::Position { row: 0, col: 1 },
+                end: noctrail_term::Position { row: 0, col: 2 },
+            }),
+            ..TerminalSnapshot::default()
+        };
+        let plan = RenderPlan::from_terminal(
+            RenderRect::new(0, 0, 4, 1),
+            RenderBackend::Software,
+            &snapshot,
+        );
+
+        let paint = prepare_cell_paint_frame(&plan);
+        let selection_rects = paint
+            .rects
+            .iter()
+            .filter(|rect| rect.layer == PaintLayer::Selection)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            selection_rects,
+            vec![PaintRect {
+                layer: PaintLayer::Selection,
+                row: 0,
+                col: 1,
+                span: 2,
+                color: None,
+            }]
+        );
     }
 
     #[test]
