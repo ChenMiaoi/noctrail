@@ -17,13 +17,21 @@ The active plan lives in [docs/real-plan.md](docs/real-plan.md). The old
 
 ```text
 crates/
+  noctrail-app/   # desktop app shell
   noctrail-cli/   # `noctrail` command-line entry point
+  noctrail-config/ # configuration boundary
+  noctrail-layout/ # workspace and pane layout boundary
+  noctrail-pty/    # PTY/process boundary
+  noctrail-render/ # render plan and backend boundary
+  noctrail-runtime/ # pane runtime registry boundary
+  noctrail-term/   # terminal state-machine boundary
 docs/
   real-plan.md    # active restart roadmap
   plan.md         # legacy pointer to the new roadmap
 ```
 
-More crates will be added only when there is clear implementation ownership for the boundary.
+The skeleton stops here until each boundary has an owner and a test
+slice.
 
 ## Development
 

@@ -1,5 +1,14 @@
 [workspace]
-members = ["crates/noctrail-cli"]
+members = [
+    "crates/noctrail-app",
+    "crates/noctrail-cli",
+    "crates/noctrail-config",
+    "crates/noctrail-layout",
+    "crates/noctrail-pty",
+    "crates/noctrail-render",
+    "crates/noctrail-runtime",
+    "crates/noctrail-term",
+]
 resolver = "3"
 
 [workspace.package]
