@@ -11,6 +11,9 @@ use thiserror::Error;
 const DEFAULT_THEME_OPACITY: f32 = 1.0;
 const DEFAULT_FONT_FAMILY: &str = "JetBrainsMono Nerd Font";
 const DEFAULT_FONT_SIZE: f32 = 14.0;
+const DEFAULT_FONT_LINE_HEIGHT: f32 = 1.55;
+const DEFAULT_FONT_WEIGHT: u16 = 450;
+const DEFAULT_FONT_BOLD_WEIGHT: u16 = 650;
 const DEFAULT_FONT_FALLBACKS: [&str; 4] = [
     "Noto Sans CJK SC",
     "Noto Color Emoji",
@@ -18,9 +21,9 @@ const DEFAULT_FONT_FALLBACKS: [&str; 4] = [
     "Segoe UI Emoji",
 ];
 const DEFAULT_CURSOR_BLINK_INTERVAL_MS: u64 = 600;
-const DEFAULT_PANE_GAP: u16 = 4;
-const DEFAULT_PANE_PADDING: u16 = 2;
-const DEFAULT_PANE_RADIUS: u16 = 8;
+const DEFAULT_PANE_GAP: u16 = 12;
+const DEFAULT_PANE_PADDING: u16 = 8;
+const DEFAULT_PANE_RADIUS: u16 = 14;
 const DEFAULT_BLUR_FALLBACK_TINT_OPACITY: f32 = 0.92;
 const DEFAULT_ANIMATION_DURATION_MS: u64 = 120;
 const DEFAULT_LAYOUT_RESIZE_STEP: u16 = 5;
@@ -85,6 +88,11 @@ impl<'de> Deserialize<'de> for RgbaColor {
 pub struct FontConfig {
     pub family: String,
     pub size: f32,
+    #[serde(rename = "line-height")]
+    pub line_height: f32,
+    pub weight: u16,
+    #[serde(rename = "bold-weight")]
+    pub bold_weight: u16,
     pub fallback: Vec<String>,
 }
 
@@ -93,6 +101,9 @@ impl Default for FontConfig {
         Self {
             family: DEFAULT_FONT_FAMILY.to_string(),
             size: DEFAULT_FONT_SIZE,
+            line_height: DEFAULT_FONT_LINE_HEIGHT,
+            weight: DEFAULT_FONT_WEIGHT,
+            bold_weight: DEFAULT_FONT_BOLD_WEIGHT,
             fallback: DEFAULT_FONT_FALLBACKS
                 .iter()
                 .map(|family| (*family).to_string())
@@ -106,13 +117,28 @@ impl Default for FontConfig {
 pub struct ThemeColors {
     pub background: RgbaColor,
     pub foreground: RgbaColor,
+    #[serde(rename = "chrome-background")]
+    pub chrome_background: RgbaColor,
+    #[serde(rename = "chrome-foreground")]
+    pub chrome_foreground: RgbaColor,
+    #[serde(rename = "chrome-muted")]
+    pub chrome_muted: RgbaColor,
+    #[serde(rename = "chrome-accent")]
+    pub chrome_accent: RgbaColor,
+    #[serde(rename = "chrome-danger")]
+    pub chrome_danger: RgbaColor,
 }
 
 impl Default for ThemeColors {
     fn default() -> Self {
         Self {
-            background: RgbaColor::from_rgb(0x05, 0x0a, 0x0f),
-            foreground: RgbaColor::from_rgb(0xc0, 0xca, 0xf5),
+            background: RgbaColor::from_rgb(0x0b, 0x10, 0x14),
+            foreground: RgbaColor::from_rgb(0xe6, 0xeb, 0xef),
+            chrome_background: RgbaColor::from_rgb(0x14, 0x1c, 0x24),
+            chrome_foreground: RgbaColor::from_rgb(0xf5, 0xf7, 0xfa),
+            chrome_muted: RgbaColor::from_rgb(0x8c, 0x99, 0xa5),
+            chrome_accent: RgbaColor::from_rgb(0x73, 0xc9, 0xa7),
+            chrome_danger: RgbaColor::from_rgb(0xf0, 0x76, 0x62),
         }
     }
 }
@@ -472,6 +498,42 @@ fn validate_config(path: &Path, config: &Config) -> Result<(), ConfigError> {
             reason: format!("font.size must be greater than 0, got {}", config.font.size),
         });
     }
+    if config.font.line_height <= 1.0 {
+        return Err(ConfigError::Validation {
+            path: path.to_path_buf(),
+            reason: format!(
+                "font.line-height must be greater than 1.0, got {}",
+                config.font.line_height
+            ),
+        });
+    }
+    if !(100..=900).contains(&config.font.weight) {
+        return Err(ConfigError::Validation {
+            path: path.to_path_buf(),
+            reason: format!(
+                "font.weight must be within 100..=900, got {}",
+                config.font.weight
+            ),
+        });
+    }
+    if !(100..=900).contains(&config.font.bold_weight) {
+        return Err(ConfigError::Validation {
+            path: path.to_path_buf(),
+            reason: format!(
+                "font.bold-weight must be within 100..=900, got {}",
+                config.font.bold_weight
+            ),
+        });
+    }
+    if config.font.bold_weight < config.font.weight {
+        return Err(ConfigError::Validation {
+            path: path.to_path_buf(),
+            reason: format!(
+                "font.bold-weight must be greater than or equal to font.weight, got {} < {}",
+                config.font.bold_weight, config.font.weight
+            ),
+        });
+    }
     if config.theme.cursor.blink_interval_ms == 0 {
         return Err(ConfigError::Validation {
             path: path.to_path_buf(),
@@ -722,6 +784,9 @@ mod tests {
         assert_eq!(config.renderer.backend, RendererBackend::Gpu);
         assert_eq!(config.font.family, DEFAULT_FONT_FAMILY);
         assert_eq!(config.font.size, DEFAULT_FONT_SIZE);
+        assert_eq!(config.font.line_height, DEFAULT_FONT_LINE_HEIGHT);
+        assert_eq!(config.font.weight, DEFAULT_FONT_WEIGHT);
+        assert_eq!(config.font.bold_weight, DEFAULT_FONT_BOLD_WEIGHT);
         assert_eq!(config.theme.opacity, DEFAULT_THEME_OPACITY);
         assert_eq!(
             config.theme.cursor.blink_interval_ms,
@@ -729,7 +794,11 @@ mod tests {
         );
         assert_eq!(
             config.theme.color.background,
-            RgbaColor::from_rgb(0x05, 0x0a, 0x0f)
+            RgbaColor::from_rgb(0x0b, 0x10, 0x14)
+        );
+        assert_eq!(
+            config.theme.color.chrome_accent,
+            RgbaColor::from_rgb(0x73, 0xc9, 0xa7)
         );
         assert_eq!(config.theme.pane.gap, DEFAULT_PANE_GAP);
         assert_eq!(config.theme.pane.padding, DEFAULT_PANE_PADDING);
@@ -765,7 +834,7 @@ mod tests {
         let path = temp_config_path("theme-load");
         fs::write(
             &path,
-            "[renderer]\nbackend = \"software\"\n\n[font]\nfamily = \"Iosevka\"\nsize = 16.5\nfallback = [\"Noto Sans CJK SC\"]\n\n[theme]\nopacity = 0.8\n\n[theme.color]\nbackground = \"#112233\"\nforeground = \"#abcdef\"\n\n[theme.border]\nactive = \"#7aa2f7\"\ninactive = \"#3b4261\"\nwidth = 2\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.blur]\nenabled = true\nfallback-tint-opacity = 0.94\n\n[theme.animation]\nenabled = false\nduration-ms = 180\n\n[theme.low-power]\nenabled = true\n\n[theme.cursor]\ncolor = \"#ffeeaa\"\nblink-interval-ms = 450\n\n[theme.selection]\nbackground = \"#264f78cc\"\nforeground = \"#ffffff\"\n\n[layout]\ndefault-split-axis = \"horizontal\"\nresize-step = 7\nscratch-height-percent = 40\nstartup-workspace = 3\n\n[keymap]\ncopy = [\"ctrl-shift-y\"]\npaste = [\"ctrl-shift-u\"]\nfocus-left = [\"alt-a\"]\nfocus-right = [\"alt-d\"]\nfocus-up = [\"alt-w\"]\nfocus-down = [\"alt-s\"]\n\n[agent]\nenabled = true\nread-env = true\nread-history = true\n\n[agent.provider]\ntype = \"openai-compatible\"\nmodel = \"gpt-5\"\nendpoint = \"https://example.invalid/v1\"\n",
+            "[renderer]\nbackend = \"software\"\n\n[font]\nfamily = \"Iosevka\"\nsize = 16.5\nline-height = 1.7\nweight = 430\nbold-weight = 700\nfallback = [\"Noto Sans CJK SC\"]\n\n[theme]\nopacity = 0.8\n\n[theme.color]\nbackground = \"#112233\"\nforeground = \"#abcdef\"\nchrome-background = \"#171f28\"\nchrome-foreground = \"#f6f8fa\"\nchrome-muted = \"#8693a0\"\nchrome-accent = \"#73c9a7\"\nchrome-danger = \"#f07662\"\n\n[theme.border]\nactive = \"#7aa2f7\"\ninactive = \"#3b4261\"\nwidth = 2\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.blur]\nenabled = true\nfallback-tint-opacity = 0.94\n\n[theme.animation]\nenabled = false\nduration-ms = 180\n\n[theme.low-power]\nenabled = true\n\n[theme.cursor]\ncolor = \"#ffeeaa\"\nblink-interval-ms = 450\n\n[theme.selection]\nbackground = \"#264f78cc\"\nforeground = \"#ffffff\"\n\n[layout]\ndefault-split-axis = \"horizontal\"\nresize-step = 7\nscratch-height-percent = 40\nstartup-workspace = 3\n\n[keymap]\ncopy = [\"ctrl-shift-y\"]\npaste = [\"ctrl-shift-u\"]\nfocus-left = [\"alt-a\"]\nfocus-right = [\"alt-d\"]\nfocus-up = [\"alt-w\"]\nfocus-down = [\"alt-s\"]\n\n[agent]\nenabled = true\nread-env = true\nread-history = true\n\n[agent.provider]\ntype = \"openai-compatible\"\nmodel = \"gpt-5\"\nendpoint = \"https://example.invalid/v1\"\n",
         )
         .expect("write config");
 
@@ -773,11 +842,18 @@ mod tests {
         assert_eq!(config.renderer.backend, RendererBackend::Software);
         assert_eq!(config.font.family, "Iosevka");
         assert_eq!(config.font.size, 16.5);
+        assert_eq!(config.font.line_height, 1.7);
+        assert_eq!(config.font.weight, 430);
+        assert_eq!(config.font.bold_weight, 700);
         assert_eq!(config.font.fallback, vec!["Noto Sans CJK SC".to_string()]);
         assert_eq!(config.theme.opacity, 0.8);
         assert_eq!(
             config.theme.color.background,
             RgbaColor::from_rgb(0x11, 0x22, 0x33)
+        );
+        assert_eq!(
+            config.theme.color.chrome_background,
+            RgbaColor::from_rgb(0x17, 0x1f, 0x28)
         );
         assert_eq!(config.theme.border.width, 2);
         assert_eq!(config.theme.pane.gap, 10);

@@ -4,7 +4,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use cosmic_text::{
     Attrs as FontAttrs, Buffer as FontBuffer, CacheKey, Family as FontFamily, FontSystem,
-    LayoutGlyph, Metrics, Shaping,
+    LayoutGlyph, Metrics, Shaping, SwashCache, SwashContent,
     fontdb::{self, Query},
 };
 use noctrail_term::{
@@ -319,6 +319,8 @@ pub struct GlyphRasterConfig {
     pub scale: f32,
     pub cell_width: f32,
     pub line_height: f32,
+    pub weight: u16,
+    pub bold_weight: u16,
 }
 
 impl Default for GlyphRasterConfig {
@@ -328,6 +330,8 @@ impl Default for GlyphRasterConfig {
             scale: 1.0,
             cell_width: DEFAULT_FONT_SIZE,
             line_height: DEFAULT_FONT_SIZE * 1.4,
+            weight: 450,
+            bold_weight: 650,
         }
     }
 }
@@ -337,6 +341,7 @@ pub struct PreparedGlyph {
     pub row: usize,
     pub col: usize,
     pub text: String,
+    pub style: Style,
     pub cache_key: CacheKey,
     pub x: i32,
     pub y: i32,
@@ -418,6 +423,43 @@ pub struct PreparedRenderFrame {
     pub stats: FrameStats,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SoftwareRenderPalette {
+    pub background: Rgba,
+    pub foreground: Rgba,
+    pub selection_background: Rgba,
+    pub selection_foreground: Rgba,
+    pub cursor: Rgba,
+}
+
+impl Default for SoftwareRenderPalette {
+    fn default() -> Self {
+        Self {
+            background: Rgba::opaque(0x05, 0x0a, 0x0f),
+            foreground: Rgba::opaque(0xc0, 0xca, 0xf5),
+            selection_background: Rgba::opaque(0x26, 0x4f, 0x78),
+            selection_foreground: Rgba::opaque(0xff, 0xff, 0xff),
+            cursor: Rgba::opaque(0xc0, 0xca, 0xf5),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoftwareRenderFrame {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+    pub stats: FrameStats,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PixelRect {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
 pub fn probe_font_diagnostics(preferences: &FontPreferences) -> FontDiagnostics {
     let mut font_system = FontSystem::new();
     collect_font_diagnostics(&mut font_system, preferences)
@@ -436,7 +478,149 @@ pub fn prepare_render_frame(
     config: &GlyphRasterConfig,
 ) -> Result<PreparedRenderFrame, GlyphPrepareError> {
     let mut font_system = FontSystem::new();
-    let glyphs = prepare_glyph_frame_with_font_system(&mut font_system, plan, config)?;
+    prepare_render_frame_with_font_system(&mut font_system, plan, config)
+}
+
+pub fn rasterize_software_frame(
+    plan: &RenderPlan,
+    config: &GlyphRasterConfig,
+    palette: &SoftwareRenderPalette,
+    cursor_visible: bool,
+) -> Result<SoftwareRenderFrame, GlyphPrepareError> {
+    let mut font_system = FontSystem::new();
+    let mut swash_cache = SwashCache::new();
+    let prepared = prepare_render_frame_with_font_system(&mut font_system, plan, config)?;
+    let width = plan.pane_rect.width.max(1) as u32;
+    let height = plan.pane_rect.height.max(1) as u32;
+    let mut pixels = vec![0; width as usize * height as usize * 4];
+    fill_rgba(&mut pixels, palette.background);
+
+    let selection = plan
+        .selection
+        .as_ref()
+        .map(|selection| selection_ranges(&plan.rows, &selection.clone().normalized()));
+
+    for segment in &prepared.border.segments {
+        fill_rect_rgba(
+            &mut pixels,
+            width,
+            height,
+            PixelRect {
+                x: segment.x as i32,
+                y: segment.y as i32,
+                width: segment.width as u32,
+                height: segment.height as u32,
+            },
+            segment.color,
+        );
+    }
+
+    for rect in &prepared.paint.rects {
+        if matches!(rect.layer, PaintLayer::Cursor) && !cursor_visible {
+            continue;
+        }
+
+        let x = plan.viewport.x as i32 + (rect.col as f32 * config.cell_width).round() as i32;
+        let y = plan.viewport.y as i32 + (rect.row as f32 * config.line_height).round() as i32;
+        let cell_width = ((rect.span as f32) * config.cell_width).ceil().max(1.0) as u32;
+        let cell_height = config.line_height.ceil().max(1.0) as u32;
+        match rect.layer {
+            PaintLayer::Background => {
+                fill_rect_rgba(
+                    &mut pixels,
+                    width,
+                    height,
+                    PixelRect {
+                        x,
+                        y,
+                        width: cell_width,
+                        height: cell_height,
+                    },
+                    resolve_color(rect.color.unwrap_or(Color::Default), palette, false),
+                );
+            }
+            PaintLayer::Selection => {
+                fill_rect_rgba(
+                    &mut pixels,
+                    width,
+                    height,
+                    PixelRect {
+                        x,
+                        y,
+                        width: cell_width,
+                        height: cell_height,
+                    },
+                    palette.selection_background,
+                );
+            }
+            PaintLayer::Cursor => {
+                fill_rect_rgba(
+                    &mut pixels,
+                    width,
+                    height,
+                    PixelRect {
+                        x,
+                        y,
+                        width: cell_width,
+                        height: cell_height,
+                    },
+                    palette.cursor,
+                );
+            }
+            PaintLayer::Underline => {
+                let underline_height = ((config.line_height / 14.0).ceil() as u32).max(1);
+                let underline_y = y + cell_height.saturating_sub(underline_height) as i32;
+                fill_rect_rgba(
+                    &mut pixels,
+                    width,
+                    height,
+                    PixelRect {
+                        x,
+                        y: underline_y,
+                        width: cell_width,
+                        height: underline_height,
+                    },
+                    resolve_color(rect.color.unwrap_or(Color::Default), palette, false),
+                );
+            }
+        }
+    }
+
+    for glyph in &prepared.glyphs.glyphs {
+        let selected = selection
+            .as_ref()
+            .is_some_and(|ranges| glyph_intersects_selection(glyph.row, glyph.col, ranges));
+        let base = resolve_color(glyph.style.foreground, palette, selected);
+        if let Some(image) = swash_cache
+            .get_image(&mut font_system, glyph.cache_key)
+            .as_ref()
+        {
+            draw_swash_image(
+                &mut pixels,
+                width,
+                height,
+                plan.viewport.x as i32 + glyph.x,
+                plan.viewport.y as i32 + glyph.y,
+                image,
+                base,
+            );
+        }
+    }
+
+    Ok(SoftwareRenderFrame {
+        width,
+        height,
+        pixels,
+        stats: prepared.stats,
+    })
+}
+
+fn prepare_render_frame_with_font_system(
+    font_system: &mut FontSystem,
+    plan: &RenderPlan,
+    config: &GlyphRasterConfig,
+) -> Result<PreparedRenderFrame, GlyphPrepareError> {
+    let glyphs = prepare_glyph_frame_with_font_system(font_system, plan, config)?;
     let paint = prepare_cell_paint_frame(plan);
     let border = prepare_border_frame(plan);
     let stats = FrameStats {
@@ -953,6 +1137,7 @@ fn prepare_glyph_frame_with_font_system(
                     row: row.row,
                     col: glyph.col,
                     text: glyph.text.clone(),
+                    style: glyph.style,
                     cache_key: physical.cache_key,
                     x: physical.x,
                     y: physical.y,
@@ -975,15 +1160,13 @@ fn font_attrs_for_render_glyph<'a>(style: Style, config: &'a GlyphRasterConfig) 
         .metrics(metrics);
 
     if style.bold {
-        attrs = attrs.weight(fontdb::Weight::BOLD);
+        attrs = attrs.weight(fontdb::Weight(config.bold_weight));
+    } else {
+        attrs = attrs.weight(fontdb::Weight(config.weight));
     }
 
     if style.italic {
         attrs = attrs.style(fontdb::Style::Italic);
-    }
-
-    if !style.bold && !style.italic {
-        attrs = attrs.weight(fontdb::Weight::NORMAL);
     }
 
     attrs
@@ -1045,6 +1228,213 @@ fn push_paint_rect(rects: &mut Vec<PaintRect>, next: PaintRect) {
     }
 
     rects.push(next);
+}
+
+fn glyph_intersects_selection(row: usize, col: usize, ranges: &[(usize, usize, usize)]) -> bool {
+    ranges.iter().any(|(selection_row, start_col, end_col)| {
+        *selection_row == row && col >= *start_col && col < *end_col
+    })
+}
+
+fn fill_rgba(pixels: &mut [u8], color: Rgba) {
+    for chunk in pixels.chunks_exact_mut(4) {
+        chunk[0] = color.red;
+        chunk[1] = color.green;
+        chunk[2] = color.blue;
+        chunk[3] = color.alpha;
+    }
+}
+
+fn fill_rect_rgba(pixels: &mut [u8], width: u32, height: u32, rect: PixelRect, color: Rgba) {
+    let x_start = rect.x.max(0) as u32;
+    let y_start = rect.y.max(0) as u32;
+    let x_end = (rect.x.saturating_add(rect.width as i32)).max(0) as u32;
+    let y_end = (rect.y.saturating_add(rect.height as i32)).max(0) as u32;
+    let x_end = x_end.min(width);
+    let y_end = y_end.min(height);
+
+    for row in y_start..y_end {
+        for col in x_start..x_end {
+            blend_rgba_pixel(pixels, width, height, col, row, color);
+        }
+    }
+}
+
+fn draw_swash_image(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    glyph_x: i32,
+    glyph_y: i32,
+    image: &cosmic_text::SwashImage,
+    base: Rgba,
+) {
+    let placement = image.placement;
+    let left = glyph_x + placement.left;
+    let top = glyph_y - placement.top;
+    match image.content {
+        SwashContent::Mask => {
+            let mut index = 0;
+            for offset_y in 0..placement.height as i32 {
+                for offset_x in 0..placement.width as i32 {
+                    let alpha = image.data[index];
+                    index += 1;
+                    let color = Rgba {
+                        red: base.red,
+                        green: base.green,
+                        blue: base.blue,
+                        alpha: multiply_alpha(base.alpha, alpha),
+                    };
+                    blend_rgba_pixel(
+                        pixels,
+                        width,
+                        height,
+                        (left + offset_x) as u32,
+                        (top + offset_y) as u32,
+                        color,
+                    );
+                }
+            }
+        }
+        SwashContent::Color => {
+            let mut index = 0;
+            for offset_y in 0..placement.height as i32 {
+                for offset_x in 0..placement.width as i32 {
+                    let color = Rgba {
+                        red: image.data[index],
+                        green: image.data[index + 1],
+                        blue: image.data[index + 2],
+                        alpha: multiply_alpha(base.alpha, image.data[index + 3]),
+                    };
+                    index += 4;
+                    blend_rgba_pixel(
+                        pixels,
+                        width,
+                        height,
+                        (left + offset_x) as u32,
+                        (top + offset_y) as u32,
+                        color,
+                    );
+                }
+            }
+        }
+        SwashContent::SubpixelMask => {}
+    }
+}
+
+fn blend_rgba_pixel(pixels: &mut [u8], width: u32, height: u32, x: u32, y: u32, source: Rgba) {
+    if source.alpha == 0 || x >= width || y >= height {
+        return;
+    }
+
+    let index = ((y * width + x) * 4) as usize;
+    if index + 3 >= pixels.len() {
+        return;
+    }
+
+    let destination = Rgba {
+        red: pixels[index],
+        green: pixels[index + 1],
+        blue: pixels[index + 2],
+        alpha: pixels[index + 3],
+    };
+    let blended = alpha_blend(source, destination);
+    pixels[index] = blended.red;
+    pixels[index + 1] = blended.green;
+    pixels[index + 2] = blended.blue;
+    pixels[index + 3] = blended.alpha;
+}
+
+fn alpha_blend(source: Rgba, destination: Rgba) -> Rgba {
+    let source_alpha = f32::from(source.alpha) / 255.0;
+    let destination_alpha = f32::from(destination.alpha) / 255.0;
+    let out_alpha = source_alpha + destination_alpha * (1.0 - source_alpha);
+    if out_alpha <= f32::EPSILON {
+        return Rgba::default();
+    }
+
+    let red = ((f32::from(source.red) * source_alpha
+        + f32::from(destination.red) * destination_alpha * (1.0 - source_alpha))
+        / out_alpha)
+        .round()
+        .clamp(0.0, 255.0) as u8;
+    let green = ((f32::from(source.green) * source_alpha
+        + f32::from(destination.green) * destination_alpha * (1.0 - source_alpha))
+        / out_alpha)
+        .round()
+        .clamp(0.0, 255.0) as u8;
+    let blue = ((f32::from(source.blue) * source_alpha
+        + f32::from(destination.blue) * destination_alpha * (1.0 - source_alpha))
+        / out_alpha)
+        .round()
+        .clamp(0.0, 255.0) as u8;
+
+    Rgba {
+        red,
+        green,
+        blue,
+        alpha: (out_alpha * 255.0).round().clamp(0.0, 255.0) as u8,
+    }
+}
+
+fn multiply_alpha(lhs: u8, rhs: u8) -> u8 {
+    ((u16::from(lhs) * u16::from(rhs)) / 255) as u8
+}
+
+fn resolve_color(color: Color, palette: &SoftwareRenderPalette, selected: bool) -> Rgba {
+    if selected {
+        return palette.selection_foreground;
+    }
+
+    match color {
+        Color::Default => palette.foreground,
+        Color::Rgb(red, green, blue) => Rgba::opaque(red, green, blue),
+        Color::Indexed(index) => indexed_color(index),
+    }
+}
+
+fn indexed_color(index: u8) -> Rgba {
+    const ANSI: [Rgba; 16] = [
+        Rgba::opaque(0x00, 0x00, 0x00),
+        Rgba::opaque(0xcd, 0x31, 0x31),
+        Rgba::opaque(0x0d, 0xbc, 0x79),
+        Rgba::opaque(0xe5, 0xe5, 0x10),
+        Rgba::opaque(0x24, 0x72, 0xc8),
+        Rgba::opaque(0xbc, 0x3f, 0xbc),
+        Rgba::opaque(0x11, 0xa8, 0xcd),
+        Rgba::opaque(0xe5, 0xe5, 0xe5),
+        Rgba::opaque(0x66, 0x66, 0x66),
+        Rgba::opaque(0xf1, 0x4c, 0x4c),
+        Rgba::opaque(0x23, 0xd1, 0x8b),
+        Rgba::opaque(0xf5, 0xf5, 0x43),
+        Rgba::opaque(0x3b, 0x8e, 0xff),
+        Rgba::opaque(0xd6, 0x70, 0xd6),
+        Rgba::opaque(0x29, 0xb8, 0xdb),
+        Rgba::opaque(0xff, 0xff, 0xff),
+    ];
+
+    if let Some(color) = ANSI.get(index as usize) {
+        return *color;
+    }
+
+    if (16..=231).contains(&index) {
+        let cube = index - 16;
+        let red = cube / 36;
+        let green = (cube % 36) / 6;
+        let blue = cube % 6;
+        return Rgba::opaque(
+            cube_component(red),
+            cube_component(green),
+            cube_component(blue),
+        );
+    }
+
+    let level = 8 + (index.saturating_sub(232) * 10);
+    Rgba::opaque(level, level, level)
+}
+
+fn cube_component(value: u8) -> u8 {
+    if value == 0 { 0 } else { 55 + value * 40 }
 }
 
 fn selection_ranges(rows: &[RenderRow], selection: &Selection) -> Vec<(usize, usize, usize)> {
@@ -1133,6 +1523,43 @@ pub enum GpuRendererError {
     SurfaceValidation,
 }
 
+const BLIT_SHADER: &str = r#"
+@group(0) @binding(0)
+var frame_texture: texture_2d<f32>;
+
+@group(0) @binding(1)
+var frame_sampler: sampler;
+
+struct VertexOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -3.0),
+        vec2<f32>(-1.0, 1.0),
+        vec2<f32>(3.0, 1.0),
+    );
+    var uvs = array<vec2<f32>, 3>(
+        vec2<f32>(0.0, 2.0),
+        vec2<f32>(0.0, 0.0),
+        vec2<f32>(2.0, 0.0),
+    );
+
+    var out: VertexOut;
+    out.position = vec4<f32>(positions[vertex_index], 0.0, 1.0);
+    out.uv = uvs[vertex_index];
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+    return textureSample(frame_texture, frame_sampler, in.uv);
+}
+"#;
+
 pub struct GpuRenderer {
     instance: wgpu::Instance,
     window: Arc<Window>,
@@ -1142,6 +1569,9 @@ pub struct GpuRenderer {
     queue: wgpu::Queue,
     surface_config: wgpu::SurfaceConfiguration,
     clear_color: wgpu::Color,
+    frame_bind_group_layout: wgpu::BindGroupLayout,
+    frame_sampler: wgpu::Sampler,
+    frame_pipeline: wgpu::RenderPipeline,
     diagnostics: GpuDiagnostics,
 }
 
@@ -1186,6 +1616,73 @@ impl GpuRenderer {
         surface_config.width = size.width.max(1);
         surface_config.height = size.height.max(1);
         surface.configure(&device, &surface_config);
+        let frame_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("noctrail-frame-bind-group-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let frame_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("noctrail-frame-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..wgpu::SamplerDescriptor::default()
+        });
+        let frame_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("noctrail-frame-pipeline-layout"),
+                bind_group_layouts: &[Some(&frame_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let frame_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("noctrail-frame-shader"),
+            source: wgpu::ShaderSource::Wgsl(BLIT_SHADER.into()),
+        });
+        let frame_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("noctrail-frame-pipeline"),
+            layout: Some(&frame_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &frame_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &frame_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
 
         let adapter_info = adapter.get_info();
         let diagnostics = GpuDiagnostics {
@@ -1212,6 +1709,9 @@ impl GpuRenderer {
                 b: 0.06,
                 a: 1.0,
             },
+            frame_bind_group_layout,
+            frame_sampler,
+            frame_pipeline,
             diagnostics,
         })
     }
@@ -1283,6 +1783,113 @@ impl GpuRenderer {
         }
         self.queue.submit([encoder.finish()]);
         frame.present();
+
+        if reconfigure_after_present {
+            self.surface.configure(&self.device, &self.surface_config);
+        }
+
+        Ok(RenderOutcome::Presented)
+    }
+
+    pub fn render_software_frame(
+        &mut self,
+        frame: &SoftwareRenderFrame,
+    ) -> Result<RenderOutcome, GpuRendererError> {
+        let (surface_frame, reconfigure_after_present) = match self.surface.get_current_texture() {
+            CurrentSurfaceTexture::Success(frame) => (frame, false),
+            CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
+            CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => {
+                return Ok(RenderOutcome::Skipped);
+            }
+            CurrentSurfaceTexture::Outdated => {
+                self.surface.configure(&self.device, &self.surface_config);
+                return Ok(RenderOutcome::Skipped);
+            }
+            CurrentSurfaceTexture::Lost => {
+                self.recreate_surface()?;
+                return Ok(RenderOutcome::Skipped);
+            }
+            CurrentSurfaceTexture::Validation => return Err(GpuRendererError::SurfaceValidation),
+        };
+
+        let texture_extent = wgpu::Extent3d {
+            width: frame.width.max(1),
+            height: frame.height.max(1),
+            depth_or_array_layers: 1,
+        };
+        let frame_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("noctrail-frame-texture"),
+            size: texture_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &frame_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &frame.pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(frame.width.max(1) * 4),
+                rows_per_image: Some(frame.height.max(1)),
+            },
+            texture_extent,
+        );
+
+        let frame_view = frame_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let frame_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("noctrail-frame-bind-group"),
+            layout: &self.frame_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&frame_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.frame_sampler),
+                },
+            ],
+        });
+
+        let surface_view = surface_frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("noctrail-frame-encoder"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("noctrail-frame-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &surface_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(self.clear_color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.frame_pipeline);
+            pass.set_bind_group(0, &frame_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.queue.submit([encoder.finish()]);
+        surface_frame.present();
 
         if reconfigure_after_present {
             self.surface.configure(&self.device, &self.surface_config);
@@ -1765,6 +2372,35 @@ mod tests {
         assert_eq!(prepared.glyphs.prepared_rows, vec![0, 1, 2]);
         assert!(prepared.paint.rects.iter().any(|rect| {
             rect.layer == PaintLayer::Selection && rect.row == 0 && rect.col == 1 && rect.span == 2
+        }));
+    }
+
+    #[test]
+    fn software_frame_rasterizes_text_into_pixels() {
+        let mut terminal = noctrail_term::TerminalState::new(4, 1);
+        let _ = terminal.advance_bytes(b"hi");
+        let snapshot = terminal.snapshot();
+        let plan =
+            RenderPlan::from_terminal(RenderRect::new(0, 0, 64, 20), RenderBackend::Gpu, &snapshot);
+        let palette = SoftwareRenderPalette::default();
+        let frame = rasterize_software_frame(
+            &plan,
+            &GlyphRasterConfig {
+                cell_width: 16.0,
+                line_height: 20.0,
+                ..GlyphRasterConfig::default()
+            },
+            &palette,
+            true,
+        )
+        .expect("software frame should rasterize");
+
+        assert_eq!(frame.width, 64);
+        assert_eq!(frame.height, 20);
+        assert!(frame.pixels.chunks_exact(4).any(|chunk| {
+            chunk[0] != palette.background.red
+                || chunk[1] != palette.background.green
+                || chunk[2] != palette.background.blue
         }));
     }
 

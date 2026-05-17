@@ -39,6 +39,8 @@ pub struct PaneChromeConfig {
     pub gap: u16,
     pub padding: u16,
     pub radius: u16,
+    pub status_height: u16,
+    pub status_spacing: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1101,6 +1103,7 @@ pub struct DesktopFrame {
     pub is_scratch: bool,
     pub pane_id: PaneId,
     pub pane_surface: LayoutRect,
+    pub status_surface: LayoutRect,
     pub surface: LayoutRect,
     pub terminal_size: PtySize,
     pub process_id: Option<u32>,
@@ -1704,12 +1707,14 @@ impl DesktopApp {
                 .ok_or(AppError::PaneNotFound(pane_id))?
         };
         let content_surface = pane_content_surface(pane_surface, self.pane_chrome);
+        let status_surface = pane_status_surface(pane_surface, self.pane_chrome);
 
         Ok(DesktopFrame {
             workspace_id,
             is_scratch,
             pane_id,
             pane_surface,
+            status_surface,
             surface: content_surface,
             terminal_size: pane.terminal_size(),
             process_id: pane.process_id(),
@@ -2349,10 +2354,34 @@ fn projected_cells(offset: u16, span: u16, total_span: u16, total_cells: u16) ->
 }
 
 fn pane_content_surface(pane_surface: LayoutRect, pane_chrome: PaneChromeConfig) -> LayoutRect {
-    inset_layout_rect(pane_surface, pane_content_insets(pane_chrome))
+    let outer = pane_outer_insets(pane_chrome);
+    let inner = inset_layout_rect(pane_surface, outer);
+    let status_height = effective_status_height(inner.height, pane_chrome);
+
+    inset_layout_rect(
+        inner,
+        EdgeInsets {
+            left: 0,
+            right: 0,
+            top: status_height
+                .saturating_add(status_spacing_for_height(status_height, pane_chrome)),
+            bottom: 0,
+        },
+    )
 }
 
-fn pane_content_insets(pane_chrome: PaneChromeConfig) -> EdgeInsets {
+fn pane_status_surface(pane_surface: LayoutRect, pane_chrome: PaneChromeConfig) -> LayoutRect {
+    let outer = pane_outer_insets(pane_chrome);
+    let inner = inset_layout_rect(pane_surface, outer);
+    let status_height = effective_status_height(inner.height, pane_chrome);
+    if status_height == 0 {
+        return LayoutRect::new(inner.x, inner.y, inner.width, 0);
+    }
+
+    LayoutRect::new(inner.x, inner.y, inner.width, status_height)
+}
+
+fn pane_outer_insets(pane_chrome: PaneChromeConfig) -> EdgeInsets {
     let left_gap = pane_chrome.gap / 2;
     let right_gap = pane_chrome.gap - left_gap;
     let top_gap = pane_chrome.gap / 2;
@@ -2362,6 +2391,26 @@ fn pane_content_insets(pane_chrome: PaneChromeConfig) -> EdgeInsets {
         right: right_gap.saturating_add(pane_chrome.padding),
         top: top_gap.saturating_add(pane_chrome.padding),
         bottom: bottom_gap.saturating_add(pane_chrome.padding),
+    }
+}
+
+fn effective_status_height(inner_height: u16, pane_chrome: PaneChromeConfig) -> u16 {
+    if pane_chrome.status_height == 0 || inner_height <= 2 {
+        return 0;
+    }
+
+    let spacing = status_spacing_for_height(pane_chrome.status_height, pane_chrome);
+    let max_height = inner_height
+        .saturating_sub(spacing.saturating_add(1))
+        .min((inner_height / 3).max(1));
+    pane_chrome.status_height.min(max_height)
+}
+
+fn status_spacing_for_height(status_height: u16, pane_chrome: PaneChromeConfig) -> u16 {
+    if status_height == 0 {
+        0
+    } else {
+        pane_chrome.status_spacing
     }
 }
 
@@ -2510,16 +2559,19 @@ mod tests {
             gap: 8,
             padding: 6,
             radius: 10,
+            status_height: 18,
+            status_spacing: 4,
         };
 
         app.set_pane_chrome(chrome)?;
 
         let frame = app.frame();
         assert_eq!(frame.pane_surface, LayoutRect::new(0, 0, 120, 80));
-        assert_eq!(frame.surface, LayoutRect::new(10, 10, 100, 60));
-        assert_eq!(frame.terminal_size, PtySize::new(10, 3));
+        assert_eq!(frame.status_surface, LayoutRect::new(10, 10, 100, 18));
+        assert_eq!(frame.surface, LayoutRect::new(10, 32, 100, 38));
+        assert_eq!(frame.terminal_size, PtySize::new(10, 2));
         assert_eq!(frame.render_plan.pane_rect, RenderRect::new(0, 0, 120, 80));
-        assert_eq!(frame.render_plan.viewport, RenderRect::new(10, 10, 100, 60));
+        assert_eq!(frame.render_plan.viewport, RenderRect::new(10, 32, 100, 38));
         assert_eq!(frame.render_plan.border, chrome.border);
         assert_eq!(frame.render_plan.corner_radius, 10);
         Ok(())
@@ -2532,6 +2584,8 @@ mod tests {
             gap: 3,
             padding: 2,
             radius: 8,
+            status_height: 0,
+            status_spacing: 0,
         };
         let left = pane_content_surface(LayoutRect::new(0, 0, 62, 53), chrome);
         let right = pane_content_surface(LayoutRect::new(62, 0, 63, 53), chrome);

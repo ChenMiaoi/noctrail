@@ -15,8 +15,12 @@ use noctrail_config::{
 };
 use noctrail_layout::{FocusDirection, LayoutRect, SplitAxis, WorkspaceId};
 use noctrail_pty::{PtyOutputReader, PtySize};
-use noctrail_render::{FontPreferences, GpuRenderer, PaneBorderStyle, RenderBackend, Rgba};
-use noctrail_term::{MouseTrackingMode, Position, SelectionMode};
+use noctrail_render::{
+    FontPreferences, GlyphRasterConfig, GpuRenderer, PaneBorderStyle, RenderBackend, RenderGlyph,
+    RenderPlan, RenderRect, RenderRow, Rgba, SoftwareRenderPalette, rasterize_software_frame,
+};
+use noctrail_term::{Color, Cursor, DamageSet, MouseTrackingMode, Position, SelectionMode, Style};
+use tracing::{debug, error, info, warn};
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize},
@@ -30,9 +34,9 @@ use crate::{DesktopApp, DesktopFrame, PaneChromeConfig, clipboard::ClipboardBrid
 
 const DEFAULT_WINDOW_WIDTH: u32 = 1280;
 const DEFAULT_WINDOW_HEIGHT: u32 = 800;
-const DEFAULT_CELL_WIDTH: u32 = 8;
-const DEFAULT_CELL_HEIGHT: u32 = 16;
 const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const STARTUP_DEBUG_WINDOW: Duration = Duration::from_secs(3);
+const STABLE_DEBUG_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct VisualEffectsPolicy {
@@ -58,6 +62,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct GuiLaunchOptions {
     pub safe_mode: bool,
+    pub debug_logging: bool,
     pub renderer_backend: RenderBackend,
     pub config_path: Option<PathBuf>,
     pub theme: ThemeConfig,
@@ -71,6 +76,7 @@ impl Default for GuiLaunchOptions {
     fn default() -> Self {
         Self {
             safe_mode: false,
+            debug_logging: false,
             renderer_backend: RenderBackend::Gpu,
             config_path: None,
             theme: ThemeConfig::default(),
@@ -360,19 +366,20 @@ pub fn run_with_options(options: GuiLaunchOptions) -> Result<(), Box<dyn Error>>
         DEFAULT_WINDOW_WIDTH as u16,
         DEFAULT_WINDOW_HEIGHT as u16,
     );
-    let initial_terminal = terminal_size_from_surface(PhysicalSize::new(
-        DEFAULT_WINDOW_WIDTH,
-        DEFAULT_WINDOW_HEIGHT,
-    ));
+    let initial_terminal = terminal_size_from_surface(
+        PhysicalSize::new(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT),
+        &options.font,
+    );
     let app = DesktopApp::spawn_shell(initial_surface, initial_terminal)?;
     let mut gui = GuiApp::new(app, options);
     event_loop.run_app(&mut gui)?;
     Ok(())
 }
 
-pub(crate) fn terminal_size_from_surface(size: PhysicalSize<u32>) -> PtySize {
-    let cols = (size.width / DEFAULT_CELL_WIDTH).max(1);
-    let rows = (size.height / DEFAULT_CELL_HEIGHT).max(1);
+pub(crate) fn terminal_size_from_surface(size: PhysicalSize<u32>, font: &FontConfig) -> PtySize {
+    let cell = cell_dimensions(font);
+    let cols = ((size.width as f32 / cell.width).floor() as u32).max(1);
+    let rows = ((size.height as f32 / cell.height).floor() as u32).max(1);
 
     PtySize::new(saturating_u32_to_u16(cols), saturating_u32_to_u16(rows))
 }
@@ -384,6 +391,13 @@ pub(crate) fn layout_rect_from_surface(size: PhysicalSize<u32>) -> LayoutRect {
         saturating_u32_to_u16(size.width),
         saturating_u32_to_u16(size.height),
     )
+}
+
+fn cell_dimensions(font: &FontConfig) -> CellDimensions {
+    CellDimensions {
+        width: (font.size * 0.66).max(8.0),
+        height: (font.size * font.line_height).max(16.0),
+    }
 }
 
 pub(crate) fn frame_title(frame: &DesktopFrame, cursor_visible: bool) -> String {
@@ -428,6 +442,237 @@ pub(crate) fn frame_title(frame: &DesktopFrame, cursor_visible: bool) -> String 
     }
 
     title
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusRuns {
+    left: Vec<StatusRun>,
+    right: Vec<StatusRun>,
+}
+
+fn compose_status_runs(frame: &DesktopFrame, cols: usize, palette: StatusBarPalette) -> StatusRuns {
+    let shell = frame.status_line.shell.as_deref().unwrap_or("shell");
+    let cwd = frame
+        .status_line
+        .cwd
+        .as_deref()
+        .map(display_status_path)
+        .unwrap_or_else(|| "workspace".to_string());
+    let branch = frame
+        .status_line
+        .git_branch
+        .as_deref()
+        .map(|branch| format!("git:{branch}"));
+    let pane_label = if frame.is_scratch {
+        "scratch".to_string()
+    } else {
+        format!("ws{}", frame.workspace_id.0)
+    };
+
+    let mut right = vec![
+        StatusRun {
+            text: format!("{}x{}", frame.terminal_size.cols, frame.terminal_size.rows),
+            style: status_style(palette.muted, false),
+        },
+        StatusRun {
+            text: "  ".to_string(),
+            style: Style::default(),
+        },
+        StatusRun {
+            text: pane_label,
+            style: status_style(palette.muted, false),
+        },
+    ];
+
+    if let Some(exit_status) = frame.status_line.exit_status.as_deref() {
+        right.push(StatusRun {
+            text: "  ".to_string(),
+            style: Style::default(),
+        });
+        right.push(StatusRun {
+            text: exit_status.to_string(),
+            style: status_style(
+                if exit_status == "code 0" {
+                    palette.accent
+                } else {
+                    palette.danger
+                },
+                false,
+            ),
+        });
+    }
+
+    let right_len = status_runs_len(&right);
+    let available_left = cols.saturating_sub(right_len.saturating_add(1));
+    let branch_len = branch
+        .as_ref()
+        .map_or(0, |branch| branch.chars().count() + 2);
+    let shell_len = shell.chars().count();
+    let mut left = vec![StatusRun {
+        text: shell.to_string(),
+        style: status_style(palette.accent, true),
+    }];
+
+    if available_left > shell_len.saturating_add(2) {
+        let reserve_branch = if branch.is_some() && available_left > shell_len.saturating_add(14) {
+            branch_len
+        } else {
+            0
+        };
+        let cwd_budget = available_left
+            .saturating_sub(shell_len)
+            .saturating_sub(2)
+            .saturating_sub(reserve_branch);
+        left.push(StatusRun {
+            text: "  ".to_string(),
+            style: Style::default(),
+        });
+        left.push(StatusRun {
+            text: truncate_middle(&cwd, cwd_budget.max(1)),
+            style: status_style(palette.foreground, false),
+        });
+
+        if let Some(branch) = branch
+            && status_runs_len(&left).saturating_add(branch_len) < available_left
+        {
+            left.push(StatusRun {
+                text: "  ".to_string(),
+                style: Style::default(),
+            });
+            left.push(StatusRun {
+                text: branch,
+                style: status_style(palette.muted, false),
+            });
+        }
+    }
+
+    StatusRuns { left, right }
+}
+
+fn compose_status_row(left: &[StatusRun], right: &[StatusRun], cols: usize) -> Vec<RenderGlyph> {
+    let mut glyphs = render_glyphs_for_runs(left, 0, cols);
+    let right_len = status_runs_len(right);
+    let start = cols.saturating_sub(right_len);
+    glyphs.extend(render_glyphs_for_runs(right, start, cols));
+    glyphs
+}
+
+fn render_glyphs_for_runs(runs: &[StatusRun], start_col: usize, cols: usize) -> Vec<RenderGlyph> {
+    let mut glyphs = Vec::new();
+    let mut col = start_col;
+    for run in runs {
+        for ch in run.text.chars() {
+            if col >= cols {
+                return glyphs;
+            }
+            if ch != ' ' {
+                glyphs.push(RenderGlyph {
+                    col,
+                    text: ch.to_string(),
+                    style: run.style,
+                    span: 1,
+                    wide_continuation: false,
+                });
+            }
+            col += 1;
+        }
+    }
+    glyphs
+}
+
+fn status_runs_len(runs: &[StatusRun]) -> usize {
+    runs.iter().map(|run| run.text.chars().count()).sum()
+}
+
+fn status_style(color: Rgba, bold: bool) -> Style {
+    Style {
+        foreground: Color::Rgb(color.red, color.green, color.blue),
+        background: Color::Default,
+        bold,
+        italic: false,
+        underline: false,
+    }
+}
+
+fn truncate_middle(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 3 {
+        return "...".chars().take(max_chars).collect();
+    }
+
+    let head = (max_chars - 3) / 2;
+    let tail = max_chars.saturating_sub(head + 3);
+    let prefix = text.chars().take(head).collect::<String>();
+    let suffix = text
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{prefix}...{suffix}")
+}
+
+fn mix_rgba(foreground: Rgba, background: Rgba, background_ratio: f32) -> Rgba {
+    let foreground_ratio = (1.0 - background_ratio).clamp(0.0, 1.0);
+    let background_ratio = background_ratio.clamp(0.0, 1.0);
+    Rgba {
+        red: ((f32::from(foreground.red) * foreground_ratio)
+            + (f32::from(background.red) * background_ratio))
+            .round() as u8,
+        green: ((f32::from(foreground.green) * foreground_ratio)
+            + (f32::from(background.green) * background_ratio))
+            .round() as u8,
+        blue: ((f32::from(foreground.blue) * foreground_ratio)
+            + (f32::from(background.blue) * background_ratio))
+            .round() as u8,
+        alpha: u8::MAX,
+    }
+}
+
+fn blit_software_frame(
+    target: &mut noctrail_render::SoftwareRenderFrame,
+    overlay: &noctrail_render::SoftwareRenderFrame,
+    origin_x: usize,
+    origin_y: usize,
+) {
+    for row in 0..overlay.height as usize {
+        for col in 0..overlay.width as usize {
+            let dst_x = origin_x.saturating_add(col);
+            let dst_y = origin_y.saturating_add(row);
+            if dst_x >= target.width as usize || dst_y >= target.height as usize {
+                continue;
+            }
+            let src_index = (row * overlay.width as usize + col) * 4;
+            let dst_index = (dst_y * target.width as usize + dst_x) * 4;
+            target.pixels[dst_index..dst_index + 4]
+                .copy_from_slice(&overlay.pixels[src_index..src_index + 4]);
+        }
+    }
+}
+
+fn fill_frame_rect(
+    target: &mut noctrail_render::SoftwareRenderFrame,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    color: Rgba,
+) {
+    let max_x = x.saturating_add(width).min(target.width as usize);
+    let max_y = y.saturating_add(height).min(target.height as usize);
+    for row in y..max_y {
+        for col in x..max_x {
+            let index = (row * target.width as usize + col) * 4;
+            target.pixels[index] = color.red;
+            target.pixels[index + 1] = color.green;
+            target.pixels[index + 2] = color.blue;
+            target.pixels[index + 3] = color.alpha;
+        }
+    }
 }
 
 fn display_status_path(path: &Path) -> String {
@@ -722,12 +967,46 @@ struct GuiApp {
     output_rx: Option<Receiver<OutputPumpEvent>>,
     output_thread: Option<JoinHandle<()>>,
     transition: Option<ActiveTransition>,
+    started_at: Instant,
+    last_frame_log_at: Option<Instant>,
+    last_frame_log_signature: Option<FrameLogSignature>,
     next_cursor_blink_at: Instant,
     cursor_visible: bool,
     frame_interval: Duration,
     window_focused: bool,
     modifiers: ModifiersState,
     clipboard: ClipboardBridge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameLogSignature {
+    full_frame: bool,
+    dirty_rows: usize,
+    glyphs: usize,
+    paint_rects: usize,
+    border_segments: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CellDimensions {
+    width: f32,
+    height: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatusBarPalette {
+    background: Rgba,
+    foreground: Rgba,
+    muted: Rgba,
+    accent: Rgba,
+    danger: Rgba,
+    separator: Rgba,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusRun {
+    text: String,
+    style: Style,
 }
 
 impl GuiApp {
@@ -744,7 +1023,7 @@ impl GuiApp {
         ));
         app.set_scratch_height_percent(launch_options.layout.scratch_height_percent)
             .expect("app should accept scratch height updates");
-        app.set_pane_chrome(pane_chrome_from_theme(&theme))
+        app.set_pane_chrome(pane_chrome_from_theme(&theme, &font))
             .expect("app should accept pane chrome updates");
         if launch_options.layout.startup_workspace != 1 {
             let _ = app
@@ -775,6 +1054,9 @@ impl GuiApp {
             output_rx: None,
             output_thread: None,
             transition: None,
+            started_at: now,
+            last_frame_log_at: None,
+            last_frame_log_signature: None,
             next_cursor_blink_at: now + Duration::from_millis(theme.cursor.blink_interval_ms),
             cursor_visible: true,
             frame_interval: Duration::from_millis(theme.cursor.blink_interval_ms),
@@ -801,6 +1083,7 @@ impl GuiApp {
         let handle = thread::spawn(move || pump_output(reader, tx));
         self.output_rx = Some(rx);
         self.output_thread = Some(handle);
+        info!("attached PTY output pump");
         Ok(())
     }
 
@@ -1016,6 +1299,13 @@ impl GuiApp {
             ))
             .with_resizable(true)
             .with_transparent(requested_transparency);
+        info!(
+            safe_mode = self.launch_options.safe_mode,
+            backend = ?self.launch_options.renderer_backend,
+            gpu_raster = self.should_attempt_gpu_renderer(),
+            transparency = requested_transparency,
+            "creating noctrail window"
+        );
         let window = Arc::new(event_loop.create_window(attributes)?);
         let size = window.inner_size();
         self.sync_surface(size)?;
@@ -1023,22 +1313,25 @@ impl GuiApp {
             self.renderer = None;
             self.gpu_fallback_error = Some("safe-mode".to_string());
             self.app.set_backend(RenderBackend::Software);
-        } else if self.should_attempt_gpu_renderer() {
+            info!("safe mode enabled; GPU presenter disabled");
+        } else {
             match GpuRenderer::new(window.clone(), size) {
                 Ok(renderer) => {
                     self.renderer = Some(renderer);
                     self.gpu_fallback_error = None;
-                    self.app.set_backend(RenderBackend::Gpu);
+                    self.app.set_backend(self.launch_options.renderer_backend);
+                    info!(
+                        backend = ?self.launch_options.renderer_backend,
+                        width = size.width,
+                        height = size.height,
+                        "render presenter initialized"
+                    );
                     self.apply_theme_visuals();
                 }
                 Err(error) => {
                     self.record_gpu_fallback(error.to_string());
                 }
             }
-        } else {
-            self.renderer = None;
-            self.gpu_fallback_error = None;
-            self.app.set_backend(RenderBackend::Software);
         }
         self.window = Some(window);
         self.apply_theme_visuals();
@@ -1049,11 +1342,18 @@ impl GuiApp {
 
     fn sync_surface(&mut self, size: PhysicalSize<u32>) -> Result<(), Box<dyn Error>> {
         let surface = layout_rect_from_surface(size);
-        let terminal_size = terminal_size_from_surface(size);
+        let terminal_size = terminal_size_from_surface(size, &self.font);
         self.app.resize(surface, terminal_size)?;
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.resize(size);
         }
+        debug!(
+            width = size.width,
+            height = size.height,
+            cols = terminal_size.cols,
+            rows = terminal_size.rows,
+            "synced surface and terminal size"
+        );
         Ok(())
     }
 
@@ -1063,8 +1363,225 @@ impl GuiApp {
         }
     }
 
+    fn concise_title_text(&self, frame: &DesktopFrame) -> String {
+        let shell = frame.status_line.shell.as_deref().unwrap_or("shell");
+        let cwd = frame
+            .status_line
+            .cwd
+            .as_deref()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("workspace");
+        format!("Noctrail - {shell} - {cwd}")
+    }
+
+    fn glyph_raster_config(&self, frame: &DesktopFrame, scale_factor: f64) -> GlyphRasterConfig {
+        let cols = f32::from(frame.terminal_size.cols.max(1));
+        let rows = f32::from(frame.terminal_size.rows.max(1));
+        GlyphRasterConfig {
+            font: self.font_preferences.clone(),
+            scale: scale_factor as f32,
+            cell_width: (f32::from(frame.surface.width.max(1)) / cols).max(1.0),
+            line_height: (f32::from(frame.surface.height.max(1)) / rows).max(1.0),
+            weight: self.font.weight,
+            bold_weight: self.font.bold_weight,
+        }
+    }
+
+    fn software_palette(&self) -> SoftwareRenderPalette {
+        SoftwareRenderPalette {
+            background: rgba_from_config(self.theme.color.background),
+            foreground: rgba_from_config(self.theme.color.foreground),
+            selection_background: rgba_from_config(self.theme.selection.background),
+            selection_foreground: rgba_from_config(self.theme.selection.foreground),
+            cursor: rgba_from_config(self.theme.cursor.color),
+        }
+    }
+
+    fn status_bar_palette(&self, active: bool) -> StatusBarPalette {
+        let colors = &self.theme.color;
+        let background = rgba_from_config(colors.chrome_background);
+        let foreground = rgba_from_config(colors.chrome_foreground);
+        let muted = if active {
+            rgba_from_config(colors.chrome_muted)
+        } else {
+            mix_rgba(rgba_from_config(colors.chrome_muted), background, 0.25)
+        };
+        let accent = if active {
+            rgba_from_config(colors.chrome_accent)
+        } else {
+            mix_rgba(rgba_from_config(colors.chrome_accent), background, 0.35)
+        };
+        let danger = if active {
+            rgba_from_config(colors.chrome_danger)
+        } else {
+            mix_rgba(rgba_from_config(colors.chrome_danger), background, 0.35)
+        };
+
+        StatusBarPalette {
+            background,
+            foreground,
+            muted,
+            accent,
+            danger,
+            separator: mix_rgba(accent, background, 0.65),
+        }
+    }
+
+    fn render_current_frame(&mut self) -> Result<(), Box<dyn Error>> {
+        let Some(window) = self.window.as_ref() else {
+            return Ok(());
+        };
+        let frame = self.app.frame();
+        let mut raster = rasterize_software_frame(
+            &frame.render_plan,
+            &self.glyph_raster_config(&frame, window.scale_factor()),
+            &self.software_palette(),
+            self.cursor_visible,
+        )?;
+        self.render_status_bar(&frame, window.scale_factor(), &mut raster)?;
+
+        self.maybe_log_render_frame(&frame, &raster);
+
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.render_software_frame(&raster)?;
+        }
+
+        Ok(())
+    }
+
+    fn render_status_bar(
+        &self,
+        frame: &DesktopFrame,
+        scale_factor: f64,
+        target: &mut noctrail_render::SoftwareRenderFrame,
+    ) -> Result<(), noctrail_render::GlyphPrepareError> {
+        if frame.status_surface.height == 0 || frame.status_surface.width == 0 {
+            return Ok(());
+        }
+        let palette = self.status_bar_palette(frame.render_plan.active);
+        let status_width = usize::from(frame.status_surface.width.max(1));
+        let status_height = usize::from(frame.status_surface.height.max(1));
+        let origin_x = usize::from(frame.status_surface.x.saturating_sub(frame.pane_surface.x));
+        let origin_y = usize::from(frame.status_surface.y.saturating_sub(frame.pane_surface.y));
+        let mut config = self.glyph_raster_config(frame, scale_factor);
+        config.line_height = config.line_height.min(status_height as f32).max(
+            (self.font.size * self.font.line_height)
+                .min(status_height as f32)
+                .max(1.0),
+        );
+
+        let horizontal_padding = ((self.font.size * 0.6).round() as usize).max(8);
+        let usable_width = status_width.saturating_sub(horizontal_padding.saturating_mul(2));
+        let cols = ((usable_width as f32 / config.cell_width).floor() as usize).max(1);
+        let runs = compose_status_runs(frame, cols, palette);
+        let row = compose_status_row(&runs.left, &runs.right, cols);
+        let top_padding =
+            (((status_height as f32) - config.line_height).max(0.0) / 2.0).floor() as usize;
+        let viewport = RenderRect::new(
+            horizontal_padding.min(status_width / 2),
+            top_padding,
+            usable_width.max(1),
+            status_height,
+        );
+        let overlay = rasterize_software_frame(
+            &RenderPlan {
+                backend: frame.render_plan.backend,
+                pane_rect: RenderRect::new(0, 0, status_width, status_height),
+                viewport,
+                damage: DamageSet {
+                    dirty_rows: vec![0],
+                    full_frame: true,
+                },
+                scrollback_rows: 0,
+                cursor: Cursor::default(),
+                alternate_screen: false,
+                selection: None,
+                active: frame.render_plan.active,
+                border: PaneBorderStyle::default(),
+                corner_radius: 0,
+                rows: vec![RenderRow {
+                    row: 0,
+                    wrapped: false,
+                    glyphs: row,
+                }],
+            },
+            &config,
+            &SoftwareRenderPalette {
+                background: palette.background,
+                foreground: palette.foreground,
+                selection_background: palette.background,
+                selection_foreground: palette.foreground,
+                cursor: palette.accent,
+            },
+            false,
+        )?;
+
+        blit_software_frame(target, &overlay, origin_x, origin_y);
+        fill_frame_rect(
+            target,
+            origin_x,
+            origin_y.saturating_add(status_height.saturating_sub(1)),
+            status_width,
+            1,
+            palette.separator,
+        );
+        Ok(())
+    }
+
+    fn maybe_log_render_frame(
+        &mut self,
+        frame: &DesktopFrame,
+        raster: &noctrail_render::SoftwareRenderFrame,
+    ) {
+        let signature = FrameLogSignature {
+            full_frame: raster.stats.full_frame,
+            dirty_rows: raster.stats.dirty_rows,
+            glyphs: raster.stats.glyphs_prepared,
+            paint_rects: raster.stats.paint_rects,
+            border_segments: raster.stats.border_segments,
+        };
+        let now = Instant::now();
+        let in_startup_window = now.duration_since(self.started_at) <= STARTUP_DEBUG_WINDOW;
+        let signature_changed = self.last_frame_log_signature != Some(signature);
+        let interval_elapsed = self
+            .last_frame_log_at
+            .is_none_or(|previous| now.duration_since(previous) >= STABLE_DEBUG_SAMPLE_INTERVAL);
+
+        if in_startup_window || signature_changed || interval_elapsed {
+            debug!(
+                backend = ?frame.render_plan.backend,
+                rows = frame.render_plan.rows.len(),
+                dirty_rows = raster.stats.dirty_rows,
+                glyphs = raster.stats.glyphs_prepared,
+                paint_rects = raster.stats.paint_rects,
+                border_segments = raster.stats.border_segments,
+                full_frame = raster.stats.full_frame,
+                startup_window = in_startup_window,
+                "prepared terminal frame"
+            );
+            self.last_frame_log_at = Some(now);
+            self.last_frame_log_signature = Some(signature);
+        }
+    }
+
     fn title_text(&self) -> String {
-        let mut title = frame_title(&self.app.frame(), self.cursor_visible);
+        let frame = self.app.frame();
+        if !self.launch_options.debug_logging
+            && self.gpu_fallback_error.is_none()
+            && self.theme_reload_error.is_none()
+            && self.app.agent_command_proposals().is_empty()
+            && self.block_browser.is_none()
+            && self.agent_context_browser.is_none()
+            && self.agent_audit_browser.is_none()
+            && self.patch_preview_browser.is_none()
+            && self.review_panel.is_none()
+            && self.command_palette.is_none()
+        {
+            return self.concise_title_text(&frame);
+        }
+
+        let mut title = frame_title(&frame, self.cursor_visible);
         let effects = self.visual_effects_policy();
         title.push_str(" | font ");
         title.push_str(&self.font.family);
@@ -1358,7 +1875,7 @@ impl GuiApp {
     }
 
     fn record_gpu_fallback(&mut self, error: String) {
-        eprintln!("GPU renderer unavailable, falling back to software: {error}");
+        warn!(reason = %error, "render presenter unavailable; falling back to degraded mode");
         self.renderer = None;
         self.gpu_fallback_error = Some(error);
         self.app
@@ -1378,7 +1895,7 @@ impl GuiApp {
                     received_output = true;
                 }
                 Ok(OutputPumpEvent::Error(error)) => {
-                    eprintln!("PTY output pump failed: {error}");
+                    error!(reason = %error, "PTY output pump failed");
                     break;
                 }
                 Ok(OutputPumpEvent::Eof) => break,
@@ -1387,6 +1904,7 @@ impl GuiApp {
         }
 
         if received_output {
+            debug!("drained PTY output into terminal state");
             self.touch_cursor_blink();
             self.update_title();
             self.request_redraw();
@@ -1428,9 +1946,17 @@ impl GuiApp {
             return None;
         }
 
-        let terminal_size = self.app.pane().terminal_size();
-        let col = (logical.x / f64::from(DEFAULT_CELL_WIDTH)).floor() as usize;
-        let row = (logical.y / f64::from(DEFAULT_CELL_HEIGHT)).floor() as usize;
+        let frame = self.app.frame();
+        let terminal_size = frame.terminal_size;
+        let cell = self.glyph_raster_config(&frame, 1.0);
+        let relative_x = logical.x - f64::from(frame.surface.x);
+        let relative_y = logical.y - f64::from(frame.surface.y);
+        if relative_x.is_sign_negative() || relative_y.is_sign_negative() {
+            return None;
+        }
+
+        let col = (relative_x / f64::from(cell.cell_width)).floor() as usize;
+        let row = (relative_y / f64::from(cell.line_height)).floor() as usize;
         if row >= usize::from(terminal_size.rows) || col >= usize::from(terminal_size.cols) {
             return None;
         }
@@ -1593,7 +2119,7 @@ impl GuiApp {
                 self.font_preferences = font_preferences_from_config(&self.font);
                 if let Err(error) = self
                     .app
-                    .set_pane_chrome(pane_chrome_from_theme(&self.theme))
+                    .set_pane_chrome(pane_chrome_from_theme(&self.theme, &self.font))
                 {
                     self.theme_reload_error = Some(error.to_string());
                     self.update_title();
@@ -2204,7 +2730,7 @@ fn read_all_runtime_output_for_gui(app: &mut DesktopApp) -> Result<Vec<u8>, Box<
     Ok(output)
 }
 
-fn pane_chrome_from_theme(theme: &ThemeConfig) -> PaneChromeConfig {
+pub fn pane_chrome_from_theme(theme: &ThemeConfig, font: &FontConfig) -> PaneChromeConfig {
     PaneChromeConfig {
         border: PaneBorderStyle {
             width: usize::from(theme.border.width),
@@ -2214,7 +2740,20 @@ fn pane_chrome_from_theme(theme: &ThemeConfig) -> PaneChromeConfig {
         gap: theme.pane.gap,
         padding: theme.pane.padding,
         radius: theme.pane.radius,
+        status_height: status_bar_height(theme, font),
+        status_spacing: status_bar_spacing(theme),
     }
+}
+
+fn status_bar_height(theme: &ThemeConfig, font: &FontConfig) -> u16 {
+    let line_height = (font.size * font.line_height).round() as u16;
+    line_height
+        .saturating_add(theme.pane.padding.saturating_mul(2))
+        .max(20)
+}
+
+fn status_bar_spacing(theme: &ThemeConfig) -> u16 {
+    theme.pane.padding.max(4) / 2
 }
 
 fn rgba_from_config(color: noctrail_config::RgbaColor) -> Rgba {
@@ -2233,11 +2772,13 @@ enum OutputPumpEvent {
 }
 
 fn pump_output(mut reader: PtyOutputReader, tx: mpsc::Sender<OutputPumpEvent>) {
+    debug!("PTY output pump thread started");
     let mut chunk = [0_u8; 4096];
     loop {
         match reader.read(&mut chunk) {
             Ok(0) => {
                 let _ = tx.send(OutputPumpEvent::Eof);
+                debug!("PTY output pump reached EOF");
                 break;
             }
             Ok(count) => {
@@ -2245,6 +2786,7 @@ fn pump_output(mut reader: PtyOutputReader, tx: mpsc::Sender<OutputPumpEvent>) {
                     .send(OutputPumpEvent::Bytes(chunk[..count].to_vec()))
                     .is_err()
                 {
+                    debug!("PTY output pump receiver dropped");
                     break;
                 }
             }
@@ -2269,7 +2811,7 @@ fn scroll_lines(delta: MouseScrollDelta) -> i32 {
     match delta {
         MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
         MouseScrollDelta::PixelDelta(delta) => {
-            let lines = delta.y / f64::from(DEFAULT_CELL_HEIGHT);
+            let lines = delta.y / 20.0;
             if lines.abs() >= 1.0 {
                 lines.round() as i32
             } else {
@@ -2287,6 +2829,7 @@ fn exit_on_error<T, E>(event_loop: &ActiveEventLoop, result: Result<T, E>) {
 
 impl ApplicationHandler for GuiApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        info!("GUI application resumed");
         if self.window.is_none() && self.create_window(event_loop).is_err() {
             event_loop.exit();
             return;
@@ -2479,9 +3022,7 @@ impl ApplicationHandler for GuiApp {
                 self.request_redraw();
             }
             WindowEvent::RedrawRequested => {
-                if let Some(renderer) = self.renderer.as_mut()
-                    && let Err(error) = renderer.render_clear()
-                {
+                if let Err(error) = self.render_current_frame() {
                     self.record_gpu_fallback(error.to_string());
                     self.update_title();
                 }
@@ -2546,13 +3087,14 @@ mod tests {
 
     #[test]
     fn surface_size_is_clamped_to_terminal_cells() {
+        let font = FontConfig::default();
         assert_eq!(
-            terminal_size_from_surface(PhysicalSize::new(7, 15)),
+            terminal_size_from_surface(PhysicalSize::new(7, 15), &font),
             PtySize::new(1, 1)
         );
         assert_eq!(
-            terminal_size_from_surface(PhysicalSize::new(320, 160)),
-            PtySize::new(40, 10)
+            terminal_size_from_surface(PhysicalSize::new(320, 160), &font),
+            PtySize::new(34, 7)
         );
     }
 
@@ -2563,6 +3105,7 @@ mod tests {
             is_scratch: false,
             pane_id: PaneId::new(7),
             pane_surface: LayoutRect::new(0, 0, 120, 80),
+            status_surface: LayoutRect::new(0, 0, 120, 22),
             surface: LayoutRect::new(0, 0, 120, 80),
             terminal_size: PtySize::new(80, 24),
             process_id: Some(1234),
@@ -3118,7 +3661,7 @@ mod tests {
 
         assert_eq!(
             gui.app.frame_for_pane(PaneId::new(1))?.surface,
-            LayoutRect::new(0, 0, 120, 20)
+            LayoutRect::new(0, 8, 120, 12)
         );
         let split = gui
             .app
@@ -3126,7 +3669,7 @@ mod tests {
             .expect("split pane should be active");
         assert_eq!(
             gui.app.frame_for_pane(split)?.surface,
-            LayoutRect::new(0, 20, 120, 20)
+            LayoutRect::new(0, 28, 120, 12)
         );
         let split_status = gui
             .app
@@ -3304,9 +3847,9 @@ mod tests {
         let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
         gui.app.advance_output(b"hello");
 
-        gui.handle_cursor_moved(PhysicalPosition::new(1.0, 1.0))?;
+        gui.handle_cursor_moved(test_cell_position(&gui, 0, 0))?;
         gui.handle_mouse_input(ElementState::Pressed, WinitMouseButton::Left)?;
-        gui.handle_cursor_moved(PhysicalPosition::new(25.0, 1.0))?;
+        gui.handle_cursor_moved(test_cell_position(&gui, 3, 0))?;
         gui.handle_mouse_input(ElementState::Released, WinitMouseButton::Left)?;
 
         assert_eq!(gui.app.copy_selection_text().as_deref(), Some("hell"));
@@ -3504,7 +4047,7 @@ mod tests {
         let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
         gui.app.advance_output(b"\x1b[?1000h\x1b[?1006h");
 
-        gui.handle_cursor_moved(PhysicalPosition::new(9.0, 17.0))?;
+        gui.handle_cursor_moved(test_cell_position(&gui, 1, 1))?;
         gui.handle_mouse_input(ElementState::Pressed, WinitMouseButton::Left)?;
 
         let output = read_all_runtime_output(&mut gui.app)?;
@@ -3529,6 +4072,15 @@ mod tests {
         {
             format!("printf '{marker}\\n'\r")
         }
+    }
+
+    fn test_cell_position(gui: &GuiApp, col: usize, row: usize) -> PhysicalPosition<f64> {
+        let frame = gui.app.frame();
+        let metrics = gui.glyph_raster_config(&frame, 1.0);
+        PhysicalPosition::new(
+            f64::from(frame.surface.x) + f64::from(metrics.cell_width) * (col as f64 + 0.5),
+            f64::from(frame.surface.y) + f64::from(metrics.line_height) * (row as f64 + 0.5),
+        )
     }
 
     fn shell_command_bytes(marker: &str) -> Vec<u8> {

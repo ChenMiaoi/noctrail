@@ -7,9 +7,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod logging;
+
 use noctrail_agent::{ProviderAdapter, ProviderError};
 use noctrail_app::{
-    AgentContextPreview, DesktopApp, PaneChromeConfig,
+    AgentContextPreview, DesktopApp,
     gui::{self, GuiLaunchOptions},
     input, redaction,
 };
@@ -19,9 +21,10 @@ use noctrail_config::{
 };
 use noctrail_layout::{FocusDirection, LayoutRect, SplitAxis, WorkspaceId};
 use noctrail_pty::{PtyCommand, PtySize};
-use noctrail_render::{PaneBorderStyle, RenderBackend, Rgba};
+use noctrail_render::RenderBackend;
 use noctrail_term::{Position, SelectionMode};
 use serde_json::json;
+use tracing::{debug, info, warn};
 use winit::keyboard::{Key, ModifiersState};
 
 const HELP: &str = "\
@@ -51,6 +54,8 @@ Commands:
 
 Options:
   --config <path>    Load a TOML config file
+  --debug            Enable verbose debug logging
+  --log-file <path>  Write logs to an explicit file path
   --safe-mode        Ignore config failures and force software backend
   -h, --help         Print this help text
 ";
@@ -59,6 +64,8 @@ Options:
 struct StartupOptions {
     command: StartupCommand,
     config_path: Option<PathBuf>,
+    debug: bool,
+    log_file: Option<PathBuf>,
     safe_mode: bool,
 }
 
@@ -87,6 +94,8 @@ enum StartupCommand {
 enum StartupError {
     #[error("missing value for --config")]
     MissingConfigPath,
+    #[error("missing value for --log-file")]
+    MissingLogFilePath,
     #[error("unknown option: {0}")]
     UnknownOption(String),
     #[error("unknown command: {0}")]
@@ -129,6 +138,27 @@ fn main() {
             process::exit(2);
         }
     };
+    if !matches!(options.command, StartupCommand::Help) {
+        match logging::init(&logging::LoggingOptions {
+            debug: options.debug,
+            log_file: options.log_file.clone(),
+        }) {
+            Ok(handle) => {
+                info!(
+                    command = ?options.command,
+                    safe_mode = options.safe_mode,
+                    debug = options.debug,
+                    config = ?options.config_path,
+                    log_file = %handle.log_file().display(),
+                    "noctrail-app startup options resolved"
+                );
+            }
+            Err(error) => {
+                eprintln!("failed to initialize logging: {error}");
+                process::exit(2);
+            }
+        }
+    }
 
     match options.command {
         StartupCommand::Help => print!("{HELP}"),
@@ -235,6 +265,8 @@ fn parse_startup_options(args: &[String]) -> Result<StartupOptions, StartupError
     let mut command = StartupCommand::Gui;
     let mut command_set = false;
     let mut config_path = None;
+    let mut debug = false;
+    let mut log_file = None;
     let mut safe_mode = false;
     let mut index = 0;
 
@@ -315,6 +347,14 @@ fn parse_startup_options(args: &[String]) -> Result<StartupOptions, StartupError
                 };
                 config_path = Some(PathBuf::from(path));
             }
+            "--debug" => debug = true,
+            "--log-file" => {
+                index += 1;
+                let Some(path) = args.get(index) else {
+                    return Err(StartupError::MissingLogFilePath);
+                };
+                log_file = Some(PathBuf::from(path));
+            }
             "--safe-mode" => safe_mode = true,
             option if option.starts_with('-') => {
                 return Err(StartupError::UnknownOption(option.to_string()));
@@ -328,6 +368,8 @@ fn parse_startup_options(args: &[String]) -> Result<StartupOptions, StartupError
     Ok(StartupOptions {
         command,
         config_path,
+        debug,
+        log_file,
         safe_mode,
     })
 }
@@ -342,9 +384,15 @@ fn resolve_launch_options(options: &StartupOptions) -> Result<GuiLaunchOptions, 
             ConfigRendererBackend::Software => RenderBackend::Software,
         }
     };
+    debug!(
+        backend = ?renderer_backend,
+        safe_mode = options.safe_mode,
+        "resolved GUI launch options"
+    );
 
     Ok(GuiLaunchOptions {
         safe_mode: options.safe_mode,
+        debug_logging: options.debug,
         renderer_backend,
         config_path: options.config_path.clone(),
         theme: config.theme,
@@ -357,13 +405,17 @@ fn resolve_launch_options(options: &StartupOptions) -> Result<GuiLaunchOptions, 
 
 fn load_config(options: &StartupOptions) -> Result<Config, StartupError> {
     let Some(path) = options.config_path.as_ref() else {
+        info!("using default configuration");
         return Ok(Config::default());
     };
 
     match Config::load_from_path(path) {
-        Ok(config) => Ok(config),
+        Ok(config) => {
+            info!(path = %path.display(), "loaded configuration file");
+            Ok(config)
+        }
         Err(error) if options.safe_mode => {
-            eprintln!("ignoring config error in safe mode: {error}");
+            warn!(path = %path.display(), reason = %error, "ignoring config error in safe mode");
             Ok(Config::default())
         }
         Err(error) => Err(StartupError::Config(error)),
@@ -371,6 +423,7 @@ fn load_config(options: &StartupOptions) -> Result<Config, StartupError> {
 }
 
 fn run_gui(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>> {
+    info!("launching GUI event loop");
     gui::run_with_options(resolve_launch_options(options)?)?;
     Ok(())
 }
@@ -1066,7 +1119,10 @@ fn run_smoke(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>>
     let mut app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24))?;
     app.set_backend(launch_options.renderer_backend);
     apply_launch_layout(&mut app, &launch_options.layout)?;
-    app.set_pane_chrome(pane_chrome_from_theme(&launch_options.theme))?;
+    app.set_pane_chrome(gui::pane_chrome_from_theme(
+        &launch_options.theme,
+        &launch_options.font,
+    ))?;
     let effects = visual_effects_mode(&launch_options);
 
     let frame = app.frame();
@@ -1374,28 +1430,6 @@ fn read_all_runtime_output(app: &mut DesktopApp) -> Result<Vec<u8>, Box<dyn std:
     }
 
     Ok(output)
-}
-
-fn pane_chrome_from_theme(theme: &ThemeConfig) -> PaneChromeConfig {
-    PaneChromeConfig {
-        border: PaneBorderStyle {
-            width: usize::from(theme.border.width),
-            active: rgba_from_config(theme.border.active),
-            inactive: rgba_from_config(theme.border.inactive),
-        },
-        gap: theme.pane.gap,
-        padding: theme.pane.padding,
-        radius: theme.pane.radius,
-    }
-}
-
-fn rgba_from_config(color: noctrail_config::RgbaColor) -> Rgba {
-    Rgba {
-        red: color.red,
-        green: color.green,
-        blue: color.blue,
-        alpha: color.alpha,
-    }
 }
 
 fn visual_effects_mode(launch_options: &GuiLaunchOptions) -> VisualEffectsMode {
@@ -1848,7 +1882,25 @@ mod tests {
             options.config_path,
             Some(PathBuf::from("/tmp/noctrail.toml"))
         );
+        assert!(!options.debug);
+        assert_eq!(options.log_file, None);
         assert!(options.safe_mode);
+    }
+
+    #[test]
+    fn parses_debug_and_log_file_options() {
+        let options = parse_startup_options(&[
+            "gui".to_string(),
+            "--debug".to_string(),
+            "--log-file".to_string(),
+            "/tmp/noctrail.log".to_string(),
+        ])
+        .expect("options should parse");
+
+        assert_eq!(options.command, StartupCommand::Gui);
+        assert!(options.debug);
+        assert_eq!(options.log_file, Some(PathBuf::from("/tmp/noctrail.log")));
+        assert!(!options.safe_mode);
     }
 
     #[test]
@@ -1998,6 +2050,8 @@ mod tests {
         let options = StartupOptions {
             command: StartupCommand::Gui,
             config_path: Some(path.clone()),
+            debug: false,
+            log_file: None,
             safe_mode: false,
         };
 
@@ -2014,6 +2068,8 @@ mod tests {
         let options = StartupOptions {
             command: StartupCommand::Gui,
             config_path: Some(path.clone()),
+            debug: false,
+            log_file: None,
             safe_mode: true,
         };
 
@@ -2031,6 +2087,8 @@ mod tests {
         let options = StartupOptions {
             command: StartupCommand::Smoke,
             config_path: Some(path.clone()),
+            debug: false,
+            log_file: None,
             safe_mode: false,
         };
 
@@ -2052,6 +2110,8 @@ mod tests {
         let options = StartupOptions {
             command: StartupCommand::Gui,
             config_path: Some(path.clone()),
+            debug: false,
+            log_file: None,
             safe_mode: false,
         };
 
