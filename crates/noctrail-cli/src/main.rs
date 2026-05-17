@@ -3385,6 +3385,7 @@ fn run_render_fixture(path: &Path) -> Result<(), String> {
         backend,
         snapshot: &fixture.snapshot,
         damage: &damage,
+        chrome: &[],
         active: fixture.active,
         border: PaneBorderStyle {
             width: fixture.border.width,

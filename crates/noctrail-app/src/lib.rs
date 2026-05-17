@@ -18,7 +18,10 @@ use noctrail_layout::{
     FocusDirection, LayoutError, LayoutRect, PaneLayout, SplitAxis, WorkspaceId, WorkspaceSet,
 };
 use noctrail_pty::{PtyCommand, PtyError, PtyExitStatus, PtySize};
-use noctrail_render::{PaneBorderStyle, RenderBackend, RenderInput, RenderPlan, RenderRect};
+use noctrail_render::{
+    ChromeLayer, ChromeRect, PaneBorderStyle, RenderBackend, RenderInput, RenderPlan, RenderRect,
+    Rgba,
+};
 use noctrail_runtime::{PaneId, PaneRuntime};
 use noctrail_term::{
     Cursor, DamageSet, LineEnding, MouseTrackingMode, Position, Selection, SelectionMode,
@@ -33,14 +36,37 @@ const MAX_COMMAND_BLOCKS: usize = 100;
 const MAX_AUDIT_ENTRIES: usize = 200;
 const DEFAULT_SCRATCH_HEIGHT_PERCENT: u8 = 33;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaneChromeConfig {
     pub border: PaneBorderStyle,
+    pub background: Rgba,
+    pub status_background: Rgba,
+    pub status_separator: Rgba,
+    pub active_indicator: Rgba,
+    pub inactive_indicator: Rgba,
     pub gap: u16,
     pub padding: u16,
     pub radius: u16,
     pub status_height: u16,
     pub status_spacing: u16,
+}
+
+impl Default for PaneChromeConfig {
+    fn default() -> Self {
+        Self {
+            border: PaneBorderStyle::default(),
+            background: Rgba::opaque(0x14, 0x1c, 0x24),
+            status_background: Rgba::opaque(0x14, 0x1c, 0x24),
+            status_separator: Rgba::opaque(0x3b, 0x42, 0x61),
+            active_indicator: Rgba::opaque(0x73, 0xc9, 0xa7),
+            inactive_indicator: Rgba::opaque(0x3b, 0x42, 0x61),
+            gap: 0,
+            padding: 0,
+            radius: 0,
+            status_height: 0,
+            status_spacing: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -974,11 +1000,13 @@ impl TerminalPane {
         &self,
         pane_surface: LayoutRect,
         content_surface: LayoutRect,
+        status_surface: LayoutRect,
         backend: RenderBackend,
         active: bool,
         chrome: PaneChromeConfig,
     ) -> RenderPlan {
         let snapshot = self.render_snapshot();
+        let chrome_rects = pane_chrome_rects(pane_surface, status_surface, active, chrome);
         RenderPlan::from_input(RenderInput {
             pane_rect: RenderRect::new(
                 usize::from(pane_surface.x),
@@ -995,6 +1023,7 @@ impl TerminalPane {
             backend,
             snapshot: &snapshot,
             damage: &self.last_damage,
+            chrome: &chrome_rects,
             active,
             border: chrome.border,
             corner_radius: usize::from(chrome.radius),
@@ -1722,6 +1751,7 @@ impl DesktopApp {
             render_plan: pane.render_plan(
                 pane_surface,
                 content_surface,
+                status_surface,
                 self.backend,
                 pane_id == active_pane,
                 self.pane_chrome,
@@ -2354,7 +2384,7 @@ fn projected_cells(offset: u16, span: u16, total_span: u16, total_cells: u16) ->
 }
 
 fn pane_content_surface(pane_surface: LayoutRect, pane_chrome: PaneChromeConfig) -> LayoutRect {
-    let outer = pane_outer_insets(pane_chrome);
+    let outer = pane_outer_insets(pane_surface, pane_chrome);
     let inner = inset_layout_rect(pane_surface, outer);
     let status_height = effective_status_height(inner.height, pane_chrome);
 
@@ -2370,8 +2400,87 @@ fn pane_content_surface(pane_surface: LayoutRect, pane_chrome: PaneChromeConfig)
     )
 }
 
+fn pane_chrome_rects(
+    pane_surface: LayoutRect,
+    status_surface: LayoutRect,
+    active: bool,
+    pane_chrome: PaneChromeConfig,
+) -> Vec<ChromeRect> {
+    let mut rects = Vec::with_capacity(4);
+    let pane_background = if active {
+        pane_chrome.background
+    } else {
+        mix_rgba(pane_chrome.status_background, pane_chrome.background, 0.84)
+    };
+    let pane_rect = layout_rect_to_render_rect(pane_surface);
+    if pane_rect.width > 0 && pane_rect.height > 0 {
+        rects.push(ChromeRect {
+            layer: ChromeLayer::PaneBackground,
+            rect: pane_rect,
+            color: pane_background,
+        });
+    }
+
+    let header_surface = if status_surface.height > 0 {
+        status_surface
+    } else {
+        pane_surface
+    };
+    let header_rect = layout_rect_to_render_rect(header_surface);
+    if header_rect.width > 0 && header_rect.height > 0 {
+        let status_background = if active {
+            pane_chrome.status_background
+        } else {
+            mix_rgba(pane_chrome.status_background, pane_background, 0.56)
+        };
+        rects.push(ChromeRect {
+            layer: ChromeLayer::StatusBackground,
+            rect: header_rect,
+            color: status_background,
+        });
+
+        let indicator_width = if active { 6_usize } else { 3_usize }
+            .min(header_rect.width)
+            .max(1);
+        rects.push(ChromeRect {
+            layer: ChromeLayer::StatusIndicator,
+            rect: RenderRect::new(
+                header_rect.x,
+                header_rect.y,
+                indicator_width,
+                header_rect.height,
+            ),
+            color: if active {
+                pane_chrome.active_indicator
+            } else {
+                pane_chrome.inactive_indicator
+            },
+        });
+    }
+
+    let status_rect = layout_rect_to_render_rect(status_surface);
+    if status_rect.width > 0 && status_rect.height > 0 {
+        rects.push(ChromeRect {
+            layer: ChromeLayer::StatusSeparator,
+            rect: RenderRect::new(
+                status_rect.x,
+                status_rect.y + status_rect.height.saturating_sub(1),
+                status_rect.width,
+                1,
+            ),
+            color: if active {
+                pane_chrome.status_separator
+            } else {
+                mix_rgba(pane_chrome.status_separator, pane_background, 0.72)
+            },
+        });
+    }
+
+    rects
+}
+
 fn pane_status_surface(pane_surface: LayoutRect, pane_chrome: PaneChromeConfig) -> LayoutRect {
-    let outer = pane_outer_insets(pane_chrome);
+    let outer = pane_outer_insets(pane_surface, pane_chrome);
     let inner = inset_layout_rect(pane_surface, outer);
     let status_height = effective_status_height(inner.height, pane_chrome);
     if status_height == 0 {
@@ -2381,16 +2490,26 @@ fn pane_status_surface(pane_surface: LayoutRect, pane_chrome: PaneChromeConfig) 
     LayoutRect::new(inner.x, inner.y, inner.width, status_height)
 }
 
-fn pane_outer_insets(pane_chrome: PaneChromeConfig) -> EdgeInsets {
+fn pane_outer_insets(pane_surface: LayoutRect, pane_chrome: PaneChromeConfig) -> EdgeInsets {
     let left_gap = pane_chrome.gap / 2;
     let right_gap = pane_chrome.gap - left_gap;
     let top_gap = pane_chrome.gap / 2;
     let bottom_gap = pane_chrome.gap - top_gap;
+    let horizontal_cap = (pane_surface.width / 10).max(2);
+    let vertical_cap = (pane_surface.height / 10).max(2);
     EdgeInsets {
-        left: left_gap.saturating_add(pane_chrome.padding),
-        right: right_gap.saturating_add(pane_chrome.padding),
-        top: top_gap.saturating_add(pane_chrome.padding),
-        bottom: bottom_gap.saturating_add(pane_chrome.padding),
+        left: left_gap
+            .saturating_add(pane_chrome.padding)
+            .min(horizontal_cap),
+        right: right_gap
+            .saturating_add(pane_chrome.padding)
+            .min(horizontal_cap),
+        top: top_gap
+            .saturating_add(pane_chrome.padding)
+            .min(vertical_cap),
+        bottom: bottom_gap
+            .saturating_add(pane_chrome.padding)
+            .min(vertical_cap),
     }
 }
 
@@ -2410,7 +2529,7 @@ fn status_spacing_for_height(status_height: u16, pane_chrome: PaneChromeConfig) 
     if status_height == 0 {
         0
     } else {
-        pane_chrome.status_spacing
+        pane_chrome.status_spacing.min((status_height / 2).max(4))
     }
 }
 
@@ -2420,6 +2539,32 @@ struct EdgeInsets {
     right: u16,
     top: u16,
     bottom: u16,
+}
+
+fn layout_rect_to_render_rect(rect: LayoutRect) -> RenderRect {
+    RenderRect::new(
+        usize::from(rect.x),
+        usize::from(rect.y),
+        usize::from(rect.width),
+        usize::from(rect.height),
+    )
+}
+
+fn mix_rgba(foreground: Rgba, background: Rgba, background_ratio: f32) -> Rgba {
+    let foreground_ratio = (1.0 - background_ratio).clamp(0.0, 1.0);
+    let background_ratio = background_ratio.clamp(0.0, 1.0);
+    Rgba {
+        red: ((f32::from(foreground.red) * foreground_ratio)
+            + (f32::from(background.red) * background_ratio))
+            .round() as u8,
+        green: ((f32::from(foreground.green) * foreground_ratio)
+            + (f32::from(background.green) * background_ratio))
+            .round() as u8,
+        blue: ((f32::from(foreground.blue) * foreground_ratio)
+            + (f32::from(background.blue) * background_ratio))
+            .round() as u8,
+        alpha: u8::MAX,
+    }
 }
 
 fn inset_layout_rect(rect: LayoutRect, insets: EdgeInsets) -> LayoutRect {
@@ -2556,6 +2701,11 @@ mod tests {
                 active: noctrail_render::Rgba::opaque(0x7a, 0xa2, 0xf7),
                 inactive: noctrail_render::Rgba::opaque(0x3b, 0x42, 0x61),
             },
+            background: noctrail_render::Rgba::opaque(0x14, 0x1c, 0x24),
+            status_background: noctrail_render::Rgba::opaque(0x1a, 0x24, 0x2d),
+            status_separator: noctrail_render::Rgba::opaque(0x3b, 0x42, 0x61),
+            active_indicator: noctrail_render::Rgba::opaque(0x73, 0xc9, 0xa7),
+            inactive_indicator: noctrail_render::Rgba::opaque(0x3b, 0x42, 0x61),
             gap: 8,
             padding: 6,
             radius: 10,
@@ -2567,13 +2717,30 @@ mod tests {
 
         let frame = app.frame();
         assert_eq!(frame.pane_surface, LayoutRect::new(0, 0, 120, 80));
-        assert_eq!(frame.status_surface, LayoutRect::new(10, 10, 100, 18));
-        assert_eq!(frame.surface, LayoutRect::new(10, 32, 100, 38));
+        assert_eq!(frame.status_surface, LayoutRect::new(10, 8, 100, 18));
+        assert_eq!(frame.surface, LayoutRect::new(10, 30, 100, 42));
         assert_eq!(frame.terminal_size, PtySize::new(10, 2));
         assert_eq!(frame.render_plan.pane_rect, RenderRect::new(0, 0, 120, 80));
-        assert_eq!(frame.render_plan.viewport, RenderRect::new(10, 32, 100, 38));
+        assert_eq!(frame.render_plan.viewport, RenderRect::new(10, 30, 100, 42));
         assert_eq!(frame.render_plan.border, chrome.border);
         assert_eq!(frame.render_plan.corner_radius, 10);
+        assert_eq!(frame.render_plan.chrome.len(), 4);
+        assert_eq!(
+            frame.render_plan.chrome[0].layer,
+            ChromeLayer::PaneBackground
+        );
+        assert_eq!(
+            frame.render_plan.chrome[1].layer,
+            ChromeLayer::StatusBackground
+        );
+        assert_eq!(
+            frame.render_plan.chrome[2].layer,
+            ChromeLayer::StatusIndicator
+        );
+        assert_eq!(
+            frame.render_plan.chrome[3].layer,
+            ChromeLayer::StatusSeparator
+        );
         Ok(())
     }
 
@@ -2581,6 +2748,11 @@ mod tests {
     fn odd_gap_insets_keep_adjacent_panes_aligned() {
         let chrome = PaneChromeConfig {
             border: PaneBorderStyle::default(),
+            background: noctrail_render::Rgba::opaque(0x14, 0x1c, 0x24),
+            status_background: noctrail_render::Rgba::opaque(0x14, 0x1c, 0x24),
+            status_separator: noctrail_render::Rgba::opaque(0x3b, 0x42, 0x61),
+            active_indicator: noctrail_render::Rgba::opaque(0x73, 0xc9, 0xa7),
+            inactive_indicator: noctrail_render::Rgba::opaque(0x3b, 0x42, 0x61),
             gap: 3,
             padding: 2,
             radius: 8,

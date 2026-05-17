@@ -69,11 +69,23 @@ Current pane-level render metadata includes:
 
 - active/inactive border colors
 - border width
+- pane surface fills
+- status/header chrome fills
 - pane gap and padding
 - corner radius
 
 The renderer uses that metadata to prepare border overlays and to keep
 inner terminal content separate from outer pane chrome.
+
+The current chrome split is:
+
+- `noctrail-app` computes pane/status/header rects and their colors.
+- `noctrail-render` consumes those immutable chrome rects alongside
+  terminal rows.
+- GUI-specific status text may still be composed separately, but the
+  pane surface, header background, active indicator, and separator are
+  now part of the shared render input rather than ad-hoc presenter
+  fills.
 
 ## Fallback and Diagnostics
 

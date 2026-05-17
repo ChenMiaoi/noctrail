@@ -9,21 +9,14 @@ use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 
 const DEFAULT_THEME_OPACITY: f32 = 1.0;
-const DEFAULT_FONT_FAMILY: &str = "JetBrainsMono Nerd Font";
-const DEFAULT_FONT_SIZE: f32 = 14.0;
+const DEFAULT_FONT_SIZE: f32 = 15.0;
 const DEFAULT_FONT_LINE_HEIGHT: f32 = 1.55;
 const DEFAULT_FONT_WEIGHT: u16 = 450;
 const DEFAULT_FONT_BOLD_WEIGHT: u16 = 650;
-const DEFAULT_FONT_FALLBACKS: [&str; 4] = [
-    "Noto Sans CJK SC",
-    "Noto Color Emoji",
-    "Apple Color Emoji",
-    "Segoe UI Emoji",
-];
 const DEFAULT_CURSOR_BLINK_INTERVAL_MS: u64 = 600;
-const DEFAULT_PANE_GAP: u16 = 12;
-const DEFAULT_PANE_PADDING: u16 = 8;
-const DEFAULT_PANE_RADIUS: u16 = 14;
+const DEFAULT_PANE_GAP: u16 = 20;
+const DEFAULT_PANE_PADDING: u16 = 14;
+const DEFAULT_PANE_RADIUS: u16 = 22;
 const DEFAULT_BLUR_FALLBACK_TINT_OPACITY: f32 = 0.92;
 const DEFAULT_ANIMATION_DURATION_MS: u64 = 120;
 const DEFAULT_LAYOUT_RESIZE_STEP: u16 = 5;
@@ -99,17 +92,57 @@ pub struct FontConfig {
 impl Default for FontConfig {
     fn default() -> Self {
         Self {
-            family: DEFAULT_FONT_FAMILY.to_string(),
+            family: default_font_family().to_string(),
             size: DEFAULT_FONT_SIZE,
             line_height: DEFAULT_FONT_LINE_HEIGHT,
             weight: DEFAULT_FONT_WEIGHT,
             bold_weight: DEFAULT_FONT_BOLD_WEIGHT,
-            fallback: DEFAULT_FONT_FALLBACKS
-                .iter()
-                .map(|family| (*family).to_string())
-                .collect(),
+            fallback: default_font_fallbacks(),
         }
     }
+}
+
+fn default_font_family() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "CaskaydiaCove Nerd Font Mono"
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        "Consolas"
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        "JetBrainsMono Nerd Font"
+    }
+}
+
+fn default_font_fallbacks() -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    let families = [
+        "Menlo",
+        "PingFang SC",
+        "Apple Color Emoji",
+        "Segoe UI Emoji",
+    ];
+
+    #[cfg(target_os = "windows")]
+    let families = ["Microsoft YaHei UI", "Segoe UI Emoji", "Noto Color Emoji"];
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let families = [
+        "Noto Sans CJK SC",
+        "Noto Color Emoji",
+        "Apple Color Emoji",
+        "Segoe UI Emoji",
+    ];
+
+    families
+        .iter()
+        .map(|family| (*family).to_string())
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -782,7 +815,7 @@ mod tests {
         let config = Config::default();
 
         assert_eq!(config.renderer.backend, RendererBackend::Gpu);
-        assert_eq!(config.font.family, DEFAULT_FONT_FAMILY);
+        assert_eq!(config.font.family, default_font_family());
         assert_eq!(config.font.size, DEFAULT_FONT_SIZE);
         assert_eq!(config.font.line_height, DEFAULT_FONT_LINE_HEIGHT);
         assert_eq!(config.font.weight, DEFAULT_FONT_WEIGHT);

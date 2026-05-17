@@ -76,6 +76,21 @@ impl PaneBorderStyle {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChromeLayer {
+    PaneBackground,
+    StatusBackground,
+    StatusIndicator,
+    StatusSeparator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChromeRect {
+    pub layer: ChromeLayer,
+    pub rect: RenderRect,
+    pub color: Rgba,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderGlyph {
     pub col: usize,
@@ -138,6 +153,7 @@ pub struct RenderInput<'a> {
     pub backend: RenderBackend,
     pub snapshot: &'a TerminalSnapshot,
     pub damage: &'a DamageSet,
+    pub chrome: &'a [ChromeRect],
     pub active: bool,
     pub border: PaneBorderStyle,
     pub corner_radius: usize,
@@ -153,6 +169,7 @@ pub struct RenderPlan {
     pub cursor: Cursor,
     pub alternate_screen: bool,
     pub selection: Option<Selection>,
+    pub chrome: Vec<ChromeRect>,
     pub active: bool,
     pub border: PaneBorderStyle,
     pub corner_radius: usize,
@@ -178,6 +195,7 @@ impl RenderPlan {
                 dirty_rows: (0..snapshot.rows.len()).collect(),
                 full_frame: true,
             },
+            chrome: &[],
             active: true,
             border: PaneBorderStyle::default(),
             corner_radius: 0,
@@ -194,6 +212,7 @@ impl RenderPlan {
             cursor: input.snapshot.cursor,
             alternate_screen: input.snapshot.alternate_screen,
             selection: input.snapshot.selection.clone(),
+            chrome: input.chrome.to_vec(),
             active: input.active,
             border: input.border,
             corner_radius: input.corner_radius,
@@ -215,14 +234,7 @@ impl RenderPlan {
 #[derive(Debug, Default)]
 pub struct RenderSurface;
 
-const DEFAULT_FONT_FAMILY: &str = "JetBrainsMono Nerd Font";
-const DEFAULT_FONT_SIZE: f32 = 14.0;
-const DEFAULT_FONT_FALLBACKS: [&str; 4] = [
-    "Noto Sans CJK SC",
-    "Noto Color Emoji",
-    "Apple Color Emoji",
-    "Segoe UI Emoji",
-];
+const DEFAULT_FONT_SIZE: f32 = 15.0;
 const FONT_SAMPLE_ASCII: &str = "abcXYZ 0123";
 const FONT_SAMPLE_CJK: &str = "你好，世界";
 const FONT_SAMPLE_EMOJI: &str = "🙂🧪🚀";
@@ -238,7 +250,7 @@ pub struct FontPreferences {
 impl Default for FontPreferences {
     fn default() -> Self {
         Self {
-            family: DEFAULT_FONT_FAMILY.to_string(),
+            family: default_font_family().to_string(),
             size: DEFAULT_FONT_SIZE,
             fallback: default_font_fallbacks(),
         }
@@ -405,12 +417,18 @@ pub struct BorderFrame {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ChromeFrame {
+    pub rects: Vec<ChromeRect>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FrameStats {
     pub full_frame: bool,
     pub scrollback_rows: usize,
     pub dirty_rows: usize,
     pub glyphs_prepared: usize,
     pub atlas_uploads: usize,
+    pub chrome_rects: usize,
     pub paint_rects: usize,
     pub border_segments: usize,
 }
@@ -418,6 +436,7 @@ pub struct FrameStats {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedRenderFrame {
     pub glyphs: PreparedGlyphFrame,
+    pub chrome: ChromeFrame,
     pub paint: CellPaintFrame,
     pub border: BorderFrame,
     pub stats: FrameStats,
@@ -499,6 +518,21 @@ pub fn rasterize_software_frame(
         .selection
         .as_ref()
         .map(|selection| selection_ranges(&plan.rows, &selection.clone().normalized()));
+
+    for rect in &prepared.chrome.rects {
+        fill_rect_rgba(
+            &mut pixels,
+            width,
+            height,
+            PixelRect {
+                x: rect.rect.x as i32,
+                y: rect.rect.y as i32,
+                width: rect.rect.width as u32,
+                height: rect.rect.height as u32,
+            },
+            rect.color,
+        );
+    }
 
     for segment in &prepared.border.segments {
         fill_rect_rgba(
@@ -621,6 +655,7 @@ fn prepare_render_frame_with_font_system(
     config: &GlyphRasterConfig,
 ) -> Result<PreparedRenderFrame, GlyphPrepareError> {
     let glyphs = prepare_glyph_frame_with_font_system(font_system, plan, config)?;
+    let chrome = prepare_chrome_frame(plan);
     let paint = prepare_cell_paint_frame(plan);
     let border = prepare_border_frame(plan);
     let stats = FrameStats {
@@ -629,16 +664,29 @@ fn prepare_render_frame_with_font_system(
         dirty_rows: glyphs.prepared_rows.len(),
         glyphs_prepared: glyphs.glyphs.len(),
         atlas_uploads: glyphs.raster_jobs(),
+        chrome_rects: chrome.rects.len(),
         paint_rects: paint.rects.len(),
         border_segments: border.segments.len(),
     };
 
     Ok(PreparedRenderFrame {
         glyphs,
+        chrome,
         paint,
         border,
         stats,
     })
+}
+
+pub fn prepare_chrome_frame(plan: &RenderPlan) -> ChromeFrame {
+    ChromeFrame {
+        rects: plan
+            .chrome
+            .iter()
+            .filter(|rect| rect.rect.width > 0 && rect.rect.height > 0)
+            .cloned()
+            .collect(),
+    }
 }
 
 pub fn prepare_cell_paint_frame(plan: &RenderPlan) -> CellPaintFrame {
@@ -898,22 +946,42 @@ fn resolve_primary_family(
     )
 }
 
+fn default_font_family() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "CaskaydiaCove Nerd Font Mono"
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        "Consolas"
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        "JetBrainsMono Nerd Font"
+    }
+}
+
 fn default_font_fallbacks() -> Vec<String> {
-    let fallback = DEFAULT_FONT_FALLBACKS
+    #[cfg(target_os = "macos")]
+    let families = [
+        "Menlo",
+        "PingFang SC",
+        "Apple Color Emoji",
+        "Segoe UI Emoji",
+    ];
+
+    #[cfg(target_os = "windows")]
+    let families = ["Microsoft YaHei UI", "Segoe UI Emoji", "Noto Color Emoji"];
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let families = DEFAULT_FONT_FALLBACKS;
+
+    families
         .iter()
         .map(|family| (*family).to_string())
-        .collect::<Vec<_>>();
-
-    #[cfg(any(target_os = "macos", windows))]
-    let mut fallback = fallback;
-
-    #[cfg(target_os = "macos")]
-    fallback.insert(1, "PingFang SC".to_string());
-
-    #[cfg(windows)]
-    fallback.insert(1, "Microsoft YaHei UI".to_string());
-
-    fallback
+        .collect()
 }
 
 fn resolve_requested_family(
@@ -1105,6 +1173,7 @@ fn prepare_glyph_frame_with_font_system(
     let prepared_rows = effective_render_rows(plan);
     let mut glyphs = Vec::new();
     let mut unique_cache_keys = BTreeSet::new();
+    let baseline_y = glyph_baseline_offset(config.font.size, config.line_height);
 
     for row in &plan.rows {
         if !prepared_rows.contains(&row.row) {
@@ -1127,7 +1196,7 @@ fn prepare_glyph_frame_with_font_system(
             );
             let offset = (
                 glyph.col as f32 * config.cell_width,
-                row.row as f32 * config.line_height,
+                row.row as f32 * config.line_height + baseline_y,
             );
 
             for layout_glyph in shaped_glyphs {
@@ -1151,6 +1220,11 @@ fn prepare_glyph_frame_with_font_system(
         unique_cache_keys: unique_cache_keys.into_iter().collect(),
         prepared_rows,
     })
+}
+
+fn glyph_baseline_offset(font_size: f32, line_height: f32) -> f32 {
+    let leading = (line_height - font_size).max(0.0);
+    (leading * 0.5) + (font_size * 0.8)
 }
 
 fn font_attrs_for_render_glyph<'a>(style: Style, config: &'a GlyphRasterConfig) -> FontAttrs<'a> {
@@ -2008,6 +2082,7 @@ mod tests {
         assert_eq!(plan.cursor, snapshot.cursor);
         assert!(plan.alternate_screen);
         assert_eq!(plan.selection, snapshot.selection);
+        assert!(plan.chrome.is_empty());
         assert!(plan.active);
         assert_eq!(plan.corner_radius, 0);
         assert_eq!(plan.rows.len(), 1);
@@ -2067,10 +2142,10 @@ mod tests {
     fn default_font_preferences_match_rendering_note() {
         let preferences = FontPreferences::default();
 
-        assert_eq!(preferences.family, DEFAULT_FONT_FAMILY);
+        assert_eq!(preferences.family, default_font_family());
         assert_eq!(preferences.size, DEFAULT_FONT_SIZE);
-        for family in DEFAULT_FONT_FALLBACKS {
-            assert!(preferences.fallback.iter().any(|item| item == family));
+        for family in default_font_fallbacks() {
+            assert!(preferences.fallback.iter().any(|item| item == &family));
         }
     }
 
@@ -2149,6 +2224,27 @@ mod tests {
         assert_eq!(frame_at_1x.raster_jobs(), 1);
         assert_eq!(frame_at_2x.raster_jobs(), 1);
         assert_ne!(frame_at_1x.unique_cache_keys, frame_at_2x.unique_cache_keys);
+    }
+
+    #[test]
+    fn glyph_frame_offsets_first_row_below_the_top_edge() {
+        let snapshot = TerminalSnapshot {
+            rows: vec![ScreenRowSnapshot {
+                cells: vec![cell("A")],
+                wrapped: false,
+            }],
+            ..TerminalSnapshot::default()
+        };
+        let plan = RenderPlan::from_terminal(
+            RenderRect::new(0, 0, 1, 1),
+            RenderBackend::Software,
+            &snapshot,
+        );
+
+        let prepared = prepare_glyph_frame(&plan, &GlyphRasterConfig::default()).unwrap();
+
+        assert!(!prepared.glyphs.is_empty());
+        assert!(prepared.glyphs.iter().all(|glyph| glyph.y > 0));
     }
 
     #[test]
@@ -2298,6 +2394,7 @@ mod tests {
             backend: RenderBackend::Software,
             snapshot: &snapshot,
             damage: &damage,
+            chrome: &[],
             active: true,
             border: PaneBorderStyle::default(),
             corner_radius: 0,
@@ -2362,6 +2459,7 @@ mod tests {
             backend: RenderBackend::Software,
             snapshot: &snapshot,
             damage: &damage,
+            chrome: &[],
             active: true,
             border: PaneBorderStyle::default(),
             corner_radius: 0,
@@ -2418,6 +2516,7 @@ mod tests {
             cursor: Cursor::default(),
             alternate_screen: false,
             selection: None,
+            chrome: Vec::new(),
             active: true,
             border: PaneBorderStyle {
                 width: 2,
@@ -2480,6 +2579,7 @@ mod tests {
             cursor: Cursor::default(),
             alternate_screen: false,
             selection: None,
+            chrome: Vec::new(),
             active: false,
             border: PaneBorderStyle {
                 width: 1,
@@ -2522,6 +2622,11 @@ mod tests {
             backend: RenderBackend::Software,
             snapshot: &snapshot,
             damage: &damage,
+            chrome: &[ChromeRect {
+                layer: ChromeLayer::PaneBackground,
+                rect: RenderRect::new(1, 2, 6, 7),
+                color: Rgba::opaque(0x14, 0x1c, 0x24),
+            }],
             active: false,
             border: PaneBorderStyle::default(),
             corner_radius: 9,
@@ -2530,10 +2635,55 @@ mod tests {
         assert_eq!(plan.pane_rect, RenderRect::new(1, 2, 6, 7));
         assert_eq!(plan.viewport, RenderRect::new(4, 5, 6, 7));
         assert_eq!(plan.damage, damage);
+        assert_eq!(
+            plan.chrome,
+            vec![ChromeRect {
+                layer: ChromeLayer::PaneBackground,
+                rect: RenderRect::new(1, 2, 6, 7),
+                color: Rgba::opaque(0x14, 0x1c, 0x24),
+            }]
+        );
         assert!(!plan.active);
         assert_eq!(plan.border, PaneBorderStyle::default());
         assert_eq!(plan.corner_radius, 9);
         assert_eq!(plan.rows[0].glyphs.len(), 3);
+    }
+
+    #[test]
+    fn chrome_frame_preserves_pane_surface_rects() {
+        let plan = RenderPlan {
+            backend: RenderBackend::Software,
+            pane_rect: RenderRect::new(0, 0, 120, 80),
+            viewport: RenderRect::new(10, 32, 100, 38),
+            damage: DamageSet {
+                dirty_rows: vec![0],
+                full_frame: true,
+            },
+            scrollback_rows: 0,
+            cursor: Cursor::default(),
+            alternate_screen: false,
+            selection: None,
+            chrome: vec![
+                ChromeRect {
+                    layer: ChromeLayer::PaneBackground,
+                    rect: RenderRect::new(0, 0, 120, 80),
+                    color: Rgba::opaque(0x14, 0x1c, 0x24),
+                },
+                ChromeRect {
+                    layer: ChromeLayer::StatusIndicator,
+                    rect: RenderRect::new(10, 10, 100, 2),
+                    color: Rgba::opaque(0x73, 0xc9, 0xa7),
+                },
+            ],
+            active: true,
+            border: PaneBorderStyle::default(),
+            corner_radius: 0,
+            rows: Vec::new(),
+        };
+
+        let chrome = prepare_chrome_frame(&plan);
+
+        assert_eq!(chrome.rects, plan.chrome);
     }
 
     #[test]
