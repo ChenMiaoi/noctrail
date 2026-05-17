@@ -63,6 +63,55 @@ fn run_smoke() -> Result<(), Box<dyn std::error::Error>> {
         frame.render_plan.rows.len()
     );
 
+    app.write_input(shell_marker_command("NOCTRAIL_APP_SMOKE_WRITE").as_bytes())?;
+    app.paste_text(&shell_marker_command("NOCTRAIL_APP_SMOKE_PASTE"))?;
+    app.write_input(shell_exit_command().as_bytes())?;
+
+    let output = read_all_runtime_output(&mut app)?;
+    let text = String::from_utf8_lossy(&output);
+    if !text.contains("NOCTRAIL_APP_SMOKE_WRITE") {
+        return Err(format!("smoke output missing write marker: {text:?}").into());
+    }
+    if !text.contains("NOCTRAIL_APP_SMOKE_PASTE") {
+        return Err(format!("smoke output missing paste marker: {text:?}").into());
+    }
+    println!("input smoke ok");
+
     let _ = app.close_runtime()?;
     Ok(())
+}
+
+fn read_all_runtime_output(app: &mut DesktopApp) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let runtime = app
+        .pane_mut()
+        .runtime_mut()
+        .ok_or("active pane is missing a runtime")?;
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 1024];
+
+    loop {
+        let count = runtime.read_output(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        output.extend_from_slice(&chunk[..count]);
+    }
+
+    Ok(output)
+}
+
+fn shell_marker_command(marker: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("echo {marker}\r\n")
+    }
+
+    #[cfg(not(windows))]
+    {
+        format!("printf '{marker}\\n'\r")
+    }
+}
+
+fn shell_exit_command() -> &'static str {
+    "exit\r\n"
 }

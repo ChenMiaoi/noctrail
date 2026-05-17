@@ -301,6 +301,7 @@ fn full_frame_damage(size: PtySize) -> DamageSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error as StdError;
 
     #[test]
     fn shellless_app_builds_single_pane_frame() {
@@ -343,5 +344,101 @@ mod tests {
         assert!(frame.render_plan.damage.full_frame);
         assert_eq!(frame.render_plan.damage.dirty_rows, vec![0, 1, 2, 3]);
         Ok(())
+    }
+
+    #[test]
+    fn active_pane_writes_and_pastes_into_shell() -> Result<(), Box<dyn StdError>> {
+        let mut app =
+            DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24))?;
+
+        app.write_input(shell_command_bytes("NOCTRAIL_APP_WRITE").as_slice())?;
+        app.paste_text(shell_command_text("NOCTRAIL_APP_PASTE").as_str())?;
+        app.write_input(shell_exit_bytes().as_slice())?;
+
+        let output = read_all_runtime_output(&mut app)?;
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("NOCTRAIL_APP_WRITE"),
+            "active pane write did not reach shell: {text:?}"
+        );
+        assert!(
+            text.contains("NOCTRAIL_APP_PASTE"),
+            "active pane paste did not reach shell: {text:?}"
+        );
+
+        let status = app.close_runtime()?;
+        assert!(status.is_some(), "shell should exit after smoke commands");
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn ctrl_d_writes_eot_byte_to_foreground_process() -> Result<(), Box<dyn StdError>> {
+        let mut app = DesktopApp::spawn(
+            LayoutRect::new(0, 0, 120, 80),
+            single_byte_hex_dump_command(),
+            PtySize::new(80, 24),
+        )?;
+
+        app.write_input(&[0x04])?;
+        let output = read_all_runtime_output(&mut app)?;
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("04"),
+            "ctrl-d byte did not reach the foreground process: {text:?}"
+        );
+
+        let status = app.close_runtime()?;
+        assert!(
+            status.is_some(),
+            "foreground process should exit after one byte"
+        );
+        Ok(())
+    }
+
+    fn read_all_runtime_output(app: &mut DesktopApp) -> Result<Vec<u8>, AppError> {
+        let runtime = app
+            .pane_mut()
+            .runtime_mut()
+            .ok_or(AppError::MissingRuntime)?;
+        let mut output = Vec::new();
+        let mut chunk = [0_u8; 1024];
+
+        loop {
+            let count = runtime.read_output(&mut chunk)?;
+            if count == 0 {
+                break;
+            }
+            output.extend_from_slice(&chunk[..count]);
+        }
+
+        Ok(output)
+    }
+
+    fn shell_command_text(marker: &str) -> String {
+        #[cfg(windows)]
+        {
+            format!("echo {marker}\r\n")
+        }
+
+        #[cfg(not(windows))]
+        {
+            format!("printf '{marker}\\n'\r")
+        }
+    }
+
+    fn shell_command_bytes(marker: &str) -> Vec<u8> {
+        shell_command_text(marker).into_bytes()
+    }
+
+    fn shell_exit_bytes() -> Vec<u8> {
+        b"exit\r\n".to_vec()
+    }
+
+    #[cfg(not(windows))]
+    fn single_byte_hex_dump_command() -> noctrail_pty::PtyCommand {
+        let mut command = noctrail_pty::PtyCommand::new("sh");
+        command.args(["-lc", "stty raw -echo; od -An -tx1 -N1"]);
+        command
     }
 }

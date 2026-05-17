@@ -218,6 +218,17 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_d_maps_to_eot_byte() {
+        let bytes = key_to_pty_bytes(
+            &Key::Character("d".into()),
+            Some("d"),
+            ModifiersState::CONTROL,
+        )
+        .expect("ctrl-d should map");
+        assert_eq!(bytes, vec![0x04]);
+    }
+
+    #[test]
     fn alt_prefixes_escape() {
         let bytes = key_to_pty_bytes(&Key::Character("x".into()), Some("x"), ModifiersState::ALT)
             .expect("alt-x should map");
