@@ -1,0 +1,62 @@
+{
+  "surface": { "width": 3, "height": 1 },
+  "backend": "software",
+  "snapshot": {
+    "rows": [
+      {
+        "cells": [
+          {
+            "text": "A",
+            "style": {
+              "foreground": { "Indexed": 7 },
+              "background": { "Indexed": 1 },
+              "bold": false,
+              "italic": false,
+              "underline": false
+            }
+          },
+          {
+            "text": "B",
+            "style": {
+              "foreground": { "Indexed": 7 },
+              "background": { "Indexed": 1 },
+              "bold": false,
+              "italic": false,
+              "underline": true
+            }
+          },
+          {
+            "text": "C",
+            "style": {
+              "foreground": { "Indexed": 7 },
+              "background": { "Indexed": 0 },
+              "bold": false,
+              "italic": false,
+              "underline": false
+            }
+          }
+        ]
+      }
+    ],
+    "cursor": { "row": 0, "col": 1 }
+  },
+  "damage": { "dirty_rows": [0] },
+  "expect": {
+    "prepared_rows": [0],
+    "glyph_rows": [0, 0, 0],
+    "raster_jobs": 3,
+    "glyphs_prepared": 3,
+    "paint_rects": 4,
+    "full_frame": false,
+    "background_rects": [
+      { "row": 0, "col": 0, "span": 2 },
+      { "row": 0, "col": 2, "span": 1 }
+    ],
+    "underline_rects": [
+      { "row": 0, "col": 1, "span": 1 }
+    ],
+    "cursor_rects": [
+      { "row": 0, "col": 1, "span": 1 }
+    ]
+  }
+}

@@ -1,15 +1,22 @@
-use std::{env, path::PathBuf, process, thread, time::Duration};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process, thread,
+    time::Duration,
+};
 
 #[cfg(windows)]
 use noctrail_pty::ShellSource;
 use noctrail_pty::{PtySession, PtySize, ResolvedShell};
 use noctrail_render::{
-    FontDiagnostics, FontFamilyDiagnostics, FontPreferences, RenderBackend, RenderPlan, RenderRect,
-    probe_font_diagnostics, probe_gpu_backend,
+    FontDiagnostics, FontFamilyDiagnostics, FontPreferences, GlyphRasterConfig, PaintLayer,
+    RenderBackend, RenderPlan, RenderRect, prepare_render_frame, probe_font_diagnostics,
+    probe_gpu_backend,
 };
 use noctrail_runtime::{PaneId, PaneRuntimeRegistry, RuntimeCommand, RuntimeEvent};
 use noctrail_term::recording::replay_recording_file;
-use noctrail_term::{Cell, Color, Cursor, ScreenRowSnapshot, Style, TerminalSnapshot};
+use noctrail_term::{Cell, Color, Cursor, DamageSet, ScreenRowSnapshot, Style, TerminalSnapshot};
+use serde::Deserialize;
 
 const HELP: &str = "\
 Noctrail development CLI
@@ -23,6 +30,7 @@ Commands:
   doctor gpu  Print GPU backend diagnostics
   doctor font Print font fallback diagnostics
   replay      Replay one or more terminal recording fixtures
+  render-fixtures  Run deterministic render fixtures
   render-smoke Run the render smoke check
   pty-smoke   Run the PTY smoke check
   help        Print this help text
@@ -58,6 +66,13 @@ fn main() {
         }
         Some("render-smoke") => {
             if let Err(error) = run_render_smoke() {
+                eprintln!("{error}");
+                process::exit(1);
+            }
+        }
+        Some("render-fixtures") => {
+            let patterns: Vec<String> = args.collect();
+            if let Err(error) = run_render_fixtures(&patterns) {
                 eprintln!("{error}");
                 process::exit(1);
             }
@@ -227,10 +242,11 @@ fn replay_fixtures(patterns: &[String]) -> Result<(), String> {
                 .map_err(|error| format!("failed to parse glob pattern {pattern:?}: {error}"))?;
             for entry in entries {
                 let path = entry.map_err(|error| format!("failed to read glob entry: {error}"))?;
+                let path = canonicalize_fixture_path(path)?;
                 paths.push(path);
             }
         } else {
-            paths.push(PathBuf::from(pattern));
+            paths.push(canonicalize_fixture_path(PathBuf::from(pattern))?);
         }
     }
 
@@ -247,6 +263,342 @@ fn replay_fixtures(patterns: &[String]) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct RenderFixture {
+    surface: RenderFixtureRect,
+    #[serde(default)]
+    backend: FixtureBackend,
+    snapshot: TerminalSnapshot,
+    damage: RenderFixtureDamage,
+    #[serde(default)]
+    glyph_raster: FixtureGlyphRaster,
+    expect: RenderFixtureExpect,
+}
+
+#[derive(Debug, Deserialize)]
+struct RenderFixtureRect {
+    #[serde(default)]
+    x: usize,
+    #[serde(default)]
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum FixtureBackend {
+    Gpu,
+    #[default]
+    Software,
+}
+
+#[derive(Debug, Deserialize)]
+struct RenderFixtureDamage {
+    dirty_rows: Vec<usize>,
+    #[serde(default)]
+    full_frame: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct FixtureGlyphRaster {
+    #[serde(default = "default_scale")]
+    scale: f32,
+    #[serde(default = "default_cell_width")]
+    cell_width: f32,
+    #[serde(default = "default_line_height")]
+    line_height: f32,
+}
+
+impl Default for FixtureGlyphRaster {
+    fn default() -> Self {
+        Self {
+            scale: default_scale(),
+            cell_width: default_cell_width(),
+            line_height: default_line_height(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RenderFixtureExpect {
+    #[serde(default)]
+    prepared_rows: Vec<usize>,
+    glyph_rows: Option<Vec<usize>>,
+    raster_jobs: Option<usize>,
+    glyphs_prepared: Option<usize>,
+    paint_rects: Option<usize>,
+    full_frame: Option<bool>,
+    background_rects: Option<Vec<ExpectedRect>>,
+    selection_rects: Option<Vec<ExpectedRect>>,
+    underline_rects: Option<Vec<ExpectedRect>>,
+    cursor_rects: Option<Vec<ExpectedRect>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct ExpectedRect {
+    row: usize,
+    col: usize,
+    span: usize,
+}
+
+fn default_scale() -> f32 {
+    1.0
+}
+
+fn default_cell_width() -> f32 {
+    14.0
+}
+
+fn default_line_height() -> f32 {
+    19.6
+}
+
+fn run_render_fixtures(patterns: &[String]) -> Result<(), String> {
+    let owned_patterns = if patterns.is_empty() {
+        default_render_fixture_patterns()
+    } else {
+        patterns.to_vec()
+    };
+    let paths = resolve_paths(&owned_patterns)?;
+
+    for path in paths {
+        run_render_fixture(&path)?;
+        println!("rendered {}", path.display());
+    }
+
+    Ok(())
+}
+
+fn run_render_fixture(path: &Path) -> Result<(), String> {
+    let fixture: RenderFixture =
+        serde_json::from_slice(&std::fs::read(path).map_err(|error| {
+            format!("failed to read render fixture {}: {error}", path.display())
+        })?)
+        .map_err(|error| format!("failed to parse render fixture {}: {error}", path.display()))?;
+    let damage = DamageSet {
+        dirty_rows: fixture.damage.dirty_rows.clone(),
+        full_frame: fixture.damage.full_frame,
+    };
+    let backend = match fixture.backend {
+        FixtureBackend::Gpu => RenderBackend::Gpu,
+        FixtureBackend::Software => RenderBackend::Software,
+    };
+    let plan = RenderPlan::from_input(noctrail_render::RenderInput {
+        viewport: RenderRect::new(
+            fixture.surface.x,
+            fixture.surface.y,
+            fixture.surface.width,
+            fixture.surface.height,
+        ),
+        backend,
+        snapshot: &fixture.snapshot,
+        damage: &damage,
+        active: true,
+    });
+    let prepared = prepare_render_frame(
+        &plan,
+        &GlyphRasterConfig {
+            scale: fixture.glyph_raster.scale,
+            cell_width: fixture.glyph_raster.cell_width,
+            line_height: fixture.glyph_raster.line_height,
+            ..GlyphRasterConfig::default()
+        },
+    )
+    .map_err(|error| {
+        format!(
+            "failed to prepare render fixture {}: {error}",
+            path.display()
+        )
+    })?;
+
+    assert_render_fixture(path, &fixture.expect, &prepared)
+}
+
+fn assert_render_fixture(
+    path: &Path,
+    expect: &RenderFixtureExpect,
+    prepared: &noctrail_render::PreparedRenderFrame,
+) -> Result<(), String> {
+    if !expect.prepared_rows.is_empty() && prepared.glyphs.prepared_rows != expect.prepared_rows {
+        return Err(format!(
+            "{} prepared rows mismatch: expected {:?}, got {:?}",
+            path.display(),
+            expect.prepared_rows,
+            prepared.glyphs.prepared_rows
+        ));
+    }
+
+    if let Some(glyph_rows) = &expect.glyph_rows {
+        let actual_rows = prepared
+            .glyphs
+            .glyphs
+            .iter()
+            .map(|glyph| glyph.row)
+            .collect::<Vec<_>>();
+        if &actual_rows != glyph_rows {
+            return Err(format!(
+                "{} glyph rows mismatch: expected {:?}, got {:?}",
+                path.display(),
+                glyph_rows,
+                actual_rows
+            ));
+        }
+    }
+
+    if let Some(raster_jobs) = expect.raster_jobs
+        && prepared.glyphs.raster_jobs() != raster_jobs
+    {
+        return Err(format!(
+            "{} raster jobs mismatch: expected {}, got {}",
+            path.display(),
+            raster_jobs,
+            prepared.glyphs.raster_jobs()
+        ));
+    }
+
+    if let Some(glyphs_prepared) = expect.glyphs_prepared
+        && prepared.stats.glyphs_prepared != glyphs_prepared
+    {
+        return Err(format!(
+            "{} glyph count mismatch: expected {}, got {}",
+            path.display(),
+            glyphs_prepared,
+            prepared.stats.glyphs_prepared
+        ));
+    }
+
+    if let Some(paint_rects) = expect.paint_rects
+        && prepared.stats.paint_rects != paint_rects
+    {
+        return Err(format!(
+            "{} paint rect count mismatch: expected {}, got {}",
+            path.display(),
+            paint_rects,
+            prepared.stats.paint_rects
+        ));
+    }
+
+    if let Some(full_frame) = expect.full_frame
+        && prepared.stats.full_frame != full_frame
+    {
+        return Err(format!(
+            "{} full_frame mismatch: expected {}, got {}",
+            path.display(),
+            full_frame,
+            prepared.stats.full_frame
+        ));
+    }
+
+    assert_expected_rects(
+        path,
+        "background",
+        PaintLayer::Background,
+        expect.background_rects.as_deref(),
+        prepared,
+    )?;
+    assert_expected_rects(
+        path,
+        "selection",
+        PaintLayer::Selection,
+        expect.selection_rects.as_deref(),
+        prepared,
+    )?;
+    assert_expected_rects(
+        path,
+        "underline",
+        PaintLayer::Underline,
+        expect.underline_rects.as_deref(),
+        prepared,
+    )?;
+    assert_expected_rects(
+        path,
+        "cursor",
+        PaintLayer::Cursor,
+        expect.cursor_rects.as_deref(),
+        prepared,
+    )?;
+
+    Ok(())
+}
+
+fn assert_expected_rects(
+    path: &Path,
+    label: &str,
+    layer: PaintLayer,
+    expected: Option<&[ExpectedRect]>,
+    prepared: &noctrail_render::PreparedRenderFrame,
+) -> Result<(), String> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let actual = prepared
+        .paint
+        .rects
+        .iter()
+        .filter(|rect| rect.layer == layer)
+        .map(|rect| ExpectedRect {
+            row: rect.row,
+            col: rect.col,
+            span: rect.span,
+        })
+        .collect::<Vec<_>>();
+
+    if actual != expected {
+        return Err(format!(
+            "{} {} rects mismatch: expected {:?}, got {:?}",
+            path.display(),
+            label,
+            expected,
+            actual
+        ));
+    }
+
+    Ok(())
+}
+
+fn resolve_paths(patterns: &[String]) -> Result<Vec<PathBuf>, String> {
+    let mut paths = Vec::new();
+    for pattern in patterns {
+        if contains_glob_meta(pattern) {
+            let entries = glob::glob(pattern)
+                .map_err(|error| format!("failed to parse glob pattern {pattern:?}: {error}"))?;
+            for entry in entries {
+                let path = entry.map_err(|error| format!("failed to read glob entry: {error}"))?;
+                paths.push(canonicalize_fixture_path(path)?);
+            }
+        } else {
+            paths.push(canonicalize_fixture_path(PathBuf::from(pattern))?);
+        }
+    }
+
+    if paths.is_empty() {
+        return Err("no fixtures matched the provided patterns".to_string());
+    }
+
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+fn default_render_fixture_patterns() -> Vec<String> {
+    let workspace_pattern =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/render/*.ntshot");
+    vec![
+        "tests/fixtures/render/*.ntshot".to_string(),
+        workspace_pattern.to_string_lossy().into_owned(),
+    ]
+}
+
+fn canonicalize_fixture_path(path: PathBuf) -> Result<PathBuf, String> {
+    path.canonicalize().map_err(|error| {
+        format!(
+            "failed to canonicalize fixture path {}: {error}",
+            path.display()
+        )
+    })
 }
 
 fn contains_glob_meta(pattern: &str) -> bool {
@@ -683,6 +1035,11 @@ mod tests {
     #[test]
     fn render_smoke_succeeds() {
         run_render_smoke().expect("render smoke should pass");
+    }
+
+    #[test]
+    fn render_fixtures_succeed() {
+        run_render_fixtures(&[]).expect("render fixtures should pass");
     }
 
     #[test]

@@ -1,0 +1,32 @@
+{
+  "surface": { "width": 3, "height": 3 },
+  "backend": "software",
+  "snapshot": {
+    "rows": [
+      { "cells": [ { "text": "A" }, { "text": "B" }, { "text": "C" } ] },
+      { "cells": [ { "text": "D" }, { "text": "E" }, { "text": "F" } ] },
+      { "cells": [ { "text": "G" }, { "text": "H" }, { "text": "I" } ] }
+    ],
+    "cursor": { "row": 2, "col": 0 },
+    "selection": {
+      "mode": "Normal",
+      "start": { "row": 0, "col": 1 },
+      "end": { "row": 0, "col": 2 }
+    }
+  },
+  "damage": { "dirty_rows": [1] },
+  "expect": {
+    "prepared_rows": [0, 1, 2],
+    "glyph_rows": [0, 0, 0, 1, 1, 1, 2, 2, 2],
+    "raster_jobs": 9,
+    "glyphs_prepared": 9,
+    "paint_rects": 2,
+    "full_frame": false,
+    "selection_rects": [
+      { "row": 0, "col": 1, "span": 2 }
+    ],
+    "cursor_rects": [
+      { "row": 2, "col": 0, "span": 1 }
+    ]
+  }
+}

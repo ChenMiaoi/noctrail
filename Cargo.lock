@@ -1114,6 +1114,8 @@ dependencies = [
  "noctrail-render",
  "noctrail-runtime",
  "noctrail-term",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

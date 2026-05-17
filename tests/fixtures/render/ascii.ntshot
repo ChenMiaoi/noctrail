@@ -1,0 +1,29 @@
+{
+  "surface": { "width": 4, "height": 1 },
+  "backend": "software",
+  "snapshot": {
+    "rows": [
+      {
+        "cells": [
+          { "text": "A" },
+          { "text": "A" },
+          { "text": "A" },
+          { "text": "A" }
+        ]
+      }
+    ],
+    "cursor": { "row": 0, "col": 3 }
+  },
+  "damage": { "dirty_rows": [0] },
+  "expect": {
+    "prepared_rows": [0],
+    "glyph_rows": [0, 0, 0, 0],
+    "raster_jobs": 1,
+    "glyphs_prepared": 4,
+    "paint_rects": 1,
+    "full_frame": false,
+    "cursor_rects": [
+      { "row": 0, "col": 3, "span": 1 }
+    ]
+  }
+}

@@ -1,8 +1,17 @@
 # Render Fixtures
 
-This directory is reserved for render-plan fixtures and screenshot-adjacent
-smoke inputs.
+Render fixtures live here as JSON `.ntshot` files consumed by:
 
-Phase 0 only requires the directory and a CLI smoke entrypoint to exist.
-Richer fixture suites can land here as `noctrail-render` grows beyond the
-current smoke coverage.
+```bash
+cargo run -p noctrail-cli -- render-fixtures
+```
+
+Each fixture describes:
+
+- a `TerminalSnapshot`
+- a render surface and damage set
+- optional glyph raster config overrides
+- structured expectations for prepared rows, raster job counts, and paint rects
+
+This is the deterministic software/golden path for Phase 3 before GPU screenshots
+become stable enough to gate in CI.
