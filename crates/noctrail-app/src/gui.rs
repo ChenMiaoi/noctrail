@@ -840,6 +840,10 @@ impl GuiApp {
                 if block.folded {
                     title.push_str(" | folded");
                 }
+                if let Some(lens) = block.structured_output.as_ref() {
+                    title.push_str(" | lens ");
+                    title.push_str(&lens.summary);
+                }
                 if let Some(command) = block.command.as_deref() {
                     title.push_str(" | cmd ");
                     title.push_str(&preview_text(command, 32));
@@ -1350,6 +1354,13 @@ impl GuiApp {
                     }
                     "o" => {
                         if let Some(output) = self.app.copy_selected_command_block_output() {
+                            self.clipboard.set_text(output);
+                        }
+                    }
+                    "s" => {
+                        if let Some(output) =
+                            self.app.copy_selected_command_block_structured_output()
+                        {
                             self.clipboard.set_text(output);
                         }
                     }
@@ -2036,22 +2047,47 @@ mod tests {
             "/tmp/noctrail-blocks",
             7,
             1200,
-            "line one\nline two",
+            "{\"line\":\"one\",\"count\":2}\n",
         ));
         gui.block_browser = Some(BlockBrowser);
         let _ = gui.app.select_newest_command_block();
 
         let unfolded = gui.title_text();
         assert!(unfolded.contains("blocks on 1/100 sel 1"));
+        assert!(unfolded.contains("lens json object 2 keys"));
         assert!(unfolded.contains("cmd cargo test -p noctrail-app"));
         assert!(unfolded.contains("code 7"));
         assert!(unfolded.contains("dur 1200ms"));
-        assert!(unfolded.contains("out line one line two"));
+        assert!(unfolded.contains("out {\"line\":\"one\",\"count\":2}"));
 
         let _ = gui.app.toggle_selected_command_block_fold();
         let folded = gui.title_text();
         assert!(folded.contains("| folded"));
-        assert!(!folded.contains("out line one line two"));
+        assert!(!folded.contains("out {\"line\":\"one\",\"count\":2}"));
+    }
+
+    #[test]
+    fn block_browser_can_copy_structured_output() {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
+        gui.app.set_block_observer_enabled(true);
+        gui.app.advance_output(&block_probe_bytes(
+            "cat structured",
+            "/tmp/noctrail-structured",
+            0,
+            18,
+            "name,count\nalpha,1\nbeta,2\n",
+        ));
+        gui.block_browser = Some(BlockBrowser);
+        let _ = gui.app.select_newest_command_block();
+
+        if let Some(output) = gui.app.copy_selected_command_block_structured_output() {
+            gui.clipboard.set_text(output);
+        }
+        assert_eq!(
+            gui.clipboard.get_text().as_deref(),
+            Some("name,count\nalpha,1\nbeta,2\n")
+        );
     }
 
     #[test]

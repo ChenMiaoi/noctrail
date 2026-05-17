@@ -22,7 +22,9 @@ use noctrail_term::{
     Cursor, DamageSet, LineEnding, MouseTrackingMode, Position, Selection, SelectionMode,
     ShellIntegrationEvent, TerminalSnapshot, TerminalState,
 };
+use serde_json::Value as JsonValue;
 use thiserror::Error;
+use toml::Value as TomlValue;
 
 const ROOT_PANE_ID: PaneId = PaneId::new(1);
 const SCRATCH_HEIGHT_DIVISOR: u16 = 3;
@@ -65,6 +67,7 @@ pub struct CommandBlock {
     pub duration_ms: Option<u64>,
     pub output: String,
     pub folded: bool,
+    pub structured_output: Option<StructuredOutputLens>,
 }
 
 impl CommandBlock {
@@ -75,6 +78,29 @@ impl CommandBlock {
             && self.duration_ms.is_none()
             && self.output.is_empty()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuredOutputKind {
+    Json,
+    Csv,
+    Toml,
+}
+
+impl StructuredOutputKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Csv => "csv",
+            Self::Toml => "toml",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredOutputLens {
+    pub kind: StructuredOutputKind,
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -200,6 +226,15 @@ impl CommandBlockObserver {
         }
     }
 
+    fn copy_selected_structured_output(&self) -> Option<String> {
+        let block = self.selected()?;
+        if block.structured_output.is_some() && !block.output.is_empty() {
+            Some(block.output.clone())
+        } else {
+            None
+        }
+    }
+
     fn observe_event(&mut self, event: ShellIntegrationEvent) {
         match event {
             ShellIntegrationEvent::Prompt => {}
@@ -239,6 +274,8 @@ impl CommandBlockObserver {
             return;
         }
 
+        let mut current = current;
+        current.structured_output = detect_structured_output(&current.output);
         self.completed.push(current);
         if self.completed.len() > MAX_COMMAND_BLOCKS {
             let overflow = self.completed.len() - MAX_COMMAND_BLOCKS;
@@ -446,6 +483,10 @@ impl TerminalPane {
 
     pub fn copy_selected_command_block_output(&self) -> Option<String> {
         self.block_observer.copy_selected_output()
+    }
+
+    pub fn copy_selected_command_block_structured_output(&self) -> Option<String> {
+        self.block_observer.copy_selected_structured_output()
     }
 
     pub fn paste_bytes(&self, text: &str) -> Vec<u8> {
@@ -824,6 +865,11 @@ impl DesktopApp {
 
     pub fn copy_selected_command_block_output(&self) -> Option<String> {
         self.active_pane_ref().copy_selected_command_block_output()
+    }
+
+    pub fn copy_selected_command_block_structured_output(&self) -> Option<String> {
+        self.active_pane_ref()
+            .copy_selected_command_block_structured_output()
     }
 
     pub fn pane_by_id(&self, pane_id: PaneId) -> Option<&TerminalPane> {
@@ -1324,6 +1370,127 @@ fn skip_escape_sequence(bytes: &[u8]) -> Option<usize> {
     }
 }
 
+fn detect_structured_output(output: &str) -> Option<StructuredOutputLens> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    detect_json_lens(trimmed)
+        .or_else(|| detect_toml_lens(trimmed))
+        .or_else(|| detect_csv_lens(trimmed))
+}
+
+fn detect_json_lens(trimmed: &str) -> Option<StructuredOutputLens> {
+    let value = serde_json::from_str::<JsonValue>(trimmed).ok()?;
+    let summary = match value {
+        JsonValue::Object(map) => format!("json object {} keys", map.len()),
+        JsonValue::Array(items) => format!("json array {} items", items.len()),
+        JsonValue::String(_) => "json string".to_string(),
+        JsonValue::Number(_) => "json number".to_string(),
+        JsonValue::Bool(_) => "json boolean".to_string(),
+        JsonValue::Null => "json null".to_string(),
+    };
+    Some(StructuredOutputLens {
+        kind: StructuredOutputKind::Json,
+        summary,
+    })
+}
+
+fn detect_toml_lens(trimmed: &str) -> Option<StructuredOutputLens> {
+    if !looks_like_toml(trimmed) {
+        return None;
+    }
+
+    let value = toml::from_str::<TomlValue>(trimmed).ok()?;
+    let summary = match value {
+        TomlValue::Table(table) => format!("toml table {} keys", table.len()),
+        TomlValue::Array(items) => format!("toml array {} items", items.len()),
+        TomlValue::String(_) => "toml string".to_string(),
+        TomlValue::Integer(_) => "toml integer".to_string(),
+        TomlValue::Float(_) => "toml float".to_string(),
+        TomlValue::Boolean(_) => "toml boolean".to_string(),
+        TomlValue::Datetime(_) => "toml datetime".to_string(),
+    };
+    Some(StructuredOutputLens {
+        kind: StructuredOutputKind::Toml,
+        summary,
+    })
+}
+
+fn looks_like_toml(trimmed: &str) -> bool {
+    trimmed.lines().any(|line| {
+        let line = line.trim();
+        (!line.is_empty() && line.contains('=')) || (line.starts_with('[') && line.ends_with(']'))
+    })
+}
+
+fn detect_csv_lens(trimmed: &str) -> Option<StructuredOutputLens> {
+    let rows = trimmed
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if rows.len() < 2 {
+        return None;
+    }
+
+    let mut width = None;
+    for row in &rows {
+        let fields = parse_csv_fields(row)?;
+        if fields.len() < 2 {
+            return None;
+        }
+        match width {
+            Some(expected) if expected != fields.len() => return None,
+            None => width = Some(fields.len()),
+            _ => {}
+        }
+    }
+
+    Some(StructuredOutputLens {
+        kind: StructuredOutputKind::Csv,
+        summary: format!("csv {} rows x {} cols", rows.len(), width.unwrap_or(0)),
+    })
+}
+
+fn parse_csv_fields(line: &str) -> Option<Vec<String>> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut chars = line.chars().peekable();
+    let mut in_quotes = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                if in_quotes {
+                    if chars.peek() == Some(&'"') {
+                        current.push('"');
+                        let _ = chars.next();
+                    } else {
+                        in_quotes = false;
+                    }
+                } else if current.is_empty() {
+                    in_quotes = true;
+                } else {
+                    return None;
+                }
+            }
+            ',' if !in_quotes => {
+                fields.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if in_quotes {
+        return None;
+    }
+
+    fields.push(current);
+    Some(fields)
+}
+
 fn selection_line_ending() -> LineEnding {
     if cfg!(windows) {
         LineEnding::CrLf
@@ -1814,6 +1981,7 @@ mod tests {
                 duration_ms: Some(33),
                 output: "visible enabled".to_string(),
                 folded: false,
+                structured_output: None,
             }
         );
     }
@@ -1838,6 +2006,7 @@ mod tests {
                 duration_ms: None,
                 output: "running output".to_string(),
                 folded: false,
+                structured_output: None,
             })
         );
         assert!(app.pane().command_blocks().is_empty());
@@ -1858,6 +2027,7 @@ mod tests {
                 duration_ms: Some(58),
                 output: "running output".to_string(),
                 folded: false,
+                structured_output: None,
             }]
         );
     }
@@ -1931,6 +2101,123 @@ mod tests {
         assert_eq!(
             app.copy_selected_command_block_output().as_deref(),
             Some("output-001")
+        );
+    }
+
+    #[test]
+    fn structured_output_lenses_detect_json_csv_and_toml_without_rewriting_raw_output() {
+        let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(40, 6));
+        app.set_block_observer_enabled(true);
+
+        let json_output = "{\"ok\":true,\"items\":[1,2]}\n";
+        app.advance_output(&shell_integration_probe_bytes(
+            "cat json",
+            "/tmp/json",
+            0,
+            12,
+            json_output.as_bytes(),
+        ));
+        let json_block = app
+            .selected_command_block()
+            .expect("json block should be selected");
+        assert_eq!(
+            json_block.structured_output.as_ref().map(|lens| lens.kind),
+            Some(StructuredOutputKind::Json)
+        );
+        assert_eq!(
+            json_block
+                .structured_output
+                .as_ref()
+                .map(|lens| lens.summary.as_str()),
+            Some("json object 2 keys")
+        );
+        assert_eq!(
+            app.copy_selected_command_block_structured_output()
+                .as_deref(),
+            Some(json_output)
+        );
+        assert_eq!(
+            app.copy_selected_command_block_output().as_deref(),
+            Some(json_output)
+        );
+
+        let csv_output = "name,count\nalpha,1\nbeta,2\n";
+        app.advance_output(&shell_integration_probe_bytes(
+            "cat csv",
+            "/tmp/csv",
+            0,
+            13,
+            csv_output.as_bytes(),
+        ));
+        let csv_block = app
+            .selected_command_block()
+            .expect("csv block should be selected");
+        assert_eq!(
+            csv_block.structured_output.as_ref().map(|lens| lens.kind),
+            Some(StructuredOutputKind::Csv)
+        );
+        assert_eq!(
+            csv_block
+                .structured_output
+                .as_ref()
+                .map(|lens| lens.summary.as_str()),
+            Some("csv 3 rows x 2 cols")
+        );
+        assert_eq!(
+            app.copy_selected_command_block_structured_output()
+                .as_deref(),
+            Some(csv_output)
+        );
+
+        let toml_output = "name = \"noctrail\"\nenabled = true\n";
+        app.advance_output(&shell_integration_probe_bytes(
+            "cat toml",
+            "/tmp/toml",
+            0,
+            14,
+            toml_output.as_bytes(),
+        ));
+        let toml_block = app
+            .selected_command_block()
+            .expect("toml block should be selected");
+        assert_eq!(
+            toml_block.structured_output.as_ref().map(|lens| lens.kind),
+            Some(StructuredOutputKind::Toml)
+        );
+        assert_eq!(
+            toml_block
+                .structured_output
+                .as_ref()
+                .map(|lens| lens.summary.as_str()),
+            Some("toml table 2 keys")
+        );
+        assert_eq!(
+            app.copy_selected_command_block_structured_output()
+                .as_deref(),
+            Some(toml_output)
+        );
+    }
+
+    #[test]
+    fn non_structured_blocks_do_not_offer_structured_copy() {
+        let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(20, 4));
+        app.set_block_observer_enabled(true);
+
+        app.advance_output(&shell_integration_probe_bytes(
+            "echo plain",
+            "/tmp/plain",
+            0,
+            3,
+            b"plain output\n",
+        ));
+
+        let block = app
+            .selected_command_block()
+            .expect("plain block should be selected");
+        assert!(block.structured_output.is_none());
+        assert!(
+            app.copy_selected_command_block_structured_output()
+                .is_none()
         );
     }
 

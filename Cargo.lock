@@ -1102,7 +1102,9 @@ dependencies = [
  "noctrail-render",
  "noctrail-runtime",
  "noctrail-term",
+ "serde_json",
  "thiserror 2.0.18",
+ "toml",
  "winit",
 ]
 

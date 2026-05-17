@@ -30,6 +30,7 @@ Commands:
   perf-smoke Run the performance smoke probe
   soak-smoke Run the split/close/resize soak probe
   smoke     Spawn a shell, build the single-pane frame, and shut it down
+  structured-output-smoke Run the structured output lens probe
   help      Print this help text
 
 Options:
@@ -53,6 +54,7 @@ enum StartupCommand {
     PerfSmoke,
     SoakSmoke,
     Smoke,
+    StructuredOutputSmoke,
     Help,
 }
 
@@ -133,6 +135,12 @@ fn main() {
                 process::exit(1);
             }
         }
+        StartupCommand::StructuredOutputSmoke => {
+            if let Err(error) = run_structured_output_smoke() {
+                eprintln!("{error}");
+                process::exit(1);
+            }
+        }
     }
 }
 
@@ -167,6 +175,10 @@ fn parse_startup_options(args: &[String]) -> Result<StartupOptions, StartupError
             }
             "smoke" if !command_set => {
                 command = StartupCommand::Smoke;
+                command_set = true;
+            }
+            "structured-output-smoke" if !command_set => {
+                command = StartupCommand::StructuredOutputSmoke;
                 command_set = true;
             }
             "help" | "-h" | "--help" if !command_set => {
@@ -343,6 +355,93 @@ fn run_block_smoke() -> Result<(), Box<dyn std::error::Error>> {
         app.command_blocks()[99].folded,
     );
     println!("block smoke ok");
+    Ok(())
+}
+
+fn run_structured_output_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24));
+    app.set_block_observer_enabled(true);
+
+    let probes = [
+        (
+            "json",
+            "cat json",
+            "/tmp/noctrail-json",
+            "{\"ok\":true,\"items\":[1,2]}\n",
+            "json object 2 keys",
+        ),
+        (
+            "csv",
+            "cat csv",
+            "/tmp/noctrail-csv",
+            "name,count\nalpha,1\nbeta,2\n",
+            "csv 3 rows x 2 cols",
+        ),
+        (
+            "toml",
+            "cat toml",
+            "/tmp/noctrail-toml",
+            "name = \"noctrail\"\nenabled = true\n",
+            "toml table 2 keys",
+        ),
+    ];
+
+    for (index, (label, command, cwd, output, summary)) in probes.iter().enumerate() {
+        app.advance_output(&block_probe_bytes(
+            command,
+            cwd,
+            0,
+            10 + index as u64,
+            output,
+        ));
+        let block = app
+            .selected_command_block()
+            .ok_or("structured output block should be selected")?;
+        let lens = block
+            .structured_output
+            .as_ref()
+            .ok_or("structured output lens should be detected")?;
+        if lens.kind.label() != *label {
+            return Err(format!("unexpected lens kind for {label}: {}", lens.kind.label()).into());
+        }
+        if lens.summary != *summary {
+            return Err(format!("unexpected lens summary for {label}: {}", lens.summary).into());
+        }
+        if app
+            .copy_selected_command_block_structured_output()
+            .as_deref()
+            != Some(*output)
+        {
+            return Err(format!("structured copy rewrote {label} stdout").into());
+        }
+        if app.copy_selected_command_block_output().as_deref() != Some(*output) {
+            return Err(format!("raw output copy mismatched {label} stdout").into());
+        }
+    }
+
+    println!(
+        "structured_blocks={} kinds={} summaries={}",
+        app.command_blocks().len(),
+        app.command_blocks()
+            .iter()
+            .filter_map(|block| block
+                .structured_output
+                .as_ref()
+                .map(|lens| lens.kind.label()))
+            .collect::<Vec<_>>()
+            .join(","),
+        app.command_blocks()
+            .iter()
+            .filter_map(|block| {
+                block
+                    .structured_output
+                    .as_ref()
+                    .map(|lens| lens.summary.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join("|"),
+    );
+    println!("structured output smoke ok");
     Ok(())
 }
 
@@ -1067,6 +1166,16 @@ mod tests {
             parse_startup_options(&["block-smoke".to_string()]).expect("options should parse");
 
         assert_eq!(options.command, StartupCommand::BlockSmoke);
+        assert_eq!(options.config_path, None);
+        assert!(!options.safe_mode);
+    }
+
+    #[test]
+    fn parses_structured_output_smoke_command() {
+        let options = parse_startup_options(&["structured-output-smoke".to_string()])
+            .expect("options should parse");
+
+        assert_eq!(options.command, StartupCommand::StructuredOutputSmoke);
         assert_eq!(options.config_path, None);
         assert!(!options.safe_mode);
     }

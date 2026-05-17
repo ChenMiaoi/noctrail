@@ -17,7 +17,9 @@ noctrail-runtime = { path = "../noctrail-runtime" }
 noctrail-term = { path = "../noctrail-term" }
 winit = "0.30.13"
 arboard = "3.6"
+serde_json = "1"
 thiserror = "2"
+toml = "0.9"
 
 [[bin]]
 name = "noctrail-app"
