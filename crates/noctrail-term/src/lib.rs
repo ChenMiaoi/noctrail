@@ -1,4 +1,11 @@
 //! Terminal state-machine boundary for Noctrail.
+//!
+//! Known limitations:
+//! - ZWJ emoji sequences are not yet collapsed into a single terminal
+//!   cell cluster.
+//! - RTL shaping is not modeled beyond scalar-width cursor accounting.
+//! - Current coverage targets printable cells, combining marks, and
+//!   wide-cell continuation behavior rather than full text shaping.
 
 use std::{cmp::min, collections::VecDeque};
 
@@ -1309,5 +1316,33 @@ mod tests {
 
         assert!(result.scrolled);
         assert_eq!(result.damage.dirty_rows, vec![0]);
+    }
+
+    #[test]
+    fn long_mixed_input_does_not_panic() {
+        let mut terminal = TerminalState::new(80, 24);
+        let mut input = Vec::with_capacity(100_000);
+        let mut state = 0x1234_5678_u64;
+
+        while input.len() < 100_000 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            match state % 9 {
+                0 => input.extend_from_slice(b"\x1b[31m"),
+                1 => input.extend_from_slice(b"\x1b[0m"),
+                2 => input.extend_from_slice(b"\x1b[38;5;201m"),
+                3 => input.extend_from_slice("中".as_bytes()),
+                4 => input.extend_from_slice("e\u{301}".as_bytes()),
+                5 => input.push(b'\n'),
+                6 => input.push(b'\r'),
+                7 => input.push(b'\t'),
+                _ => input.push(b'a' + (state % 26) as u8),
+            }
+        }
+
+        input.truncate(100_000);
+        let result = terminal.advance_bytes(&input);
+
+        assert!(!result.damage.dirty_rows.is_empty());
+        assert_eq!(terminal.snapshot().rows.len(), 24);
     }
 }

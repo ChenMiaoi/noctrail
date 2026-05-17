@@ -474,6 +474,85 @@
       }
     },
     {
+      "name": "sgr_ansi_style_reset",
+      "width": 3,
+      "height": 1,
+      "input_hex": "1b5b313b333b343b33313b34346d411b5b306d42",
+      "expected": {
+        "rows": [
+          {
+            "cells": [
+              {
+                "text": "A",
+                "style": {
+                  "foreground": { "Indexed": 1 },
+                  "background": { "Indexed": 4 },
+                  "bold": true,
+                  "italic": true,
+                  "underline": true
+                }
+              },
+              { "text": "B" },
+              {}
+            ]
+          }
+        ],
+        "cursor": { "row": 0, "col": 2 }
+      }
+    },
+    {
+      "name": "sgr_256_color",
+      "width": 2,
+      "height": 1,
+      "input_hex": "1b5b33383b353b3230313b34383b353b31366d43",
+      "expected": {
+        "rows": [
+          {
+            "cells": [
+              {
+                "text": "C",
+                "style": {
+                  "foreground": { "Indexed": 201 },
+                  "background": { "Indexed": 16 },
+                  "bold": false,
+                  "italic": false,
+                  "underline": false
+                }
+              },
+              {}
+            ]
+          }
+        ],
+        "cursor": { "row": 0, "col": 1 }
+      }
+    },
+    {
+      "name": "sgr_true_color",
+      "width": 2,
+      "height": 1,
+      "input_hex": "1b5b33383b323b313b323b333b34383b323b343b353b366d44",
+      "expected": {
+        "rows": [
+          {
+            "cells": [
+              {
+                "text": "D",
+                "style": {
+                  "foreground": { "Rgb": [1, 2, 3] },
+                  "background": { "Rgb": [4, 5, 6] },
+                  "bold": false,
+                  "italic": false,
+                  "underline": false
+                }
+              },
+              {}
+            ]
+          }
+        ],
+        "cursor": { "row": 0, "col": 1 }
+      }
+    },
+    {
       "name": "wrap_variant",
       "width": 2,
       "height": 2,
