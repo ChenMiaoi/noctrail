@@ -3386,6 +3386,13 @@ mod tests {
             PtySize::new(80, 24),
         )?;
 
+        let ready = read_runtime_output_until(&mut app, b"READY\n")?;
+        assert!(
+            String::from_utf8_lossy(&ready).contains("READY"),
+            "raw-mode probe never reported readiness: {:?}",
+            String::from_utf8_lossy(&ready)
+        );
+
         app.write_input(&[0x04])?;
         let output = read_all_runtime_output(&mut app)?;
         let text = String::from_utf8_lossy(&output);
@@ -3573,6 +3580,14 @@ mod tests {
         read_all_runtime_output_from_runtime(runtime)
     }
 
+    fn read_runtime_output_until(app: &mut DesktopApp, needle: &[u8]) -> Result<Vec<u8>, AppError> {
+        let runtime = app
+            .pane_mut()
+            .runtime_mut()
+            .ok_or(AppError::MissingRuntime)?;
+        read_runtime_output_until_from_runtime(runtime, needle)
+    }
+
     fn read_all_runtime_output_for_pane(
         app: &mut DesktopApp,
         pane_id: PaneId,
@@ -3597,6 +3612,27 @@ mod tests {
                 break;
             }
             output.extend_from_slice(&chunk[..count]);
+        }
+
+        Ok(output)
+    }
+
+    fn read_runtime_output_until_from_runtime(
+        runtime: &mut PaneRuntime,
+        needle: &[u8],
+    ) -> Result<Vec<u8>, AppError> {
+        let mut output = Vec::new();
+        let mut chunk = [0_u8; 1024];
+
+        loop {
+            let count = runtime.read_output(&mut chunk)?;
+            if count == 0 {
+                break;
+            }
+            output.extend_from_slice(&chunk[..count]);
+            if output.windows(needle.len()).any(|window| window == needle) {
+                break;
+            }
         }
 
         Ok(output)
@@ -3721,7 +3757,7 @@ mod tests {
     #[cfg(not(windows))]
     fn single_byte_hex_dump_command() -> noctrail_pty::PtyCommand {
         let mut command = noctrail_pty::PtyCommand::new("sh");
-        command.args(["-lc", "stty raw -echo; od -An -tx1 -N1"]);
+        command.args(["-lc", "stty raw -echo; printf 'READY\\n'; od -An -tx1 -N1"]);
         command
     }
 }
