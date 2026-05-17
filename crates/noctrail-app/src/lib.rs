@@ -172,6 +172,7 @@ impl TerminalPane {
             backend,
             snapshot: &snapshot,
             damage: &self.last_damage,
+            active: true,
         })
     }
 
@@ -316,6 +317,7 @@ mod tests {
         assert!(frame.render_plan.damage.full_frame);
         assert_eq!(frame.render_plan.damage.dirty_rows, vec![0, 1, 2]);
         assert_eq!(frame.render_plan.scrollback_rows, 0);
+        assert!(frame.render_plan.active);
         assert!(frame.render_plan.selection.is_none());
     }
 
@@ -329,6 +331,7 @@ mod tests {
         assert_eq!(frame.render_plan.rows.len(), 2);
         assert_eq!(frame.render_plan.damage.dirty_rows, vec![0]);
         assert!(!frame.render_plan.damage.full_frame);
+        assert!(frame.render_plan.active);
         assert_eq!(frame.render_plan.rows[0].glyphs[0].text, "h");
         assert_eq!(frame.render_plan.rows[0].glyphs[1].text, "i");
     }
@@ -342,6 +345,7 @@ mod tests {
         assert_eq!(frame.surface, LayoutRect::new(10, 20, 160, 90));
         assert_eq!(frame.terminal_size, PtySize::new(7, 4));
         assert!(frame.render_plan.damage.full_frame);
+        assert!(frame.render_plan.active);
         assert_eq!(frame.render_plan.damage.dirty_rows, vec![0, 1, 2, 3]);
         Ok(())
     }

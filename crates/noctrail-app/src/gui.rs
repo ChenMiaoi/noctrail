@@ -298,6 +298,7 @@ mod tests {
                 cursor: noctrail_term::Cursor { row: 1, col: 2 },
                 alternate_screen: false,
                 selection: None,
+                active: true,
                 rows: Vec::new(),
             },
         };

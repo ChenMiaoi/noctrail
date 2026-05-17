@@ -91,6 +91,7 @@ pub struct RenderInput<'a> {
     pub backend: RenderBackend,
     pub snapshot: &'a TerminalSnapshot,
     pub damage: &'a DamageSet,
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -102,6 +103,7 @@ pub struct RenderPlan {
     pub cursor: Cursor,
     pub alternate_screen: bool,
     pub selection: Option<Selection>,
+    pub active: bool,
     pub rows: Vec<RenderRow>,
 }
 
@@ -123,6 +125,7 @@ impl RenderPlan {
                 dirty_rows: (0..snapshot.rows.len()).collect(),
                 full_frame: true,
             },
+            active: true,
         })
     }
 
@@ -135,6 +138,7 @@ impl RenderPlan {
             cursor: input.snapshot.cursor,
             alternate_screen: input.snapshot.alternate_screen,
             selection: input.snapshot.selection.clone(),
+            active: input.active,
             rows: input
                 .snapshot
                 .rows
@@ -218,6 +222,7 @@ mod tests {
         assert_eq!(plan.cursor, snapshot.cursor);
         assert!(plan.alternate_screen);
         assert_eq!(plan.selection, snapshot.selection);
+        assert!(plan.active);
         assert_eq!(plan.rows.len(), 1);
         assert_eq!(plan.rows[0].row, 0);
         assert!(!plan.rows[0].wrapped);
@@ -290,10 +295,12 @@ mod tests {
             backend: RenderBackend::Software,
             snapshot: &snapshot,
             damage: &damage,
+            active: false,
         });
 
         assert_eq!(plan.viewport, RenderRect::new(4, 5, 6, 7));
         assert_eq!(plan.damage, damage);
+        assert!(!plan.active);
         assert_eq!(plan.rows[0].glyphs.len(), 3);
     }
 }
