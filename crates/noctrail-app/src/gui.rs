@@ -31,11 +31,19 @@ const DEFAULT_CELL_HEIGHT: u32 = 16;
 const PALETTE_RESIZE_DELTA: u16 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct TransparencyPolicy {
+struct VisualEffectsPolicy {
     requested_opacity: f32,
     effective_opacity: f32,
     window_transparent: bool,
-    fallback_reason: Option<&'static str>,
+    transparency_fallback_reason: Option<&'static str>,
+    blur_mode: BlurMode,
+    blur_fallback_reason: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlurMode {
+    Disabled,
+    TintedSolid,
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {
@@ -392,40 +400,75 @@ impl GuiApp {
         !self.launch_options.safe_mode && self.launch_options.renderer_backend == RenderBackend::Gpu
     }
 
-    fn transparency_policy(&self) -> TransparencyPolicy {
+    fn visual_effects_policy(&self) -> VisualEffectsPolicy {
         let requested_opacity = self.theme.opacity;
         if requested_opacity >= 1.0 {
-            return TransparencyPolicy {
+            return VisualEffectsPolicy {
                 requested_opacity,
                 effective_opacity: 1.0,
                 window_transparent: false,
-                fallback_reason: None,
+                transparency_fallback_reason: None,
+                blur_mode: BlurMode::Disabled,
+                blur_fallback_reason: None,
             };
         }
 
         if self.launch_options.safe_mode {
-            return TransparencyPolicy {
+            return VisualEffectsPolicy {
                 requested_opacity,
                 effective_opacity: 1.0,
                 window_transparent: false,
-                fallback_reason: Some("safe-mode"),
+                transparency_fallback_reason: Some("safe-mode"),
+                blur_mode: if self.theme.blur.enabled {
+                    BlurMode::TintedSolid
+                } else {
+                    BlurMode::Disabled
+                },
+                blur_fallback_reason: if self.theme.blur.enabled {
+                    Some("safe-mode")
+                } else {
+                    None
+                },
             };
         }
 
         if self.app.backend() != RenderBackend::Gpu {
-            return TransparencyPolicy {
+            return VisualEffectsPolicy {
                 requested_opacity,
                 effective_opacity: 1.0,
                 window_transparent: false,
-                fallback_reason: Some("software-backend"),
+                transparency_fallback_reason: Some("software-backend"),
+                blur_mode: if self.theme.blur.enabled {
+                    BlurMode::TintedSolid
+                } else {
+                    BlurMode::Disabled
+                },
+                blur_fallback_reason: if self.theme.blur.enabled {
+                    Some("software-backend")
+                } else {
+                    None
+                },
             };
         }
 
-        TransparencyPolicy {
+        if self.theme.blur.enabled {
+            return VisualEffectsPolicy {
+                requested_opacity,
+                effective_opacity: self.theme.blur.fallback_tint_opacity.max(requested_opacity),
+                window_transparent: false,
+                transparency_fallback_reason: None,
+                blur_mode: BlurMode::TintedSolid,
+                blur_fallback_reason: Some("unsupported-platform"),
+            };
+        }
+
+        VisualEffectsPolicy {
             requested_opacity,
             effective_opacity: requested_opacity,
             window_transparent: true,
-            fallback_reason: None,
+            transparency_fallback_reason: None,
+            blur_mode: BlurMode::Disabled,
+            blur_fallback_reason: None,
         }
     }
 
@@ -483,15 +526,23 @@ impl GuiApp {
     fn update_title(&self) {
         if let Some(window) = self.window.as_ref() {
             let mut title = frame_title(&self.app.frame(), self.cursor_visible);
-            let transparency = self.transparency_policy();
+            let effects = self.visual_effects_policy();
             title.push_str(" | font ");
             title.push_str(&self.font.family);
             title.push(' ');
             title.push_str(&format!("{:.1}", self.font.size));
             title.push_str(" | opacity ");
-            title.push_str(&format!("{:.2}", transparency.effective_opacity));
-            if let Some(reason) = transparency.fallback_reason {
+            title.push_str(&format!("{:.2}", effects.effective_opacity));
+            match effects.blur_mode {
+                BlurMode::Disabled => title.push_str(" | blur off"),
+                BlurMode::TintedSolid => title.push_str(" | blur tinted-solid"),
+            }
+            if let Some(reason) = effects.transparency_fallback_reason {
                 title.push_str(" | transparency-fallback ");
+                title.push_str(reason);
+            }
+            if let Some(reason) = effects.blur_fallback_reason {
+                title.push_str(" | blur-fallback ");
                 title.push_str(reason);
             }
             if let Some(error) = self.gpu_fallback_error.as_deref() {
@@ -527,9 +578,9 @@ impl GuiApp {
     fn apply_theme_visuals(&mut self) {
         self.frame_interval = Duration::from_millis(self.theme.cursor.blink_interval_ms);
         self.app.invalidate_visuals();
-        let transparency = self.transparency_policy();
+        let effects = self.visual_effects_policy();
         if let Some(window) = self.window.as_ref() {
-            window.set_transparent(transparency.window_transparent);
+            window.set_transparent(effects.window_transparent);
         }
         if let Some(renderer) = self.renderer.as_mut() {
             let background = self.theme.color.background;
@@ -537,7 +588,7 @@ impl GuiApp {
                 srgb_component(background.red),
                 srgb_component(background.green),
                 srgb_component(background.blue),
-                f64::from(transparency.effective_opacity) * background.alpha_factor(),
+                f64::from(effects.effective_opacity) * background.alpha_factor(),
             );
         }
     }
@@ -1247,7 +1298,7 @@ mod tests {
     }
 
     #[test]
-    fn transparency_policy_uses_requested_opacity_on_gpu() {
+    fn visual_effects_policy_keeps_requested_opacity_without_blur() {
         let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
         let theme = ThemeConfig {
             opacity: 0.72,
@@ -1263,21 +1314,52 @@ mod tests {
         );
         gui.app.set_backend(RenderBackend::Gpu);
 
-        let transparency = gui.transparency_policy();
+        let effects = gui.visual_effects_policy();
 
-        assert_eq!(transparency.requested_opacity, 0.72);
-        assert_eq!(transparency.effective_opacity, 0.72);
-        assert!(transparency.window_transparent);
-        assert_eq!(transparency.fallback_reason, None);
+        assert_eq!(effects.requested_opacity, 0.72);
+        assert_eq!(effects.effective_opacity, 0.72);
+        assert!(effects.window_transparent);
+        assert_eq!(effects.transparency_fallback_reason, None);
+        assert_eq!(effects.blur_mode, BlurMode::Disabled);
+        assert_eq!(effects.blur_fallback_reason, None);
     }
 
     #[test]
-    fn transparency_policy_falls_back_in_safe_mode() {
+    fn visual_effects_policy_uses_tinted_solid_when_blur_is_requested() {
         let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
-        let theme = ThemeConfig {
+        let mut theme = ThemeConfig {
             opacity: 0.72,
             ..ThemeConfig::default()
         };
+        theme.blur.enabled = true;
+        theme.blur.fallback_tint_opacity = 0.9;
+        let mut gui = GuiApp::new(
+            app,
+            GuiLaunchOptions {
+                renderer_backend: RenderBackend::Gpu,
+                theme,
+                ..GuiLaunchOptions::default()
+            },
+        );
+        gui.app.set_backend(RenderBackend::Gpu);
+
+        let effects = gui.visual_effects_policy();
+
+        assert_eq!(effects.effective_opacity, 0.9);
+        assert!(!effects.window_transparent);
+        assert_eq!(effects.transparency_fallback_reason, None);
+        assert_eq!(effects.blur_mode, BlurMode::TintedSolid);
+        assert_eq!(effects.blur_fallback_reason, Some("unsupported-platform"));
+    }
+
+    #[test]
+    fn visual_effects_policy_falls_back_in_safe_mode() {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
+        let mut theme = ThemeConfig {
+            opacity: 0.72,
+            ..ThemeConfig::default()
+        };
+        theme.blur.enabled = true;
         let gui = GuiApp::new(
             app,
             GuiLaunchOptions {
@@ -1288,20 +1370,23 @@ mod tests {
             },
         );
 
-        let transparency = gui.transparency_policy();
+        let effects = gui.visual_effects_policy();
 
-        assert_eq!(transparency.effective_opacity, 1.0);
-        assert!(!transparency.window_transparent);
-        assert_eq!(transparency.fallback_reason, Some("safe-mode"));
+        assert_eq!(effects.effective_opacity, 1.0);
+        assert!(!effects.window_transparent);
+        assert_eq!(effects.transparency_fallback_reason, Some("safe-mode"));
+        assert_eq!(effects.blur_mode, BlurMode::TintedSolid);
+        assert_eq!(effects.blur_fallback_reason, Some("safe-mode"));
     }
 
     #[test]
-    fn transparency_policy_falls_back_on_software_backend() {
+    fn visual_effects_policy_falls_back_on_software_backend() {
         let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
-        let theme = ThemeConfig {
+        let mut theme = ThemeConfig {
             opacity: 0.72,
             ..ThemeConfig::default()
         };
+        theme.blur.enabled = true;
         let gui = GuiApp::new(
             app,
             GuiLaunchOptions {
@@ -1311,11 +1396,16 @@ mod tests {
             },
         );
 
-        let transparency = gui.transparency_policy();
+        let effects = gui.visual_effects_policy();
 
-        assert_eq!(transparency.effective_opacity, 1.0);
-        assert!(!transparency.window_transparent);
-        assert_eq!(transparency.fallback_reason, Some("software-backend"));
+        assert_eq!(effects.effective_opacity, 1.0);
+        assert!(!effects.window_transparent);
+        assert_eq!(
+            effects.transparency_fallback_reason,
+            Some("software-backend")
+        );
+        assert_eq!(effects.blur_mode, BlurMode::TintedSolid);
+        assert_eq!(effects.blur_fallback_reason, Some("software-backend"));
     }
 
     #[test]
