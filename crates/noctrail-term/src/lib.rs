@@ -1097,11 +1097,8 @@ impl TerminalState {
 
     fn erase_in_display(&mut self, mode: usize) {
         match mode {
-            3 => {
-                if self.alternate.is_none() {
-                    self.primary_scrollback.clear();
-                }
-            }
+            3 if self.alternate.is_none() => self.primary_scrollback.clear(),
+            3 => {}
             0..=2 => {
                 let cursor = self.active_grid().cursor();
                 let grid = self.active_grid_mut();
