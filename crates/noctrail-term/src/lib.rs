@@ -131,9 +131,11 @@ pub enum MouseTrackingMode {
 pub enum ShellIntegrationEvent {
     Prompt,
     CommandStart,
+    CommandText(String),
     CommandEnd,
     Cwd(String),
     ExitCode(i32),
+    DurationMs(u64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -906,6 +908,11 @@ impl TerminalState {
             b"CommandStart" => {
                 self.push_shell_integration_event(ShellIntegrationEvent::CommandStart);
             }
+            b"CommandText" => {
+                if let Some(value) = osc_value(params, 3) {
+                    self.push_shell_integration_event(ShellIntegrationEvent::CommandText(value));
+                }
+            }
             b"CommandEnd" => {
                 self.push_shell_integration_event(ShellIntegrationEvent::CommandEnd);
             }
@@ -919,6 +926,13 @@ impl TerminalState {
                     osc_value(params, 3).and_then(|value| value.trim().parse::<i32>().ok())
                 {
                     self.push_shell_integration_event(ShellIntegrationEvent::ExitCode(value));
+                }
+            }
+            b"DurationMs" => {
+                if let Some(value) =
+                    osc_value(params, 3).and_then(|value| value.trim().parse::<u64>().ok())
+                {
+                    self.push_shell_integration_event(ShellIntegrationEvent::DurationMs(value));
                 }
             }
             _ => {}
@@ -1456,6 +1470,22 @@ mod tests {
         terminal.advance_bytes(b"\x1b]1337;Noctrail;ExitCode;nope\x07");
 
         assert!(terminal.drain_shell_integration_events().is_empty());
+    }
+
+    #[test]
+    fn osc_command_text_and_duration_values_round_trip() {
+        let mut terminal = TerminalState::new(8, 2);
+
+        terminal.advance_bytes(b"\x1b]1337;Noctrail;CommandText;printf foo;pwd\x07");
+        terminal.advance_bytes(b"\x1b]1337;Noctrail;DurationMs;1200\x07");
+
+        assert_eq!(
+            terminal.drain_shell_integration_events(),
+            vec![
+                ShellIntegrationEvent::CommandText("printf foo;pwd".to_string()),
+                ShellIntegrationEvent::DurationMs(1200),
+            ]
+        );
     }
 
     #[test]
