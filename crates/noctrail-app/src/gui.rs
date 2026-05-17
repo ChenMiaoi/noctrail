@@ -33,6 +33,7 @@ const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct VisualEffectsPolicy {
+    low_power_enabled: bool,
     requested_opacity: f32,
     effective_opacity: f32,
     window_transparent: bool,
@@ -491,8 +492,12 @@ impl GuiApp {
         !self.launch_options.safe_mode && self.launch_options.renderer_backend == RenderBackend::Gpu
     }
 
+    fn low_power_enabled(&self) -> bool {
+        self.theme.low_power.enabled
+    }
+
     fn animation_duration(&self) -> Option<Duration> {
-        if self.theme.animation.enabled {
+        if self.theme.animation.enabled && !self.low_power_enabled() {
             Some(Duration::from_millis(self.theme.animation.duration_ms))
         } else {
             None
@@ -584,29 +589,25 @@ impl GuiApp {
 
     fn visual_effects_policy(&self) -> VisualEffectsPolicy {
         let requested_opacity = self.theme.opacity;
-        if requested_opacity >= 1.0 {
-            return VisualEffectsPolicy {
-                requested_opacity,
-                effective_opacity: 1.0,
-                window_transparent: false,
-                transparency_fallback_reason: None,
-                blur_mode: BlurMode::Disabled,
-                blur_fallback_reason: None,
-            };
-        }
+        let low_power_enabled = self.low_power_enabled();
 
         if self.launch_options.safe_mode {
             return VisualEffectsPolicy {
+                low_power_enabled,
                 requested_opacity,
                 effective_opacity: 1.0,
                 window_transparent: false,
                 transparency_fallback_reason: Some("safe-mode"),
-                blur_mode: if self.theme.blur.enabled {
+                blur_mode: if low_power_enabled {
+                    BlurMode::Disabled
+                } else if self.theme.blur.enabled {
                     BlurMode::TintedSolid
                 } else {
                     BlurMode::Disabled
                 },
-                blur_fallback_reason: if self.theme.blur.enabled {
+                blur_fallback_reason: if low_power_enabled && self.theme.blur.enabled {
+                    Some("low-power")
+                } else if self.theme.blur.enabled {
                     Some("safe-mode")
                 } else {
                     None
@@ -616,16 +617,21 @@ impl GuiApp {
 
         if self.app.backend() != RenderBackend::Gpu {
             return VisualEffectsPolicy {
+                low_power_enabled,
                 requested_opacity,
                 effective_opacity: 1.0,
                 window_transparent: false,
                 transparency_fallback_reason: Some("software-backend"),
-                blur_mode: if self.theme.blur.enabled {
+                blur_mode: if low_power_enabled {
+                    BlurMode::Disabled
+                } else if self.theme.blur.enabled {
                     BlurMode::TintedSolid
                 } else {
                     BlurMode::Disabled
                 },
-                blur_fallback_reason: if self.theme.blur.enabled {
+                blur_fallback_reason: if low_power_enabled && self.theme.blur.enabled {
+                    Some("low-power")
+                } else if self.theme.blur.enabled {
                     Some("software-backend")
                 } else {
                     None
@@ -633,8 +639,33 @@ impl GuiApp {
             };
         }
 
+        if low_power_enabled {
+            return VisualEffectsPolicy {
+                low_power_enabled,
+                requested_opacity,
+                effective_opacity: requested_opacity,
+                window_transparent: requested_opacity < 1.0,
+                transparency_fallback_reason: None,
+                blur_mode: BlurMode::Disabled,
+                blur_fallback_reason: self.theme.blur.enabled.then_some("low-power"),
+            };
+        }
+
+        if requested_opacity >= 1.0 {
+            return VisualEffectsPolicy {
+                low_power_enabled,
+                requested_opacity,
+                effective_opacity: 1.0,
+                window_transparent: false,
+                transparency_fallback_reason: None,
+                blur_mode: BlurMode::Disabled,
+                blur_fallback_reason: None,
+            };
+        }
+
         if self.theme.blur.enabled {
             return VisualEffectsPolicy {
+                low_power_enabled,
                 requested_opacity,
                 effective_opacity: self.theme.blur.fallback_tint_opacity.max(requested_opacity),
                 window_transparent: false,
@@ -645,6 +676,7 @@ impl GuiApp {
         }
 
         VisualEffectsPolicy {
+            low_power_enabled,
             requested_opacity,
             effective_opacity: requested_opacity,
             window_transparent: true,
@@ -713,6 +745,12 @@ impl GuiApp {
             title.push_str(&self.font.family);
             title.push(' ');
             title.push_str(&format!("{:.1}", self.font.size));
+            title.push_str(" | power ");
+            title.push_str(if effects.low_power_enabled {
+                "low"
+            } else {
+                "normal"
+            });
             title.push_str(" | opacity ");
             title.push_str(&format!("{:.2}", effects.effective_opacity));
             match effects.blur_mode {
@@ -766,7 +804,7 @@ impl GuiApp {
     fn apply_theme_visuals(&mut self) {
         self.frame_interval = Duration::from_millis(self.theme.cursor.blink_interval_ms);
         self.app.invalidate_visuals();
-        if !self.theme.animation.enabled {
+        if self.animation_duration().is_none() {
             self.transition = None;
         }
         let effects = self.visual_effects_policy();
@@ -1559,6 +1597,7 @@ mod tests {
         assert_eq!(effects.effective_opacity, 0.72);
         assert!(effects.window_transparent);
         assert_eq!(effects.transparency_fallback_reason, None);
+        assert!(!effects.low_power_enabled);
         assert_eq!(effects.blur_mode, BlurMode::Disabled);
         assert_eq!(effects.blur_fallback_reason, None);
     }
@@ -1584,6 +1623,7 @@ mod tests {
 
         let effects = gui.visual_effects_policy();
 
+        assert!(!effects.low_power_enabled);
         assert_eq!(effects.effective_opacity, 0.9);
         assert!(!effects.window_transparent);
         assert_eq!(effects.transparency_fallback_reason, None);
@@ -1611,6 +1651,7 @@ mod tests {
 
         let effects = gui.visual_effects_policy();
 
+        assert!(!effects.low_power_enabled);
         assert_eq!(effects.effective_opacity, 1.0);
         assert!(!effects.window_transparent);
         assert_eq!(effects.transparency_fallback_reason, Some("safe-mode"));
@@ -1637,6 +1678,7 @@ mod tests {
 
         let effects = gui.visual_effects_policy();
 
+        assert!(!effects.low_power_enabled);
         assert_eq!(effects.effective_opacity, 1.0);
         assert!(!effects.window_transparent);
         assert_eq!(
@@ -1665,6 +1707,36 @@ mod tests {
     }
 
     #[test]
+    fn visual_effects_policy_disables_blur_in_low_power_mode() {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
+        let mut theme = ThemeConfig {
+            opacity: 0.72,
+            ..ThemeConfig::default()
+        };
+        theme.blur.enabled = true;
+        theme.low_power.enabled = true;
+        let mut gui = GuiApp::new(
+            app,
+            GuiLaunchOptions {
+                renderer_backend: RenderBackend::Gpu,
+                theme,
+                ..GuiLaunchOptions::default()
+            },
+        );
+        gui.app.set_backend(RenderBackend::Gpu);
+
+        let effects = gui.visual_effects_policy();
+
+        assert!(effects.low_power_enabled);
+        assert_eq!(effects.effective_opacity, 0.72);
+        assert!(effects.window_transparent);
+        assert_eq!(effects.transparency_fallback_reason, None);
+        assert_eq!(effects.blur_mode, BlurMode::Disabled);
+        assert_eq!(effects.blur_fallback_reason, Some("low-power"));
+        assert!(gui.animation_duration().is_none());
+    }
+
+    #[test]
     fn software_backend_launch_options_skip_gpu_attempts() {
         let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
         let gui = GuiApp::new(
@@ -1686,7 +1758,7 @@ mod tests {
         let path = temp_config_path("theme-reload");
         fs::write(
             &path,
-            "[font]\nfamily = \"JetBrainsMono Nerd Font\"\nsize = 14.0\n\n[theme]\nopacity = 1.0\n\n[theme.pane]\ngap = 8\npadding = 6\nradius = 8\n\n[theme.animation]\nenabled = true\nduration-ms = 120\n\n[theme.cursor]\nblink-interval-ms = 600\n",
+            "[font]\nfamily = \"JetBrainsMono Nerd Font\"\nsize = 14.0\n\n[theme]\nopacity = 1.0\n\n[theme.pane]\ngap = 8\npadding = 6\nradius = 8\n\n[theme.animation]\nenabled = true\nduration-ms = 120\n\n[theme.low-power]\nenabled = false\n\n[theme.cursor]\nblink-interval-ms = 600\n",
         )
         .expect("write initial config");
 
@@ -1704,7 +1776,7 @@ mod tests {
 
         fs::write(
             &path,
-            "[font]\nfamily = \"Iosevka\"\nsize = 16.0\nfallback = [\"Noto Sans CJK SC\"]\n\n[theme]\nopacity = 0.75\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.animation]\nenabled = false\nduration-ms = 200\n\n[theme.cursor]\nblink-interval-ms = 250\n",
+            "[font]\nfamily = \"Iosevka\"\nsize = 16.0\nfallback = [\"Noto Sans CJK SC\"]\n\n[theme]\nopacity = 0.75\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.animation]\nenabled = true\nduration-ms = 200\n\n[theme.low-power]\nenabled = true\n\n[theme.cursor]\nblink-interval-ms = 250\n",
         )
         .expect("write changed config");
 
@@ -1717,8 +1789,10 @@ mod tests {
         assert_eq!(gui.app.pane_chrome().gap, 10);
         assert_eq!(gui.app.pane_chrome().padding, 4);
         assert_eq!(gui.app.pane_chrome().radius, 12);
-        assert!(!gui.theme.animation.enabled);
+        assert!(gui.theme.animation.enabled);
         assert_eq!(gui.theme.animation.duration_ms, 200);
+        assert!(gui.theme.low_power.enabled);
+        assert!(gui.animation_duration().is_none());
         assert!(gui.theme_reload_error.is_none());
         assert!(!gui.poll_config_reload());
 
@@ -1840,6 +1914,26 @@ mod tests {
         let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
         let mut theme = ThemeConfig::default();
         theme.animation.enabled = false;
+        let mut gui = GuiApp::new(
+            app,
+            GuiLaunchOptions {
+                theme,
+                ..GuiLaunchOptions::default()
+            },
+        );
+
+        gui.apply_palette_command(PaletteCommand::SplitHorizontal)?;
+
+        assert!(gui.transition.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn low_power_mode_skips_transition_even_when_animation_is_enabled() -> Result<(), Box<dyn Error>>
+    {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
+        let mut theme = ThemeConfig::default();
+        theme.low_power.enabled = true;
         let mut gui = GuiApp::new(
             app,
             GuiLaunchOptions {

@@ -54,6 +54,7 @@ enum StartupError {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct VisualEffectsMode {
+    low_power_enabled: bool,
     requested_opacity: f32,
     effective_opacity: f32,
     transparency_fallback_reason: Option<&'static str>,
@@ -188,7 +189,7 @@ fn run_smoke(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>>
 
     let frame = app.frame();
     println!(
-        "pane={:?} pid={:?} backend={:?} pane={}x{} content={}x{} terminal={}x{} rows={} status_shell={} status_cwd={} status_git={} status_exit={} font={} size={} opacity={} requested_opacity={} transparency_fallback={} blur={} blur_fallback={} animation={} animation_duration_ms={}",
+        "pane={:?} pid={:?} backend={:?} pane={}x{} content={}x{} terminal={}x{} rows={} status_shell={} status_cwd={} status_git={} status_exit={} font={} size={} low_power={} opacity={} requested_opacity={} transparency_fallback={} blur={} blur_fallback={} animation={} animation_duration_ms={}",
         frame.pane_id,
         frame.process_id,
         frame.render_plan.backend,
@@ -205,16 +206,13 @@ fn run_smoke(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>>
         frame.status_line.exit_status.as_deref().unwrap_or("none"),
         launch_options.font.family,
         launch_options.font.size,
+        on_off(effects.low_power_enabled),
         effects.effective_opacity,
         effects.requested_opacity,
         effects.transparency_fallback_reason.unwrap_or("none"),
         effects.blur_mode,
         effects.blur_fallback_reason.unwrap_or("none"),
-        if launch_options.theme.animation.enabled {
-            "on"
-        } else {
-            "off"
-        },
+        on_off(animations_enabled(&launch_options.theme)),
         launch_options.theme.animation.duration_ms,
     );
 
@@ -295,27 +293,23 @@ fn rgba_from_config(color: noctrail_config::RgbaColor) -> Rgba {
 
 fn visual_effects_mode(launch_options: &GuiLaunchOptions) -> VisualEffectsMode {
     let requested_opacity = launch_options.theme.opacity;
-    if requested_opacity >= 1.0 {
-        return VisualEffectsMode {
-            requested_opacity,
-            effective_opacity: 1.0,
-            transparency_fallback_reason: None,
-            blur_mode: "off",
-            blur_fallback_reason: None,
-        };
-    }
-
+    let low_power_enabled = launch_options.theme.low_power.enabled;
     if launch_options.safe_mode {
         return VisualEffectsMode {
+            low_power_enabled,
             requested_opacity,
             effective_opacity: 1.0,
             transparency_fallback_reason: Some("safe-mode"),
-            blur_mode: if launch_options.theme.blur.enabled {
+            blur_mode: if low_power_enabled {
+                "off"
+            } else if launch_options.theme.blur.enabled {
                 "tinted-solid"
             } else {
                 "off"
             },
-            blur_fallback_reason: if launch_options.theme.blur.enabled {
+            blur_fallback_reason: if low_power_enabled && launch_options.theme.blur.enabled {
+                Some("low-power")
+            } else if launch_options.theme.blur.enabled {
                 Some("safe-mode")
             } else {
                 None
@@ -325,15 +319,20 @@ fn visual_effects_mode(launch_options: &GuiLaunchOptions) -> VisualEffectsMode {
 
     if launch_options.renderer_backend != RenderBackend::Gpu {
         return VisualEffectsMode {
+            low_power_enabled,
             requested_opacity,
             effective_opacity: 1.0,
             transparency_fallback_reason: Some("software-backend"),
-            blur_mode: if launch_options.theme.blur.enabled {
+            blur_mode: if low_power_enabled {
+                "off"
+            } else if launch_options.theme.blur.enabled {
                 "tinted-solid"
             } else {
                 "off"
             },
-            blur_fallback_reason: if launch_options.theme.blur.enabled {
+            blur_fallback_reason: if low_power_enabled && launch_options.theme.blur.enabled {
+                Some("low-power")
+            } else if launch_options.theme.blur.enabled {
                 Some("software-backend")
             } else {
                 None
@@ -341,8 +340,31 @@ fn visual_effects_mode(launch_options: &GuiLaunchOptions) -> VisualEffectsMode {
         };
     }
 
+    if low_power_enabled {
+        return VisualEffectsMode {
+            low_power_enabled,
+            requested_opacity,
+            effective_opacity: requested_opacity,
+            transparency_fallback_reason: None,
+            blur_mode: "off",
+            blur_fallback_reason: launch_options.theme.blur.enabled.then_some("low-power"),
+        };
+    }
+
+    if requested_opacity >= 1.0 {
+        return VisualEffectsMode {
+            low_power_enabled,
+            requested_opacity,
+            effective_opacity: 1.0,
+            transparency_fallback_reason: None,
+            blur_mode: "off",
+            blur_fallback_reason: None,
+        };
+    }
+
     if launch_options.theme.blur.enabled {
         return VisualEffectsMode {
+            low_power_enabled,
             requested_opacity,
             effective_opacity: launch_options
                 .theme
@@ -356,6 +378,7 @@ fn visual_effects_mode(launch_options: &GuiLaunchOptions) -> VisualEffectsMode {
     }
 
     VisualEffectsMode {
+        low_power_enabled,
         requested_opacity,
         effective_opacity: requested_opacity,
         transparency_fallback_reason: None,
@@ -378,6 +401,14 @@ fn shell_marker_command(marker: &str) -> String {
 
 fn shell_exit_command() -> &'static str {
     "exit\r\n"
+}
+
+fn animations_enabled(theme: &ThemeConfig) -> bool {
+    theme.animation.enabled && !theme.low_power.enabled
+}
+
+fn on_off(enabled: bool) -> &'static str {
+    if enabled { "on" } else { "off" }
 }
 
 fn display_status_path(path: Option<&std::path::Path>) -> String {
@@ -465,7 +496,7 @@ mod tests {
         let path = temp_config_path("theme-font");
         fs::write(
             &path,
-            "[font]\nfamily = \"Iosevka\"\nsize = 15.5\n\n[theme]\nopacity = 0.85\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.blur]\nenabled = true\nfallback-tint-opacity = 0.94\n\n[theme.animation]\nenabled = false\nduration-ms = 180\n\n[theme.cursor]\nblink-interval-ms = 420\n",
+            "[font]\nfamily = \"Iosevka\"\nsize = 15.5\n\n[theme]\nopacity = 0.85\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.blur]\nenabled = true\nfallback-tint-opacity = 0.94\n\n[theme.animation]\nenabled = false\nduration-ms = 180\n\n[theme.low-power]\nenabled = true\n\n[theme.cursor]\nblink-interval-ms = 420\n",
         )
         .expect("write config");
         let options = StartupOptions {
@@ -485,6 +516,7 @@ mod tests {
         assert_eq!(launch.theme.blur.fallback_tint_opacity, 0.94);
         assert!(!launch.theme.animation.enabled);
         assert_eq!(launch.theme.animation.duration_ms, 180);
+        assert!(launch.theme.low_power.enabled);
         assert_eq!(launch.theme.cursor.blink_interval_ms, 420);
         assert_eq!(launch.config_path, Some(path.clone()));
 
@@ -504,6 +536,7 @@ mod tests {
 
         let mode = visual_effects_mode(&launch);
 
+        assert!(!mode.low_power_enabled);
         assert_eq!(mode.requested_opacity, 0.8);
         assert_eq!(mode.effective_opacity, 0.8);
         assert_eq!(mode.transparency_fallback_reason, None);
@@ -528,6 +561,7 @@ mod tests {
 
         let mode = visual_effects_mode(&launch);
 
+        assert!(!mode.low_power_enabled);
         assert_eq!(mode.effective_opacity, 0.9);
         assert_eq!(mode.transparency_fallback_reason, None);
         assert_eq!(mode.blur_mode, "tinted-solid");
@@ -551,6 +585,7 @@ mod tests {
 
         let mode = visual_effects_mode(&launch);
 
+        assert!(!mode.low_power_enabled);
         assert_eq!(mode.effective_opacity, 1.0);
         assert_eq!(mode.transparency_fallback_reason, Some("software-backend"));
         assert_eq!(mode.blur_mode, "tinted-solid");
@@ -575,10 +610,37 @@ mod tests {
 
         let mode = visual_effects_mode(&launch);
 
+        assert!(!mode.low_power_enabled);
         assert_eq!(mode.effective_opacity, 1.0);
         assert_eq!(mode.transparency_fallback_reason, Some("safe-mode"));
         assert_eq!(mode.blur_mode, "tinted-solid");
         assert_eq!(mode.blur_fallback_reason, Some("safe-mode"));
+    }
+
+    #[test]
+    fn visual_effects_mode_disables_blur_in_low_power_mode() {
+        let launch = GuiLaunchOptions {
+            renderer_backend: RenderBackend::Gpu,
+            theme: ThemeConfig {
+                opacity: 0.7,
+                blur: noctrail_config::BlurTheme {
+                    enabled: true,
+                    fallback_tint_opacity: 0.9,
+                },
+                low_power: noctrail_config::LowPowerTheme { enabled: true },
+                ..ThemeConfig::default()
+            },
+            ..GuiLaunchOptions::default()
+        };
+
+        let mode = visual_effects_mode(&launch);
+
+        assert!(mode.low_power_enabled);
+        assert_eq!(mode.effective_opacity, 0.7);
+        assert_eq!(mode.transparency_fallback_reason, None);
+        assert_eq!(mode.blur_mode, "off");
+        assert_eq!(mode.blur_fallback_reason, Some("low-power"));
+        assert!(!animations_enabled(&launch.theme));
     }
 
     fn temp_config_path(label: &str) -> PathBuf {

@@ -215,6 +215,12 @@ impl Default for AnimationTheme {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(default)]
+pub struct LowPowerTheme {
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct ThemeConfig {
@@ -224,6 +230,8 @@ pub struct ThemeConfig {
     pub pane: PaneTheme,
     pub blur: BlurTheme,
     pub animation: AnimationTheme,
+    #[serde(rename = "low-power")]
+    pub low_power: LowPowerTheme,
     pub cursor: CursorTheme,
     pub selection: SelectionTheme,
 }
@@ -237,6 +245,7 @@ impl Default for ThemeConfig {
             pane: PaneTheme::default(),
             blur: BlurTheme::default(),
             animation: AnimationTheme::default(),
+            low_power: LowPowerTheme::default(),
             cursor: CursorTheme::default(),
             selection: SelectionTheme::default(),
         }
@@ -435,6 +444,7 @@ mod tests {
             config.theme.animation.duration_ms,
             DEFAULT_ANIMATION_DURATION_MS
         );
+        assert!(!config.theme.low_power.enabled);
     }
 
     #[test]
@@ -442,7 +452,7 @@ mod tests {
         let path = temp_config_path("theme-load");
         fs::write(
             &path,
-            "[renderer]\nbackend = \"software\"\n\n[font]\nfamily = \"Iosevka\"\nsize = 16.5\nfallback = [\"Noto Sans CJK SC\"]\n\n[theme]\nopacity = 0.8\n\n[theme.color]\nbackground = \"#112233\"\nforeground = \"#abcdef\"\n\n[theme.border]\nactive = \"#7aa2f7\"\ninactive = \"#3b4261\"\nwidth = 2\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.blur]\nenabled = true\nfallback-tint-opacity = 0.94\n\n[theme.animation]\nenabled = false\nduration-ms = 180\n\n[theme.cursor]\ncolor = \"#ffeeaa\"\nblink-interval-ms = 450\n\n[theme.selection]\nbackground = \"#264f78cc\"\nforeground = \"#ffffff\"\n",
+            "[renderer]\nbackend = \"software\"\n\n[font]\nfamily = \"Iosevka\"\nsize = 16.5\nfallback = [\"Noto Sans CJK SC\"]\n\n[theme]\nopacity = 0.8\n\n[theme.color]\nbackground = \"#112233\"\nforeground = \"#abcdef\"\n\n[theme.border]\nactive = \"#7aa2f7\"\ninactive = \"#3b4261\"\nwidth = 2\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.blur]\nenabled = true\nfallback-tint-opacity = 0.94\n\n[theme.animation]\nenabled = false\nduration-ms = 180\n\n[theme.low-power]\nenabled = true\n\n[theme.cursor]\ncolor = \"#ffeeaa\"\nblink-interval-ms = 450\n\n[theme.selection]\nbackground = \"#264f78cc\"\nforeground = \"#ffffff\"\n",
         )
         .expect("write config");
 
@@ -464,6 +474,7 @@ mod tests {
         assert_eq!(config.theme.blur.fallback_tint_opacity, 0.94);
         assert!(!config.theme.animation.enabled);
         assert_eq!(config.theme.animation.duration_ms, 180);
+        assert!(config.theme.low_power.enabled);
         assert_eq!(
             config.theme.cursor.color,
             RgbaColor::from_rgb(0xff, 0xee, 0xaa)
