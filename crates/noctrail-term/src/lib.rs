@@ -3,6 +3,7 @@
 use std::cmp::min;
 
 use unicode_width::UnicodeWidthChar;
+use vte::{Params, Parser, Perform};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Color {
@@ -126,6 +127,10 @@ impl Grid {
     }
 
     pub fn advance_char(&mut self, ch: char) {
+        self.advance_char_with_style(ch, Style::default());
+    }
+
+    pub fn advance_char_with_style(&mut self, ch: char, style: Style) {
         match ch {
             '\n' => self.newline(),
             '\r' => self.cursor.col = 0,
@@ -145,9 +150,9 @@ impl Grid {
                 let row = self.cursor.row;
                 let col = self.cursor.col;
 
-                self.write_glyph(row, col, ch);
+                self.write_glyph(row, col, ch, style);
                 if width == 2 && col + 1 < self.width {
-                    self.write_wide_continuation(row, col + 1);
+                    self.write_wide_continuation(row, col + 1, style);
                 }
 
                 self.cursor.col += width;
@@ -159,8 +164,12 @@ impl Grid {
     }
 
     pub fn advance_str(&mut self, text: &str) {
+        self.advance_str_with_style(text, Style::default());
+    }
+
+    pub fn advance_str_with_style(&mut self, text: &str, style: Style) {
         for ch in text.chars() {
-            self.advance_char(ch);
+            self.advance_char_with_style(ch, style);
         }
     }
 
@@ -214,19 +223,19 @@ impl Grid {
         self.mark_dirty(self.cursor.row);
     }
 
-    fn write_glyph(&mut self, row: usize, col: usize, ch: char) {
+    fn write_glyph(&mut self, row: usize, col: usize, ch: char, style: Style) {
         if let Some(cell) = self.cell_mut(row, col) {
             cell.text.clear();
             cell.text.push(ch);
-            cell.style = Style::default();
+            cell.style = style;
             cell.wide_continuation = false;
             self.mark_dirty(row);
         }
     }
 
-    fn write_wide_continuation(&mut self, row: usize, col: usize) {
+    fn write_wide_continuation(&mut self, row: usize, col: usize, style: Style) {
         if let Some(cell) = self.cell_mut(row, col) {
-            *cell = Cell::wide_continuation(Style::default());
+            *cell = Cell::wide_continuation(style);
             self.mark_dirty(row);
         }
     }
@@ -264,15 +273,23 @@ pub struct TerminalSnapshot {
     pub cursor: Cursor,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Default)]
 pub struct TerminalState {
     grid: Grid,
+    style: Style,
+    saved_cursor: Cursor,
+    saved_style: Style,
+    parser: Parser,
 }
 
 impl TerminalState {
     pub fn new(width: usize, height: usize) -> Self {
         Self {
             grid: Grid::new(width, height),
+            style: Style::default(),
+            saved_cursor: Cursor::default(),
+            saved_style: Style::default(),
+            parser: Parser::new(),
         }
     }
 
@@ -284,22 +301,237 @@ impl TerminalState {
         &mut self.grid
     }
 
+    pub fn style(&self) -> Style {
+        self.style
+    }
+
+    pub fn set_style(&mut self, style: Style) {
+        self.style = style;
+    }
+
+    pub fn reset_style(&mut self) {
+        self.style = Style::default();
+    }
+
+    pub fn save_cursor(&mut self) {
+        self.saved_cursor = self.grid.cursor();
+        self.saved_style = self.style;
+    }
+
+    pub fn restore_cursor(&mut self) {
+        self.grid.cursor = self.saved_cursor;
+        self.style = self.saved_style;
+    }
+
     pub fn resize(&mut self, width: usize, height: usize) {
         self.grid.resize(width, height);
     }
 
     pub fn advance_char(&mut self, ch: char) {
-        self.grid.advance_char(ch);
+        let mut buf = [0; 4];
+        let text = ch.encode_utf8(&mut buf);
+        self.advance_bytes(text.as_bytes());
     }
 
     pub fn advance_str(&mut self, text: &str) {
-        self.grid.advance_str(text);
+        self.advance_bytes(text.as_bytes());
+    }
+
+    pub fn advance_bytes(&mut self, bytes: &[u8]) {
+        let mut parser = std::mem::take(&mut self.parser);
+        {
+            let mut performer = TerminalPerform { state: self };
+            parser.advance(&mut performer, bytes);
+        }
+        self.parser = parser;
     }
 
     pub fn snapshot(&self) -> TerminalSnapshot {
         TerminalSnapshot {
             cells: self.grid.snapshot_rows(),
             cursor: self.grid.cursor(),
+        }
+    }
+
+    fn advance_printable(&mut self, ch: char) {
+        self.grid.advance_char_with_style(ch, self.style);
+    }
+
+    fn execute_control(&mut self, byte: u8) {
+        match byte {
+            b'\n' => self.grid.advance_char_with_style('\n', self.style),
+            b'\r' => self.grid.advance_char_with_style('\r', self.style),
+            b'\t' => self.tab(),
+            0x08 => self.backspace(),
+            0x0c => self.reset_style(),
+            _ => {}
+        }
+    }
+
+    fn move_cursor_up(&mut self, count: usize) {
+        self.grid.cursor.row = self.grid.cursor.row.saturating_sub(count);
+    }
+
+    fn move_cursor_down(&mut self, count: usize) {
+        self.grid.cursor.row = self
+            .grid
+            .cursor
+            .row
+            .saturating_add(count)
+            .min(self.grid.height() - 1);
+    }
+
+    fn move_cursor_forward(&mut self, count: usize) {
+        self.grid.cursor.col = self
+            .grid
+            .cursor
+            .col
+            .saturating_add(count)
+            .min(self.grid.width() - 1);
+    }
+
+    fn move_cursor_backward(&mut self, count: usize) {
+        self.grid.cursor.col = self.grid.cursor.col.saturating_sub(count);
+    }
+
+    fn set_cursor_position(&mut self, row: usize, col: usize) {
+        self.grid.cursor.row = min(row, self.grid.height() - 1);
+        self.grid.cursor.col = min(col, self.grid.width() - 1);
+    }
+
+    fn backspace(&mut self) {
+        if self.grid.cursor.col > 0 {
+            self.grid.cursor.col -= 1;
+        }
+    }
+
+    fn tab(&mut self) {
+        let next_tab_stop = ((self.grid.cursor.col / 8) + 1) * 8;
+        let spaces = next_tab_stop.saturating_sub(self.grid.cursor.col);
+        for _ in 0..spaces {
+            self.grid.advance_char_with_style(' ', self.style);
+        }
+    }
+
+    fn apply_sgr(&mut self, params: &Params) {
+        let mut iter = params.iter();
+        let mut saw_param = false;
+
+        while let Some(param) = iter.next() {
+            saw_param = true;
+            let value = first_value(param);
+            match value {
+                0 => self.reset_style(),
+                1 => self.style.bold = true,
+                3 => self.style.italic = true,
+                4 => self.style.underline = true,
+                22 => self.style.bold = false,
+                23 => self.style.italic = false,
+                24 => self.style.underline = false,
+                30..=37 => self.style.foreground = Color::Indexed((value - 30) as u8),
+                39 => self.style.foreground = Color::Default,
+                40..=47 => self.style.background = Color::Indexed((value - 40) as u8),
+                49 => self.style.background = Color::Default,
+                90..=97 => self.style.foreground = Color::Indexed((value - 90 + 8) as u8),
+                100..=107 => self.style.background = Color::Indexed((value - 100 + 8) as u8),
+                38 | 48 => {
+                    let target = if value == 38 {
+                        &mut self.style.foreground
+                    } else {
+                        &mut self.style.background
+                    };
+                    let mode = iter.next().map(first_value).unwrap_or(0);
+                    match mode {
+                        2 => {
+                            let red = iter.next().map(first_value).unwrap_or(0) as u8;
+                            let green = iter.next().map(first_value).unwrap_or(0) as u8;
+                            let blue = iter.next().map(first_value).unwrap_or(0) as u8;
+                            *target = Color::Rgb(red, green, blue);
+                        }
+                        5 => {
+                            let index = iter.next().map(first_value).unwrap_or(0) as u8;
+                            *target = Color::Indexed(index);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !saw_param {
+            self.reset_style();
+        }
+    }
+}
+
+fn first_value(param: &[u16]) -> u16 {
+    param.first().copied().unwrap_or(0)
+}
+
+struct TerminalPerform<'a> {
+    state: &'a mut TerminalState,
+}
+
+impl Perform for TerminalPerform<'_> {
+    fn print(&mut self, c: char) {
+        self.state.advance_printable(c);
+    }
+
+    fn execute(&mut self, byte: u8) {
+        self.state.execute_control(byte);
+    }
+
+    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _byte: char) {}
+
+    fn put(&mut self, _byte: u8) {}
+
+    fn unhook(&mut self) {}
+
+    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+
+    fn csi_dispatch(
+        &mut self,
+        params: &Params,
+        _intermediates: &[u8],
+        _ignore: bool,
+        action: char,
+    ) {
+        let mut values = params.iter().map(first_value);
+        match action {
+            'A' => self
+                .state
+                .move_cursor_up(values.next().unwrap_or(1) as usize),
+            'B' => self
+                .state
+                .move_cursor_down(values.next().unwrap_or(1) as usize),
+            'C' => self
+                .state
+                .move_cursor_forward(values.next().unwrap_or(1) as usize),
+            'D' => self
+                .state
+                .move_cursor_backward(values.next().unwrap_or(1) as usize),
+            'H' | 'f' => {
+                let row = values.next().unwrap_or(1).saturating_sub(1) as usize;
+                let col = values.next().unwrap_or(1).saturating_sub(1) as usize;
+                self.state.set_cursor_position(row, col);
+            }
+            'm' => self.state.apply_sgr(params),
+            's' => self.state.save_cursor(),
+            'u' => self.state.restore_cursor(),
+            _ => {}
+        }
+    }
+
+    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
+        match byte {
+            b'7' => self.state.save_cursor(),
+            b'8' => self.state.restore_cursor(),
+            b'c' => {
+                self.state.reset_style();
+                self.state.set_cursor_position(0, 0);
+            }
+            _ => {}
         }
     }
 }

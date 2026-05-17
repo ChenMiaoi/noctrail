@@ -9,4 +9,5 @@ description = "Terminal state-machine boundary for Noctrail."
 publish = false
 
 [dependencies]
+vte = "0.15"
 unicode-width = "0.2"
