@@ -58,6 +58,7 @@ Noctrail reads an optional TOML config with `noctrail-app --config <path>`.
 The schema reference lives in [docs/config-reference.md](docs/config-reference.md),
 and a runnable example lives at
 [examples/noctrail.example.toml](examples/noctrail.example.toml).
+The current beta gate lives in [docs/release-blockers.md](docs/release-blockers.md).
 
 ## License
 
