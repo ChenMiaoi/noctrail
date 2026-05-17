@@ -31,6 +31,7 @@ Usage:
   noctrail-app [command] [options]
 
 Commands:
+  agent-audit-smoke Run the agent audit ledger probe
   agent-context-smoke Run the read-only agent context preview probe
   agent-default-smoke Run the default-off agent policy probe
   agent-patch-preview-smoke Run the patch preview diff probe
@@ -63,6 +64,7 @@ struct StartupOptions {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartupCommand {
+    AgentAuditSmoke,
     AgentContextSmoke,
     AgentDefaultSmoke,
     AgentPatchPreviewSmoke,
@@ -130,6 +132,12 @@ fn main() {
 
     match options.command {
         StartupCommand::Help => print!("{HELP}"),
+        StartupCommand::AgentAuditSmoke => {
+            if let Err(error) = gui::agent_audit_smoke() {
+                eprintln!("{error}");
+                process::exit(1);
+            }
+        }
         StartupCommand::AgentContextSmoke => {
             if let Err(error) = run_agent_context_smoke() {
                 eprintln!("{error}");
@@ -232,6 +240,10 @@ fn parse_startup_options(args: &[String]) -> Result<StartupOptions, StartupError
 
     while index < args.len() {
         match args[index].as_str() {
+            "agent-audit-smoke" if !command_set => {
+                command = StartupCommand::AgentAuditSmoke;
+                command_set = true;
+            }
             "agent-context-smoke" if !command_set => {
                 command = StartupCommand::AgentContextSmoke;
                 command_set = true;
@@ -1809,6 +1821,16 @@ mod tests {
             parse_startup_options(&["redaction-smoke".to_string()]).expect("options should parse");
 
         assert_eq!(options.command, StartupCommand::RedactionSmoke);
+        assert_eq!(options.config_path, None);
+        assert!(!options.safe_mode);
+    }
+
+    #[test]
+    fn parses_agent_audit_smoke_command() {
+        let options = parse_startup_options(&["agent-audit-smoke".to_string()])
+            .expect("options should parse");
+
+        assert_eq!(options.command, StartupCommand::AgentAuditSmoke);
         assert_eq!(options.config_path, None);
         assert!(!options.safe_mode);
     }

@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use noctrail_agent::CommandRisk;
+use noctrail_agent::{CommandPermission, CommandProposal, CommandRisk, ProviderRequestPreview};
 use noctrail_config::{AgentConfig, ConfigReloader, FontConfig, ThemeConfig};
 use noctrail_layout::{FocusDirection, LayoutRect, SplitAxis, WorkspaceId};
 use noctrail_pty::{PtyOutputReader, PtySize};
@@ -100,6 +100,91 @@ pub fn idle_schedule_probe(theme: &ThemeConfig) -> IdleScheduleProbe {
         premature_redraw: gui.advance_cursor_blink(now + gui.frame_interval / 2),
         next_wakeup: gui.next_cursor_blink_at.saturating_duration_since(now),
     }
+}
+
+pub fn agent_audit_smoke() -> Result<(), Box<dyn Error>> {
+    let app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24))?;
+    let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
+    gui.app.set_block_observer_enabled(true);
+    gui.app.advance_output(&shell_integration_probe_bytes(
+        "cargo test -p noctrail-app",
+        "/tmp/noctrail-agent-audit",
+        0,
+        19,
+        "audit context\n",
+    ));
+    let _ = gui.app.select_newest_command_block();
+    gui.app
+        .set_agent_explicit_files(vec![PathBuf::from("/tmp/noctrail/Cargo.toml")]);
+    gui.app.select_viewport_range(
+        Position { row: 0, col: 0 },
+        Position { row: 0, col: 4 },
+        SelectionMode::Normal,
+    );
+
+    let preview = crate::redaction::redact_agent_context_preview(&gui.app.agent_context_preview());
+    gui.app.record_agent_context_access(&preview);
+    let prompt = format!(
+        "cwd: {}\ncommand: {}\nselection: {}\nfiles: {}",
+        preview
+            .cwd
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        preview
+            .current_block
+            .as_ref()
+            .and_then(|block| block.command.as_deref())
+            .unwrap_or("none"),
+        preview.selection.as_deref().unwrap_or("none"),
+        preview.explicit_files.len(),
+    );
+    gui.app.record_agent_read(&ProviderRequestPreview {
+        kind: "cli",
+        endpoint: None,
+        model: None,
+        command: vec!["sh".to_string(), "-lc".to_string(), "echo".to_string()],
+        prompt_chars: prompt.chars().count(),
+    });
+    gui.app.set_agent_command_proposals(vec![CommandProposal {
+        command: review_output_command("NOCTRAIL_AUDIT_EXECUTE"),
+        reason: "Verify the shell remains interactive after reviewed execution.".to_string(),
+        risk: CommandRisk::Low,
+        permission: CommandPermission::Review,
+    }]);
+    gui.toggle_review_panel();
+    let _ = gui.confirm_review_selection()?;
+    gui.toggle_agent_audit_browser();
+
+    let title = gui.title_text();
+    if !title.contains("agent-audit") || !title.contains("execute") {
+        return Err("audit browser title did not expose the latest execution entry".into());
+    }
+
+    let kinds = gui
+        .app
+        .agent_audit_entries()
+        .iter()
+        .map(|entry| entry.kind.label())
+        .collect::<Vec<_>>();
+    for required in ["context", "read", "suggest", "review", "execute"] {
+        if !kinds.contains(&required) {
+            return Err(format!("audit ledger did not record {required}").into());
+        }
+    }
+
+    gui.app.write_input(shell_exit_bytes().as_slice())?;
+    std::thread::sleep(Duration::from_millis(100));
+    let output = read_all_runtime_output_for_gui(&mut gui.app)?;
+    let _ = gui.app.close_runtime()?;
+    let text = String::from_utf8_lossy(&output);
+    if !text.contains("NOCTRAIL_AUDIT_EXECUTE") {
+        return Err("audit smoke did not preserve reviewed shell execution".into());
+    }
+
+    println!("audit_entries={} latest={}", kinds.len(), kinds.join(","));
+    println!("agent audit smoke ok");
+    Ok(())
 }
 
 pub fn review_panel_smoke() -> Result<(), Box<dyn Error>> {
@@ -594,6 +679,9 @@ impl CommandPalette {
 struct AgentContextBrowser;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct AgentAuditBrowser;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct PatchPreviewBrowser;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -616,6 +704,7 @@ struct GuiApp {
     font: FontConfig,
     font_preferences: FontPreferences,
     ime_preedit: Option<String>,
+    agent_audit_browser: Option<AgentAuditBrowser>,
     agent_context_browser: Option<AgentContextBrowser>,
     patch_preview_browser: Option<PatchPreviewBrowser>,
     review_panel: Option<ReviewPanel>,
@@ -658,6 +747,7 @@ impl GuiApp {
             font: font.clone(),
             font_preferences: font_preferences_from_config(&font),
             ime_preedit: None,
+            agent_audit_browser: None,
             agent_context_browser: None,
             patch_preview_browser: None,
             review_panel: None,
@@ -1077,6 +1167,21 @@ impl GuiApp {
                 title.push_str(&preview.explicit_files.len().to_string());
                 title.push(' ');
                 title.push_str(&preview_paths(&preview.explicit_files, 48));
+            }
+        }
+        if self.agent_audit_browser.is_some() {
+            title.push_str(" | agent-audit");
+            title.push_str(" | entries ");
+            title.push_str(&self.app.agent_audit_entries().len().to_string());
+            if let Some(index) = self.app.selected_agent_audit_entry_index() {
+                title.push_str(" sel ");
+                title.push_str(&(index + 1).to_string());
+            }
+            if let Some(entry) = self.app.selected_agent_audit_entry() {
+                title.push_str(" | ");
+                title.push_str(entry.kind.label());
+                title.push(' ');
+                title.push_str(&preview_text(&entry.summary, 48));
             }
         }
         if let Some(proposal) = self.app.agent_command_proposals().first() {
@@ -1508,6 +1613,10 @@ impl GuiApp {
             if self.app.selected_agent_command_proposal_index().is_none() {
                 let _ = self.app.select_oldest_agent_command_proposal();
             }
+            if let Some(proposal) = self.app.selected_agent_command_proposal() {
+                self.app
+                    .record_agent_review(format!("open {}", preview_text(&proposal.command, 48)));
+            }
             self.review_panel = Some(ReviewPanel::default());
         }
         self.touch_cursor_blink();
@@ -1534,6 +1643,20 @@ impl GuiApp {
             self.agent_context_browser = None;
         } else {
             self.agent_context_browser = Some(AgentContextBrowser);
+        }
+        self.touch_cursor_blink();
+        self.update_title();
+        self.request_redraw();
+    }
+
+    fn toggle_agent_audit_browser(&mut self) {
+        if self.agent_audit_browser.is_some() {
+            self.agent_audit_browser = None;
+        } else if !self.app.agent_audit_entries().is_empty() {
+            if self.app.selected_agent_audit_entry_index().is_none() {
+                let _ = self.app.select_newest_agent_audit_entry();
+            }
+            self.agent_audit_browser = Some(AgentAuditBrowser);
         }
         self.touch_cursor_blink();
         self.update_title();
@@ -1567,13 +1690,25 @@ impl GuiApp {
         match proposal.risk {
             CommandRisk::High | CommandRisk::Critical => {
                 if review_panel.strong_confirm_index == Some(index) {
+                    self.app.record_agent_review(format!(
+                        "confirm {}",
+                        preview_text(&proposal.command, 48)
+                    ));
                     self.app.submit_selected_agent_command_proposal()?;
                     self.review_panel = None;
                 } else {
+                    self.app.record_agent_review(format!(
+                        "arm {}",
+                        preview_text(&proposal.command, 48)
+                    ));
                     review_panel.strong_confirm_index = Some(index);
                 }
             }
             CommandRisk::Low | CommandRisk::Medium => {
+                self.app.record_agent_review(format!(
+                    "approve {}",
+                    preview_text(&proposal.command, 48)
+                ));
                 self.app.submit_selected_agent_command_proposal()?;
                 self.review_panel = None;
             }
@@ -1597,6 +1732,12 @@ impl GuiApp {
         }
 
         if text.eq_ignore_ascii_case("y") {
+            if let Some(proposal) = self.app.selected_agent_command_proposal() {
+                self.app.record_agent_review(format!(
+                    "confirm {}",
+                    preview_text(&proposal.command, 48)
+                ));
+            }
             self.app.submit_selected_agent_command_proposal()?;
             self.review_panel = None;
         }
@@ -1755,6 +1896,44 @@ impl GuiApp {
             }
             winit::keyboard::Key::Named(winit::keyboard::NamedKey::End) => {
                 let _ = self.app.select_newest_agent_patch_preview();
+            }
+            _ => {}
+        }
+
+        self.touch_cursor_blink();
+        self.update_title();
+        self.request_redraw();
+        Ok(true)
+    }
+
+    fn handle_agent_audit_key(
+        &mut self,
+        event: &winit::event::KeyEvent,
+    ) -> Result<bool, Box<dyn Error>> {
+        if self.agent_audit_browser.is_none() {
+            return Ok(false);
+        }
+        if !event.state.is_pressed() {
+            return Ok(true);
+        }
+
+        match event.logical_key.as_ref() {
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape) => {
+                self.agent_audit_browser = None;
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp) => {
+                let _ = self.app.select_previous_agent_audit_entry();
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowDown)
+            | winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab) => {
+                let _ = self.app.select_next_agent_audit_entry();
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Home) => {
+                let _ = self.app.select_oldest_agent_audit_entry();
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::End)
+            | winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter) => {
+                let _ = self.app.select_newest_agent_audit_entry();
             }
             _ => {}
         }
@@ -2135,6 +2314,13 @@ impl ApplicationHandler for GuiApp {
                 }
                 if matches!(
                     input::shortcut_action(&event.logical_key, self.modifiers),
+                    Some(input::ShortcutAction::ToggleAgentAuditBrowser)
+                ) {
+                    self.toggle_agent_audit_browser();
+                    return;
+                }
+                if matches!(
+                    input::shortcut_action(&event.logical_key, self.modifiers),
                     Some(input::ShortcutAction::ToggleAgentContextPreview)
                 ) {
                     self.toggle_agent_context_preview();
@@ -2184,6 +2370,14 @@ impl ApplicationHandler for GuiApp {
                         return;
                     }
                 }
+                match self.handle_agent_audit_key(&event) {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(_) => {
+                        event_loop.exit();
+                        return;
+                    }
+                }
                 match self.handle_block_browser_key(&event) {
                     Ok(true) => return,
                     Ok(false) => {}
@@ -2202,6 +2396,7 @@ impl ApplicationHandler for GuiApp {
                 }
                 if let Some(action) = input::shortcut_action(&event.logical_key, self.modifiers) {
                     match action {
+                        input::ShortcutAction::ToggleAgentAuditBrowser => unreachable!(),
                         input::ShortcutAction::ToggleAgentContextPreview => unreachable!(),
                         input::ShortcutAction::ToggleBlockBrowser => unreachable!(),
                         input::ShortcutAction::ToggleCommandPalette => unreachable!(),
@@ -2700,6 +2895,31 @@ mod tests {
         assert!(title.contains("cwd /tmp/noctrail-agent"));
         assert!(title.contains("files 2"));
         assert!(title.contains("/tmp/noctrail/Cargo.toml"));
+    }
+
+    #[test]
+    fn audit_browser_title_reflects_selected_entry() {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
+        let preview = crate::AgentContextPreview {
+            current_block: Some(crate::AgentContextBlock {
+                command: Some("echo token=sk-live-secretvalue12345".to_string()),
+                output: "ok".to_string(),
+                exit_code: Some(0),
+            }),
+            selection: None,
+            cwd: Some(PathBuf::from("/tmp/noctrail-agent-audit")),
+            explicit_files: Vec::new(),
+        };
+        gui.app.record_agent_context_access(&preview);
+        gui.app.record_agent_review("approve git status");
+
+        gui.toggle_agent_audit_browser();
+        let title = gui.title_text();
+
+        assert!(title.contains("agent-audit"));
+        assert!(title.contains("entries 2"));
+        assert!(title.contains("review approve git status"));
     }
 
     #[test]

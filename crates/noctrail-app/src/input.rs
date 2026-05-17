@@ -9,6 +9,7 @@ pub enum ShortcutAction {
     Copy,
     Paste,
     Focus(FocusDirection),
+    ToggleAgentAuditBrowser,
     ToggleAgentContextPreview,
     ToggleBlockBrowser,
     ToggleCommandPalette,
@@ -62,6 +63,7 @@ pub fn shortcut_action(logical_key: &Key, modifiers: ModifiersState) -> Option<S
                 "b" => Some(ShortcutAction::ToggleBlockBrowser),
                 "c" => Some(ShortcutAction::Copy),
                 "d" => Some(ShortcutAction::TogglePatchPreview),
+                "l" => Some(ShortcutAction::ToggleAgentAuditBrowser),
                 "p" => Some(ShortcutAction::ToggleCommandPalette),
                 "r" => Some(ShortcutAction::ToggleReviewPanel),
                 "v" => Some(ShortcutAction::Paste),
@@ -435,6 +437,10 @@ mod tests {
         assert_eq!(
             shortcut_action(&Key::Character("a".into()), modifiers),
             Some(ShortcutAction::ToggleAgentContextPreview)
+        );
+        assert_eq!(
+            shortcut_action(&Key::Character("l".into()), modifiers),
+            Some(ShortcutAction::ToggleAgentAuditBrowser)
         );
     }
 

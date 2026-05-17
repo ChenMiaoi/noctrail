@@ -13,7 +13,7 @@ pub mod gui;
 pub mod input;
 pub mod redaction;
 
-use noctrail_agent::{CommandProposal, PatchPreview};
+use noctrail_agent::{CommandProposal, PatchPreview, ProviderRequestPreview};
 use noctrail_layout::{
     FocusDirection, LayoutError, LayoutRect, PaneLayout, SplitAxis, WorkspaceId, WorkspaceSet,
 };
@@ -31,6 +31,7 @@ use toml::Value as TomlValue;
 const ROOT_PANE_ID: PaneId = PaneId::new(1);
 const SCRATCH_HEIGHT_DIVISOR: u16 = 3;
 const MAX_COMMAND_BLOCKS: usize = 100;
+const MAX_AUDIT_ENTRIES: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PaneChromeConfig {
@@ -109,6 +110,105 @@ pub struct AgentContextPreview {
     pub selection: Option<String>,
     pub cwd: Option<PathBuf>,
     pub explicit_files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentAuditKind {
+    Context,
+    Read,
+    Suggest,
+    Review,
+    Execute,
+}
+
+impl AgentAuditKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Context => "context",
+            Self::Read => "read",
+            Self::Suggest => "suggest",
+            Self::Review => "review",
+            Self::Execute => "execute",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentAuditEntry {
+    pub kind: AgentAuditKind,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct AgentAuditLedger {
+    entries: Vec<AgentAuditEntry>,
+    selected: Option<usize>,
+}
+
+impl AgentAuditLedger {
+    fn entries(&self) -> &[AgentAuditEntry] {
+        &self.entries
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        self.selected
+    }
+
+    fn selected(&self) -> Option<&AgentAuditEntry> {
+        self.selected.and_then(|index| self.entries.get(index))
+    }
+
+    fn push(&mut self, entry: AgentAuditEntry) {
+        self.entries.push(entry);
+        if self.entries.len() > MAX_AUDIT_ENTRIES {
+            let overflow = self.entries.len() - MAX_AUDIT_ENTRIES;
+            self.entries.drain(0..overflow);
+            self.selected = self
+                .selected
+                .map(|selected| selected.saturating_sub(overflow));
+        }
+        self.selected = Some(self.entries.len() - 1);
+    }
+
+    fn select_oldest(&mut self) -> Option<usize> {
+        self.selected = (!self.entries.is_empty()).then_some(0);
+        self.selected
+    }
+
+    fn select_newest(&mut self) -> Option<usize> {
+        self.selected = self.entries.len().checked_sub(1);
+        self.selected
+    }
+
+    fn select_previous(&mut self) -> Option<usize> {
+        let len = self.entries.len();
+        if len == 0 {
+            self.selected = None;
+            return None;
+        }
+
+        let next = match self.selected {
+            Some(0) | None => len - 1,
+            Some(index) => index - 1,
+        };
+        self.selected = Some(next);
+        self.selected
+    }
+
+    fn select_next(&mut self) -> Option<usize> {
+        let len = self.entries.len();
+        if len == 0 {
+            self.selected = None;
+            return None;
+        }
+
+        let next = match self.selected {
+            Some(index) => (index + 1) % len,
+            None => 0,
+        };
+        self.selected = Some(next);
+        self.selected
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1018,6 +1118,7 @@ pub struct DesktopApp {
     scratch_pane_id: Option<PaneId>,
     scratch_visible: bool,
     explicit_agent_files: Vec<PathBuf>,
+    audit_ledger: AgentAuditLedger,
     panes: HashMap<PaneId, TerminalPane>,
     next_pane_id: u64,
 }
@@ -1296,6 +1397,7 @@ impl DesktopApp {
     }
 
     pub fn set_agent_command_proposals(&mut self, proposals: Vec<CommandProposal>) {
+        self.record_agent_command_suggestions(&proposals);
         self.active_pane_mut()
             .set_agent_command_proposals(proposals);
     }
@@ -1324,8 +1426,15 @@ impl DesktopApp {
     }
 
     pub fn submit_selected_agent_command_proposal(&mut self) -> Result<usize, AppError> {
-        self.active_pane_mut()
-            .submit_selected_agent_command_proposal()
+        let command = self
+            .selected_agent_command_proposal()
+            .map(|proposal| proposal.command.clone())
+            .ok_or(AppError::MissingAgentProposal)?;
+        let written = self
+            .active_pane_mut()
+            .submit_selected_agent_command_proposal()?;
+        self.record_agent_execute(&command);
+        Ok(written)
     }
 
     pub fn agent_patch_previews(&self) -> &[PatchPreview] {
@@ -1341,6 +1450,7 @@ impl DesktopApp {
     }
 
     pub fn set_agent_patch_previews(&mut self, previews: Vec<PatchPreview>) {
+        self.record_agent_patch_suggestions(&previews);
         self.active_pane_mut().set_agent_patch_previews(previews);
     }
 
@@ -1362,6 +1472,100 @@ impl DesktopApp {
 
     pub fn select_next_agent_patch_preview(&mut self) -> Option<usize> {
         self.active_pane_mut().select_next_agent_patch_preview()
+    }
+
+    pub fn agent_audit_entries(&self) -> &[AgentAuditEntry] {
+        self.audit_ledger.entries()
+    }
+
+    pub fn selected_agent_audit_entry_index(&self) -> Option<usize> {
+        self.audit_ledger.selected_index()
+    }
+
+    pub fn selected_agent_audit_entry(&self) -> Option<&AgentAuditEntry> {
+        self.audit_ledger.selected()
+    }
+
+    pub fn select_oldest_agent_audit_entry(&mut self) -> Option<usize> {
+        self.audit_ledger.select_oldest()
+    }
+
+    pub fn select_newest_agent_audit_entry(&mut self) -> Option<usize> {
+        self.audit_ledger.select_newest()
+    }
+
+    pub fn select_previous_agent_audit_entry(&mut self) -> Option<usize> {
+        self.audit_ledger.select_previous()
+    }
+
+    pub fn select_next_agent_audit_entry(&mut self) -> Option<usize> {
+        self.audit_ledger.select_next()
+    }
+
+    pub fn record_agent_context_access(&mut self, preview: &AgentContextPreview) {
+        let preview = crate::redaction::redact_agent_context_preview(preview);
+        let command = preview
+            .current_block
+            .as_ref()
+            .and_then(|block| block.command.as_deref())
+            .unwrap_or("none");
+        let cwd = preview
+            .cwd
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "none".to_string());
+        self.record_agent_audit(
+            AgentAuditKind::Context,
+            format!("cwd={cwd} command={command}"),
+        );
+    }
+
+    pub fn record_agent_read(&mut self, preview: &ProviderRequestPreview) {
+        let target = preview
+            .endpoint
+            .as_deref()
+            .or(preview.model.as_deref())
+            .unwrap_or("cli");
+        self.record_agent_audit(
+            AgentAuditKind::Read,
+            format!(
+                "provider={} target={} prompt_chars={}",
+                preview.kind, target, preview.prompt_chars
+            ),
+        );
+    }
+
+    pub fn record_agent_command_suggestions(&mut self, proposals: &[CommandProposal]) {
+        let first = proposals
+            .first()
+            .map(|proposal| preview_agent_summary(&proposal.command))
+            .unwrap_or_else(|| "none".to_string());
+        self.record_agent_audit(
+            AgentAuditKind::Suggest,
+            format!("commands={} first={first}", proposals.len()),
+        );
+    }
+
+    pub fn record_agent_patch_suggestions(&mut self, previews: &[PatchPreview]) {
+        let first = previews
+            .first()
+            .map(|preview| preview.path.display().to_string())
+            .unwrap_or_else(|| "none".to_string());
+        self.record_agent_audit(
+            AgentAuditKind::Suggest,
+            format!("patches={} first={first}", previews.len()),
+        );
+    }
+
+    pub fn record_agent_review(&mut self, summary: impl Into<String>) {
+        self.record_agent_audit(
+            AgentAuditKind::Review,
+            preview_agent_summary(&summary.into()),
+        );
+    }
+
+    pub fn record_agent_execute(&mut self, command: &str) {
+        self.record_agent_audit(AgentAuditKind::Execute, preview_agent_summary(command));
     }
 
     pub fn mouse_tracking_mode(&self) -> MouseTrackingMode {
@@ -1569,9 +1773,14 @@ impl DesktopApp {
             scratch_pane_id: None,
             scratch_visible: false,
             explicit_agent_files: Vec::new(),
+            audit_ledger: AgentAuditLedger::default(),
             panes,
             next_pane_id: ROOT_PANE_ID.0 + 1,
         }
+    }
+
+    fn record_agent_audit(&mut self, kind: AgentAuditKind, summary: String) {
+        self.audit_ledger.push(AgentAuditEntry { kind, summary });
     }
 
     fn allocate_pane_id(&mut self) -> Result<PaneId, AppError> {
@@ -1900,6 +2109,16 @@ fn selection_line_ending() -> LineEnding {
     } else {
         LineEnding::Lf
     }
+}
+
+fn preview_agent_summary(text: &str) -> String {
+    let redacted = crate::redaction::redact_secret_text(text);
+    let normalized = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview = normalized.chars().take(48).collect::<String>();
+    if normalized.chars().count() > 48 {
+        preview.push_str("...");
+    }
+    preview
 }
 
 fn full_frame_damage(size: PtySize) -> DamageSet {
@@ -2755,6 +2974,94 @@ mod tests {
         let _ = app.select_next_agent_patch_preview();
         app.clear_agent_patch_previews();
         assert!(app.agent_patch_previews().is_empty());
+    }
+
+    #[test]
+    fn audit_ledger_tracks_context_suggest_review_and_execute() -> Result<(), Box<dyn StdError>> {
+        let mut app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 40), PtySize::new(20, 4))?;
+        app.set_block_observer_enabled(true);
+        app.advance_output(&shell_integration_probe_bytes(
+            "echo token=sk-live-secretvalue12345",
+            "/tmp/noctrail-audit",
+            0,
+            7,
+            b"ok\n",
+        ));
+        app.record_agent_context_access(&app.agent_context_preview());
+        app.record_agent_read(&ProviderRequestPreview {
+            kind: "cli",
+            endpoint: None,
+            model: None,
+            command: vec!["sh".to_string(), "-lc".to_string(), "echo".to_string()],
+            prompt_chars: 42,
+        });
+        app.set_agent_command_proposals(vec![CommandProposal {
+            command: "printf 'NOCTRAIL_AUDIT_OK\\n'".to_string(),
+            reason: "Verify the shell remains interactive.".to_string(),
+            risk: noctrail_agent::CommandRisk::Low,
+            permission: noctrail_agent::CommandPermission::Review,
+        }]);
+        app.record_agent_review("confirm printf 'NOCTRAIL_AUDIT_OK\\n'");
+        let _ = app.submit_selected_agent_command_proposal()?;
+
+        let entries = app.agent_audit_entries();
+        assert_eq!(
+            entries.iter().map(|entry| entry.kind).collect::<Vec<_>>(),
+            vec![
+                AgentAuditKind::Context,
+                AgentAuditKind::Read,
+                AgentAuditKind::Suggest,
+                AgentAuditKind::Review,
+                AgentAuditKind::Execute,
+            ]
+        );
+        assert!(entries[0].summary.contains("[REDACTED]"));
+        assert!(entries[2].summary.contains("commands=1"));
+        assert!(entries[4].summary.contains("NOCTRAIL_AUDIT_OK"));
+        Ok(())
+    }
+
+    #[test]
+    fn audit_ledger_rolls_forward_and_supports_selection_navigation() {
+        let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(20, 4));
+        for index in 0..=MAX_AUDIT_ENTRIES {
+            app.record_agent_review(format!("entry-{index:03}"));
+        }
+
+        assert_eq!(app.agent_audit_entries().len(), MAX_AUDIT_ENTRIES);
+        assert_eq!(
+            app.agent_audit_entries()
+                .first()
+                .map(|entry| entry.summary.as_str()),
+            Some("entry-001")
+        );
+        assert_eq!(
+            app.agent_audit_entries()
+                .last()
+                .map(|entry| entry.summary.as_str()),
+            Some("entry-200")
+        );
+        assert_eq!(
+            app.selected_agent_audit_entry()
+                .map(|entry| entry.summary.as_str()),
+            Some("entry-200")
+        );
+        assert_eq!(app.select_oldest_agent_audit_entry(), Some(0));
+        assert_eq!(
+            app.selected_agent_audit_entry()
+                .map(|entry| entry.summary.as_str()),
+            Some("entry-001")
+        );
+        assert_eq!(
+            app.select_previous_agent_audit_entry(),
+            Some(MAX_AUDIT_ENTRIES - 1)
+        );
+        assert_eq!(
+            app.selected_agent_audit_entry()
+                .map(|entry| entry.summary.as_str()),
+            Some("entry-200")
+        );
+        assert_eq!(app.select_next_agent_audit_entry(), Some(0));
     }
 
     #[test]
