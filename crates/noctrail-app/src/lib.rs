@@ -3,6 +3,7 @@
 use std::fmt;
 
 pub mod gui;
+pub mod input;
 
 use noctrail_layout::LayoutRect;
 use noctrail_pty::{PtyCommand, PtyError, PtyExitStatus, PtySize};

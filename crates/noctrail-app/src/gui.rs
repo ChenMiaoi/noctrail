@@ -10,10 +10,11 @@ use winit::{
     dpi::{LogicalSize, PhysicalSize},
     event::WindowEvent,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    keyboard::ModifiersState,
     window::{Window, WindowId},
 };
 
-use crate::{DesktopApp, DesktopFrame};
+use crate::{DesktopApp, DesktopFrame, input};
 
 const DEFAULT_WINDOW_WIDTH: u32 = 1280;
 const DEFAULT_WINDOW_HEIGHT: u32 = 800;
@@ -87,6 +88,7 @@ struct GuiApp {
     next_frame_at: Instant,
     cursor_visible: bool,
     frame_interval: Duration,
+    modifiers: ModifiersState,
 }
 
 impl GuiApp {
@@ -98,6 +100,7 @@ impl GuiApp {
             next_frame_at: now,
             cursor_visible: true,
             frame_interval: FRAME_INTERVAL,
+            modifiers: ModifiersState::empty(),
         }
     }
 
@@ -176,6 +179,31 @@ impl ApplicationHandler for GuiApp {
             WindowEvent::CloseRequested => {
                 let _ = self.app.close_runtime();
                 event_loop.exit();
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
+            }
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } => {
+                if is_synthetic {
+                    return;
+                }
+                if let Some(bytes) = input::key_event_to_pty_bytes(
+                    event.state,
+                    &event.logical_key,
+                    event.text.as_deref(),
+                    self.modifiers,
+                ) {
+                    if self.app.write_input(&bytes).is_err() {
+                        event_loop.exit();
+                        return;
+                    }
+                    self.request_redraw();
+                    self.update_title();
+                }
             }
             WindowEvent::Resized(size) => {
                 if self.sync_surface(size).is_err() {
