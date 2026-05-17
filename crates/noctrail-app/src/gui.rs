@@ -88,6 +88,7 @@ struct GuiApp {
     app: DesktopApp,
     window: Option<Arc<Window>>,
     renderer: Option<GpuRenderer>,
+    gpu_fallback_error: Option<String>,
     next_frame_at: Instant,
     cursor_visible: bool,
     frame_interval: Duration,
@@ -102,6 +103,7 @@ impl GuiApp {
             app,
             window: None,
             renderer: None,
+            gpu_fallback_error: None,
             next_frame_at: now,
             cursor_visible: true,
             frame_interval: FRAME_INTERVAL,
@@ -125,8 +127,16 @@ impl GuiApp {
         let window = Arc::new(event_loop.create_window(attributes)?);
         let size = window.inner_size();
         self.sync_surface(size)?;
-        self.renderer = Some(GpuRenderer::new(window.clone(), size)?);
-        self.app.set_backend(noctrail_render::RenderBackend::Gpu);
+        match GpuRenderer::new(window.clone(), size) {
+            Ok(renderer) => {
+                self.renderer = Some(renderer);
+                self.gpu_fallback_error = None;
+                self.app.set_backend(noctrail_render::RenderBackend::Gpu);
+            }
+            Err(error) => {
+                self.record_gpu_fallback(error.to_string());
+            }
+        }
         self.window = Some(window);
         self.update_title();
         self.request_redraw();
@@ -145,7 +155,12 @@ impl GuiApp {
 
     fn update_title(&self) {
         if let Some(window) = self.window.as_ref() {
-            window.set_title(&frame_title(&self.app.frame(), self.cursor_visible));
+            let mut title = frame_title(&self.app.frame(), self.cursor_visible);
+            if let Some(error) = self.gpu_fallback_error.as_deref() {
+                title.push_str(" | gpu-fallback ");
+                title.push_str(error);
+            }
+            window.set_title(&title);
         }
     }
 
@@ -162,6 +177,14 @@ impl GuiApp {
             self.next_frame_at = now + self.frame_interval;
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame_at));
+    }
+
+    fn record_gpu_fallback(&mut self, error: String) {
+        eprintln!("GPU renderer unavailable, falling back to software: {error}");
+        self.renderer = None;
+        self.gpu_fallback_error = Some(error);
+        self.app
+            .set_backend(noctrail_render::RenderBackend::Software);
     }
 }
 
@@ -246,10 +269,10 @@ impl ApplicationHandler for GuiApp {
             }
             WindowEvent::RedrawRequested => {
                 if let Some(renderer) = self.renderer.as_mut()
-                    && renderer.render_clear().is_err()
+                    && let Err(error) = renderer.render_clear()
                 {
-                    event_loop.exit();
-                    return;
+                    self.record_gpu_fallback(error.to_string());
+                    self.update_title();
                 }
                 self.cursor_visible = !self.cursor_visible;
                 self.update_title();
@@ -324,5 +347,18 @@ mod tests {
         assert!(title.contains("rows 0"));
         assert!(title.contains("gpu"));
         assert!(title.contains("cursor on"));
+    }
+
+    #[test]
+    fn gpu_fallback_switches_backend_without_exiting() {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
+        let mut gui = GuiApp::new(app);
+        gui.app.set_backend(RenderBackend::Gpu);
+
+        gui.record_gpu_fallback("adapter missing".to_string());
+
+        assert_eq!(gui.app.backend(), RenderBackend::Software);
+        assert!(gui.renderer.is_none());
+        assert_eq!(gui.gpu_fallback_error.as_deref(), Some("adapter missing"));
     }
 }
