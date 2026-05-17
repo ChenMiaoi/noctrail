@@ -122,6 +122,10 @@ version = "0.1.0"
 [[package]]
 name = "noctrail-layout"
 version = "0.1.0"
+dependencies = [
+ "noctrail-runtime",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "noctrail-pty"

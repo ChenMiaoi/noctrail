@@ -9,3 +9,5 @@ description = "Workspace and pane layout boundary for Noctrail."
 publish = false
 
 [dependencies]
+noctrail-runtime = { path = "../noctrail-runtime" }
+thiserror = "2"
