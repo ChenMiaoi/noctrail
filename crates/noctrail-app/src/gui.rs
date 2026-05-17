@@ -14,7 +14,7 @@ use winit::{
     window::{Window, WindowId},
 };
 
-use crate::{DesktopApp, DesktopFrame, input};
+use crate::{DesktopApp, DesktopFrame, clipboard::ClipboardBridge, input};
 
 const DEFAULT_WINDOW_WIDTH: u32 = 1280;
 const DEFAULT_WINDOW_HEIGHT: u32 = 800;
@@ -89,6 +89,7 @@ struct GuiApp {
     cursor_visible: bool,
     frame_interval: Duration,
     modifiers: ModifiersState,
+    clipboard: ClipboardBridge,
 }
 
 impl GuiApp {
@@ -101,6 +102,7 @@ impl GuiApp {
             cursor_visible: true,
             frame_interval: FRAME_INTERVAL,
             modifiers: ModifiersState::empty(),
+            clipboard: ClipboardBridge::new(),
         }
     }
 
@@ -189,6 +191,26 @@ impl ApplicationHandler for GuiApp {
                 ..
             } => {
                 if is_synthetic {
+                    return;
+                }
+                if let Some(action) = input::shortcut_action(&event.logical_key, self.modifiers) {
+                    match action {
+                        input::ShortcutAction::Copy => {
+                            if let Some(text) = self.app.copy_selection_text() {
+                                self.clipboard.set_text(text);
+                            }
+                        }
+                        input::ShortcutAction::Paste => {
+                            if let Some(text) = self.clipboard.get_text() {
+                                if self.app.paste_text(&text).is_err() {
+                                    event_loop.exit();
+                                    return;
+                                }
+                                self.request_redraw();
+                                self.update_title();
+                            }
+                        }
+                    }
                     return;
                 }
                 if let Some(bytes) = input::key_event_to_pty_bytes(

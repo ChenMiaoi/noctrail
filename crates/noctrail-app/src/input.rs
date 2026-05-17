@@ -3,6 +3,35 @@ use winit::{
     keyboard::{Key, ModifiersState, NamedKey},
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutAction {
+    Copy,
+    Paste,
+}
+
+pub fn shortcut_action(logical_key: &Key, modifiers: ModifiersState) -> Option<ShortcutAction> {
+    if modifiers.alt_key() || modifiers.super_key() {
+        return None;
+    }
+
+    match logical_key.as_ref() {
+        Key::Character(text) if modifiers.control_key() && modifiers.shift_key() => {
+            match text.to_ascii_lowercase().as_str() {
+                "c" => Some(ShortcutAction::Copy),
+                "v" => Some(ShortcutAction::Paste),
+                _ => None,
+            }
+        }
+        Key::Named(NamedKey::Insert) if modifiers.shift_key() && !modifiers.control_key() => {
+            Some(ShortcutAction::Paste)
+        }
+        Key::Named(NamedKey::Insert) if modifiers.control_key() && !modifiers.shift_key() => {
+            Some(ShortcutAction::Copy)
+        }
+        _ => None,
+    }
+}
+
 pub fn key_to_pty_bytes(
     logical_key: &Key,
     text: Option<&str>,
@@ -33,6 +62,22 @@ pub fn key_to_pty_bytes(
     }
 
     Some(bytes)
+}
+
+pub fn paste_bytes(text: &str, bracketed_paste: bool) -> Vec<u8> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    if bracketed_paste {
+        let mut bytes = Vec::with_capacity(text.len() + 12);
+        bytes.extend_from_slice(b"\x1b[200~");
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+        bytes
+    } else {
+        text.as_bytes().to_vec()
+    }
 }
 
 pub fn key_event_to_pty_bytes(
@@ -195,5 +240,33 @@ mod tests {
         let bytes = key_to_pty_bytes(&Key::Named(NamedKey::F5), None, ModifiersState::empty())
             .expect("f5 should map");
         assert_eq!(bytes, b"\x1b[15~");
+    }
+
+    #[test]
+    fn paste_bytes_wraps_when_bracketed() {
+        assert_eq!(paste_bytes("hello", true), b"\x1b[200~hello\x1b[201~");
+        assert_eq!(paste_bytes("hello", false), b"hello");
+    }
+
+    #[test]
+    fn shortcut_actions_cover_copy_and_paste() {
+        assert_eq!(
+            shortcut_action(
+                &Key::Character("c".into()),
+                ModifiersState::CONTROL | ModifiersState::SHIFT,
+            ),
+            Some(ShortcutAction::Copy)
+        );
+        assert_eq!(
+            shortcut_action(
+                &Key::Character("v".into()),
+                ModifiersState::CONTROL | ModifiersState::SHIFT,
+            ),
+            Some(ShortcutAction::Paste)
+        );
+        assert_eq!(
+            shortcut_action(&Key::Named(NamedKey::Insert), ModifiersState::SHIFT),
+            Some(ShortcutAction::Paste)
+        );
     }
 }

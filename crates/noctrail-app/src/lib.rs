@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+mod clipboard;
+
 pub mod gui;
 pub mod input;
 
@@ -9,7 +11,7 @@ use noctrail_layout::LayoutRect;
 use noctrail_pty::{PtyCommand, PtyError, PtyExitStatus, PtySize};
 use noctrail_render::{RenderBackend, RenderPlan, RenderRect};
 use noctrail_runtime::{PaneId, PaneRuntime};
-use noctrail_term::{TerminalSnapshot, TerminalState};
+use noctrail_term::{LineEnding, TerminalSnapshot, TerminalState};
 use thiserror::Error;
 
 const ROOT_PANE_ID: PaneId = PaneId::new(1);
@@ -102,8 +104,20 @@ impl TerminalPane {
         self.terminal_size
     }
 
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        self.terminal.bracketed_paste_mode()
+    }
+
+    pub fn copy_selection_text(&self) -> Option<String> {
+        self.terminal.selection_text(selection_line_ending())
+    }
+
     pub fn process_id(&self) -> Option<u32> {
         self.runtime.as_ref().and_then(PaneRuntime::process_id)
+    }
+
+    pub fn paste_bytes(&self, text: &str) -> Vec<u8> {
+        input::paste_bytes(text, self.bracketed_paste_enabled())
     }
 
     pub fn advance_output(&mut self, bytes: &[u8]) {
@@ -113,6 +127,11 @@ impl TerminalPane {
     pub fn write_input(&mut self, bytes: &[u8]) -> Result<usize, AppError> {
         let runtime = self.runtime.as_mut().ok_or(AppError::MissingRuntime)?;
         runtime.write(bytes).map_err(AppError::from)
+    }
+
+    pub fn paste_text(&mut self, text: &str) -> Result<usize, AppError> {
+        let bytes = self.paste_bytes(text);
+        self.write_input(&bytes)
     }
 
     pub fn resize(&mut self, size: PtySize) -> Result<(), AppError> {
@@ -222,6 +241,14 @@ impl DesktopApp {
         self.pane.write_input(bytes)
     }
 
+    pub fn paste_text(&mut self, text: &str) -> Result<usize, AppError> {
+        self.pane.paste_text(text)
+    }
+
+    pub fn copy_selection_text(&self) -> Option<String> {
+        self.pane.copy_selection_text()
+    }
+
     pub fn resize(&mut self, surface: LayoutRect, terminal_size: PtySize) -> Result<(), AppError> {
         self.pane.resize(terminal_size)?;
         self.surface = surface;
@@ -240,6 +267,14 @@ impl DesktopApp {
 
     pub fn close_runtime(&mut self) -> Result<Option<PtyExitStatus>, AppError> {
         self.pane.close_runtime()
+    }
+}
+
+fn selection_line_ending() -> LineEnding {
+    if cfg!(windows) {
+        LineEnding::CrLf
+    } else {
+        LineEnding::Lf
     }
 }
 

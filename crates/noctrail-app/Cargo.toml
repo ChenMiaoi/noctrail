@@ -15,6 +15,7 @@ noctrail-render = { path = "../noctrail-render" }
 noctrail-runtime = { path = "../noctrail-runtime" }
 noctrail-term = { path = "../noctrail-term" }
 winit = "0.30.13"
+arboard = "3.6"
 thiserror = "2"
 
 [[bin]]

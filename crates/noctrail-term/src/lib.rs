@@ -544,6 +544,8 @@ pub struct TerminalSnapshot {
     pub cursor: Cursor,
     #[serde(default, skip_serializing_if = "is_false")]
     pub alternate_screen: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bracketed_paste: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<Selection>,
 }
@@ -565,6 +567,7 @@ pub struct TerminalState {
     style: Style,
     saved_primary: Option<SavedState>,
     saved_alternate: Option<SavedState>,
+    bracketed_paste: bool,
     selection: Option<Selection>,
     parser: Parser,
 }
@@ -579,6 +582,7 @@ impl TerminalState {
             style: Style::default(),
             saved_primary: None,
             saved_alternate: None,
+            bracketed_paste: false,
             selection: None,
             parser: Parser::new(),
         }
@@ -659,6 +663,14 @@ impl TerminalState {
         self.selection = None;
     }
 
+    pub fn bracketed_paste_mode(&self) -> bool {
+        self.bracketed_paste
+    }
+
+    pub fn set_bracketed_paste_mode(&mut self, enabled: bool) {
+        self.bracketed_paste = enabled;
+    }
+
     pub fn selection_text(&self, line_ending: LineEnding) -> Option<String> {
         let selection = self.selection.as_ref()?.clone().normalized();
         let rows = self.active_rows();
@@ -694,6 +706,7 @@ impl TerminalState {
             },
             cursor: self.active_grid().cursor(),
             alternate_screen: self.alternate.is_some(),
+            bracketed_paste: self.bracketed_paste,
             selection: self.selection.clone(),
         }
     }
@@ -928,6 +941,7 @@ impl TerminalState {
         self.style = Style::default();
         self.saved_primary = None;
         self.saved_alternate = None;
+        self.bracketed_paste = false;
         self.selection = None;
     }
 
@@ -1098,6 +1112,8 @@ impl Perform for TerminalPerform<'_> {
                 match (mode, action) {
                     (47 | 1047 | 1049, 'h') => self.state.enter_alternate_screen(),
                     (47 | 1047 | 1049, 'l') => self.state.exit_alternate_screen(),
+                    (2004, 'h') => self.state.set_bracketed_paste_mode(true),
+                    (2004, 'l') => self.state.set_bracketed_paste_mode(false),
                     (1048, 'h') => self.state.save_cursor(),
                     (1048, 'l') => self.state.restore_cursor(),
                     _ => {}
@@ -1174,5 +1190,16 @@ mod tests {
         assert_eq!(row[1].text, "b");
         assert_eq!(row[2].text, "c");
         assert_eq!(terminal.grid().cursor(), Cursor { row: 1, col: 0 });
+    }
+
+    #[test]
+    fn bracketed_paste_mode_tracks_private_csi_sequences() {
+        let mut terminal = TerminalState::new(4, 1);
+
+        assert!(!terminal.bracketed_paste_mode());
+        terminal.advance_bytes(b"\x1b[?2004h");
+        assert!(terminal.bracketed_paste_mode());
+        terminal.advance_bytes(b"\x1b[?2004l");
+        assert!(!terminal.bracketed_paste_mode());
     }
 }

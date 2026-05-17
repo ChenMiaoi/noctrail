@@ -174,6 +174,7 @@ mod tests {
             }],
             cursor: Cursor { row: 1, col: 2 },
             alternate_screen: true,
+            bracketed_paste: false,
             selection: Some(Selection {
                 mode: SelectionMode::Line,
                 start: noctrail_term::Position { row: 0, col: 0 },
