@@ -240,6 +240,22 @@ pub struct PtySession {
     closed: bool,
 }
 
+pub struct PtyOutputReader {
+    inner: Box<dyn Read + Send>,
+}
+
+impl fmt::Debug for PtyOutputReader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PtyOutputReader").finish_non_exhaustive()
+    }
+}
+
+impl Read for PtyOutputReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
 impl fmt::Debug for PtySession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PtySession")
@@ -296,6 +312,17 @@ impl PtySession {
             Some(reader) => reader.read(buf).map_err(PtyError::Read),
             None => Err(closed_error("read from")),
         }
+    }
+
+    pub fn clone_output_reader(&self) -> Result<PtyOutputReader, PtyError> {
+        let master = self
+            .master
+            .as_ref()
+            .ok_or_else(|| closed_error("clone reader from"))?;
+        let reader = master
+            .try_clone_reader()
+            .map_err(|error| PtyError::context("failed to clone PTY reader", error))?;
+        Ok(PtyOutputReader { inner: reader })
     }
 
     pub fn write(&mut self, bytes: &[u8]) -> Result<usize, PtyError> {

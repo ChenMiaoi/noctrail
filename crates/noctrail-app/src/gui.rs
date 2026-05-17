@@ -1,11 +1,14 @@
 use std::{
     error::Error,
+    io::Read,
     sync::Arc,
+    sync::mpsc::{self, Receiver, TryRecvError},
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 use noctrail_layout::LayoutRect;
-use noctrail_pty::PtySize;
+use noctrail_pty::{PtyOutputReader, PtySize};
 use noctrail_render::GpuRenderer;
 use winit::{
     application::ApplicationHandler,
@@ -89,6 +92,8 @@ struct GuiApp {
     window: Option<Arc<Window>>,
     renderer: Option<GpuRenderer>,
     gpu_fallback_error: Option<String>,
+    output_rx: Option<Receiver<OutputPumpEvent>>,
+    output_thread: Option<JoinHandle<()>>,
     next_frame_at: Instant,
     cursor_visible: bool,
     frame_interval: Duration,
@@ -104,6 +109,8 @@ impl GuiApp {
             window: None,
             renderer: None,
             gpu_fallback_error: None,
+            output_rx: None,
+            output_thread: None,
             next_frame_at: now,
             cursor_visible: true,
             frame_interval: FRAME_INTERVAL,
@@ -114,6 +121,22 @@ impl GuiApp {
 
     fn window_id(&self) -> Option<WindowId> {
         self.window.as_ref().map(|window| window.id())
+    }
+
+    fn attach_output_pump(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.output_rx.is_some() {
+            return Ok(());
+        }
+
+        let Some(runtime) = self.app.pane().runtime() else {
+            return Ok(());
+        };
+        let reader = runtime.session().clone_output_reader()?;
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || pump_output(reader, tx));
+        self.output_rx = Some(rx);
+        self.output_thread = Some(handle);
+        Ok(())
     }
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), Box<dyn Error>> {
@@ -186,11 +209,74 @@ impl GuiApp {
         self.app
             .set_backend(noctrail_render::RenderBackend::Software);
     }
+
+    fn drain_output_events(&mut self) -> bool {
+        let Some(rx) = self.output_rx.as_ref() else {
+            return false;
+        };
+
+        let mut received_output = false;
+        loop {
+            match rx.try_recv() {
+                Ok(OutputPumpEvent::Bytes(bytes)) => {
+                    self.app.advance_output(&bytes);
+                    received_output = true;
+                }
+                Ok(OutputPumpEvent::Error(error)) => {
+                    eprintln!("PTY output pump failed: {error}");
+                    break;
+                }
+                Ok(OutputPumpEvent::Eof) => break,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            }
+        }
+
+        if received_output {
+            self.update_title();
+            self.request_redraw();
+        }
+
+        received_output
+    }
+}
+
+enum OutputPumpEvent {
+    Bytes(Vec<u8>),
+    Eof,
+    Error(String),
+}
+
+fn pump_output(mut reader: PtyOutputReader, tx: mpsc::Sender<OutputPumpEvent>) {
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => {
+                let _ = tx.send(OutputPumpEvent::Eof);
+                break;
+            }
+            Ok(count) => {
+                if tx
+                    .send(OutputPumpEvent::Bytes(chunk[..count].to_vec()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(error) => {
+                let _ = tx.send(OutputPumpEvent::Error(error.to_string()));
+                break;
+            }
+        }
+    }
 }
 
 impl ApplicationHandler for GuiApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() && self.create_window(event_loop).is_err() {
+            event_loop.exit();
+            return;
+        }
+        if self.attach_output_pump().is_err() {
             event_loop.exit();
             return;
         }
@@ -291,11 +377,16 @@ impl ApplicationHandler for GuiApp {
             return;
         }
 
+        let _ = self.drain_output_events();
         self.reschedule(event_loop);
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         let _ = self.app.close_runtime();
+        self.output_rx.take();
+        if let Some(handle) = self.output_thread.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -360,5 +451,73 @@ mod tests {
         assert_eq!(gui.app.backend(), RenderBackend::Software);
         assert!(gui.renderer.is_none());
         assert_eq!(gui.gpu_fallback_error.as_deref(), Some("adapter missing"));
+    }
+
+    #[test]
+    fn output_pump_feeds_shell_output_into_render_plan() -> Result<(), Box<dyn Error>> {
+        let app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24))?;
+        let mut gui = GuiApp::new(app);
+        gui.attach_output_pump()?;
+
+        gui.app
+            .write_input(shell_command_bytes("NOCTRAIL_GUI_PUMP").as_slice())?;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut observed = false;
+        while Instant::now() < deadline {
+            if gui.drain_output_events() {
+                let frame = gui.app.frame();
+                let text = frame
+                    .render_plan
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        row.glyphs
+                            .iter()
+                            .map(|glyph| glyph.text.as_str())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if text.contains("NOCTRAIL_GUI_PUMP") {
+                    observed = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        gui.app.write_input(shell_exit_bytes().as_slice())?;
+        let _ = gui.app.close_runtime()?;
+        gui.output_rx.take();
+        if let Some(handle) = gui.output_thread.take() {
+            let _ = handle.join();
+        }
+
+        assert!(
+            observed,
+            "output pump did not feed shell output into render plan"
+        );
+        Ok(())
+    }
+
+    fn shell_command_text(marker: &str) -> String {
+        #[cfg(windows)]
+        {
+            format!("echo {marker}\r\n")
+        }
+
+        #[cfg(not(windows))]
+        {
+            format!("printf '{marker}\\n'\r")
+        }
+    }
+
+    fn shell_command_bytes(marker: &str) -> Vec<u8> {
+        shell_command_text(marker).into_bytes()
+    }
+
+    fn shell_exit_bytes() -> Vec<u8> {
+        b"exit\r\n".to_vec()
     }
 }
