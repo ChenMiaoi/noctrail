@@ -1,6 +1,8 @@
 use std::{env, path::PathBuf, process};
 
-use noctrail_pty::{PtyCommand, PtySession, PtySize, ResolvedShell};
+#[cfg(windows)]
+use noctrail_pty::ShellSource;
+use noctrail_pty::{PtySession, PtySize, ResolvedShell};
 use noctrail_render::{RenderBackend, RenderPlan, RenderRect};
 use noctrail_term::recording::replay_recording_file;
 use noctrail_term::{Cell, Color, Cursor, ScreenRowSnapshot, Style, TerminalSnapshot};
@@ -227,39 +229,87 @@ fn run_render_smoke() -> Result<(), String> {
 }
 
 fn run_pty_smoke() -> Result<(), String> {
-    let command = pty_smoke_command();
-    let mut session = PtySession::spawn(command, PtySize::new(80, 24))
-        .map_err(|error| format!("failed to spawn PTY smoke command: {error}"))?;
+    let probe = pty_smoke_probe()?;
+    let mut session = PtySession::spawn_shell(PtySize::new(80, 24))
+        .map_err(|error| format!("failed to spawn PTY shell: {error}"))?;
+    session
+        .write(&probe.input)
+        .map_err(|error| format!("failed to write PTY smoke input: {error}"))?;
     let output = read_all_output(&mut session)
         .map_err(|error| format!("failed to read PTY smoke output: {error}"))?;
     let _ = session.close();
 
     let haystack = String::from_utf8_lossy(&output);
-    if !haystack.contains("NOCTRAIL_PTY_SMOKE") {
-        return Err(format!(
-            "PTY smoke output did not contain sentinel; output was {:?}",
-            haystack
-        ));
+
+    for expected in &probe.expected_fragments {
+        if !haystack.contains(expected) {
+            return Err(format!(
+                "PTY smoke output missing {:?}; output was {:?}",
+                expected, haystack
+            ));
+        }
     }
 
     println!("pty smoke ok");
     Ok(())
 }
 
-fn pty_smoke_command() -> PtyCommand {
+struct PtySmokeProbe {
+    input: Vec<u8>,
+    expected_fragments: Vec<String>,
+}
+
+fn pty_smoke_probe() -> Result<PtySmokeProbe, String> {
+    let cwd = env::current_dir()
+        .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
+
     #[cfg(windows)]
     {
-        let program = env::var_os("COMSPEC").unwrap_or_else(|| std::ffi::OsString::from("cmd.exe"));
-        let mut command = PtyCommand::new(program);
-        command.args(["/C", "echo", "NOCTRAIL_PTY_SMOKE"]);
-        command
+        let shell = ResolvedShell::detect();
+        let cwd = cwd.display().to_string();
+
+        match shell.source() {
+            ShellSource::PathPwsh | ShellSource::PathPowerShell => Ok(PtySmokeProbe {
+                input: b"Write-Output 'NOCTRAIL_PTY_SMOKE'; (Get-Location).Path; Write-Output \"$($Host.UI.RawUI.WindowSize.Height) $($Host.UI.RawUI.WindowSize.Width)\"; exit\r".to_vec(),
+                expected_fragments: vec![
+                    "NOCTRAIL_PTY_SMOKE".to_string(),
+                    cwd,
+                    "24 80".to_string(),
+                ],
+            }),
+            ShellSource::PathWsl => Ok(PtySmokeProbe {
+                input: b"printf 'NOCTRAIL_PTY_SMOKE\n'; pwd; stty size; exit\r".to_vec(),
+                expected_fragments: vec![
+                    "NOCTRAIL_PTY_SMOKE".to_string(),
+                    cwd,
+                    "24 80".to_string(),
+                ],
+            }),
+            ShellSource::EnvComSpec | ShellSource::FallbackCmd => Ok(PtySmokeProbe {
+                input: b"echo NOCTRAIL_PTY_SMOKE\r\ncd\r\nmode con\r\nexit\r\n".to_vec(),
+                expected_fragments: vec![
+                    "NOCTRAIL_PTY_SMOKE".to_string(),
+                    cwd,
+                    "Columns:".to_string(),
+                    "Lines:".to_string(),
+                ],
+            }),
+            ShellSource::EnvShell | ShellSource::FallbackSh => Err(
+                "unexpected Unix shell source while building Windows PTY smoke probe".to_string(),
+            ),
+        }
     }
 
     #[cfg(not(windows))]
     {
-        let mut command = PtyCommand::new("sh");
-        command.args(["-lc", "printf 'NOCTRAIL_PTY_SMOKE'"]);
-        command
+        Ok(PtySmokeProbe {
+            input: b"printf 'NOCTRAIL_PTY_SMOKE\n'; pwd; stty size; exit\r".to_vec(),
+            expected_fragments: vec![
+                "NOCTRAIL_PTY_SMOKE".to_string(),
+                cwd.display().to_string(),
+                "24 80".to_string(),
+            ],
+        })
     }
 }
 
@@ -295,8 +345,9 @@ mod tests {
     }
 
     #[test]
-    fn pty_smoke_command_has_a_program() {
-        let command = pty_smoke_command();
-        assert!(!command.program().is_empty());
+    fn pty_smoke_probe_contains_sentinel() {
+        let probe = pty_smoke_probe().expect("pty smoke probe should build");
+        let script = String::from_utf8(probe.input).expect("probe input should be utf-8");
+        assert!(script.contains("NOCTRAIL_PTY_SMOKE"));
     }
 }
