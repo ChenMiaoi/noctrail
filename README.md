@@ -3,8 +3,10 @@
 Noctrail is a Rust-native terminal project being rebooted around a
 stable terminal-core-first roadmap.
 
-The active plan lives in [docs/real-plan.md](docs/real-plan.md). The old
-[docs/plan.md](docs/plan.md) file is retained only as a legacy pointer.
+The active plan lives in [docs/roadmap.md](docs/roadmap.md). The old
+[docs/plan.md](docs/plan.md) and
+[docs/real-plan.md](docs/real-plan.md) files are retained only as
+legacy pointers.
 
 ## Goals
 
@@ -26,8 +28,9 @@ crates/
   noctrail-runtime/ # pane runtime registry boundary
   noctrail-term/   # terminal state-machine boundary
 docs/
-  real-plan.md    # active restart roadmap
-  plan.md         # legacy pointer to the new roadmap
+  roadmap.md      # active engineering roadmap
+  plan.md         # legacy pointer to the active roadmap
+  real-plan.md    # legacy pointer to the active roadmap
 ```
 
 The skeleton stops here until each boundary has an owner and a test
