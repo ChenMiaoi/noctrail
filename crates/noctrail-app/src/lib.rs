@@ -7,7 +7,9 @@ mod clipboard;
 pub mod gui;
 pub mod input;
 
-use noctrail_layout::{FocusDirection, LayoutError, LayoutRect, LayoutTree, PaneLayout};
+use noctrail_layout::{
+    FocusDirection, LayoutError, LayoutRect, PaneLayout, WorkspaceId, WorkspaceSet,
+};
 use noctrail_pty::{PtyCommand, PtyError, PtyExitStatus, PtySize};
 use noctrail_render::{RenderBackend, RenderInput, RenderPlan, RenderRect};
 use noctrail_runtime::{PaneId, PaneRuntime};
@@ -315,6 +317,7 @@ impl TerminalPane {
 
 #[derive(Debug)]
 pub struct DesktopFrame {
+    pub workspace_id: WorkspaceId,
     pub pane_id: PaneId,
     pub surface: LayoutRect,
     pub terminal_size: PtySize,
@@ -327,7 +330,7 @@ pub struct DesktopApp {
     surface: LayoutRect,
     terminal_size: PtySize,
     backend: RenderBackend,
-    layout: LayoutTree,
+    workspaces: WorkspaceSet,
     panes: HashMap<PaneId, TerminalPane>,
     next_pane_id: u64,
 }
@@ -374,7 +377,11 @@ impl DesktopApp {
     }
 
     pub fn active_pane_id(&self) -> Option<PaneId> {
-        self.layout.active_pane()
+        self.workspaces.active_layout().active_pane()
+    }
+
+    pub fn active_workspace_id(&self) -> WorkspaceId {
+        self.workspaces.active_workspace()
     }
 
     pub fn pane_count(&self) -> usize {
@@ -382,7 +389,11 @@ impl DesktopApp {
     }
 
     pub fn pane_layouts(&self) -> Vec<PaneLayout> {
-        self.layout.arrange(self.surface)
+        self.workspaces.active_layout().arrange(self.surface)
+    }
+
+    pub fn workspace_ids(&self) -> Vec<WorkspaceId> {
+        self.workspaces.workspace_ids()
     }
 
     pub fn pane(&self) -> &TerminalPane {
@@ -402,11 +413,17 @@ impl DesktopApp {
     }
 
     pub fn focus_direction(&mut self, direction: FocusDirection) -> Result<PaneId, AppError> {
-        Ok(self.layout.focus_direction(direction, self.surface)?)
+        Ok(self
+            .workspaces
+            .active_layout_mut()
+            .focus_direction(direction, self.surface)?)
     }
 
     pub fn swap_active_pane(&mut self, direction: FocusDirection) -> Result<PaneId, AppError> {
-        Ok(self.layout.swap_active(direction, self.surface)?)
+        Ok(self
+            .workspaces
+            .active_layout_mut()
+            .swap_active(direction, self.surface)?)
     }
 
     pub fn resize_active_split(
@@ -414,7 +431,9 @@ impl DesktopApp {
         direction: FocusDirection,
         delta: u16,
     ) -> Result<(), AppError> {
-        self.layout.resize_active(direction, delta, self.surface)?;
+        self.workspaces
+            .active_layout_mut()
+            .resize_active(direction, delta, self.surface)?;
         self.sync_pane_terminal_sizes()
     }
 
@@ -427,7 +446,9 @@ impl DesktopApp {
         let terminal_size = self.active_pane_ref().terminal_size();
         let pane = TerminalPane::spawn(new_pane_id, command, terminal_size)?;
 
-        self.layout.split_active(new_pane_id, self.surface)?;
+        self.workspaces
+            .active_layout_mut()
+            .split_active(new_pane_id, self.surface)?;
         self.panes.insert(new_pane_id, pane);
         self.sync_pane_terminal_sizes()?;
         Ok(new_pane_id)
@@ -480,6 +501,22 @@ impl DesktopApp {
         self.active_pane_mut().clear_selection();
     }
 
+    pub fn switch_workspace(&mut self, workspace_id: WorkspaceId) -> Result<PaneId, AppError> {
+        self.workspaces.switch_to(workspace_id);
+        let active = if let Some(pane_id) = self.active_pane_id() {
+            pane_id
+        } else {
+            let pane_id = self.allocate_pane_id()?;
+            let pane = TerminalPane::spawn_shell(pane_id, self.terminal_size)?;
+            self.workspaces.active_layout_mut().insert_root(pane_id)?;
+            self.panes.insert(pane_id, pane);
+            pane_id
+        };
+
+        self.sync_pane_terminal_sizes()?;
+        Ok(active)
+    }
+
     pub fn frame(&self) -> DesktopFrame {
         let pane_id = self
             .active_pane_id()
@@ -490,6 +527,7 @@ impl DesktopApp {
 
     pub fn frame_for_pane(&self, pane_id: PaneId) -> Result<DesktopFrame, AppError> {
         let active_pane = self.active_pane_id().ok_or(AppError::MissingActivePane)?;
+        let workspace_id = self.active_workspace_id();
         let pane = self
             .pane_by_id(pane_id)
             .ok_or(AppError::PaneNotFound(pane_id))?;
@@ -501,6 +539,7 @@ impl DesktopApp {
             .ok_or(AppError::PaneNotFound(pane_id))?;
 
         Ok(DesktopFrame {
+            workspace_id,
             pane_id,
             surface: pane_surface,
             terminal_size: pane.terminal_size(),
@@ -518,6 +557,10 @@ impl DesktopApp {
             return Err(AppError::CannotCloseLastPane);
         }
 
+        if self.workspaces.active_layout().pane_count() <= 1 {
+            return Err(AppError::CannotCloseLastPane);
+        }
+
         let active = self.active_pane_id().ok_or(AppError::MissingActivePane)?;
         let status = if self
             .pane_by_id(active)
@@ -532,7 +575,8 @@ impl DesktopApp {
         };
 
         let next_active = self
-            .layout
+            .workspaces
+            .active_layout_mut()
             .close(active)?
             .ok_or(AppError::MissingActivePane)?;
         self.panes.remove(&active);
@@ -547,7 +591,7 @@ impl DesktopApp {
             surface,
             terminal_size,
             backend: RenderBackend::default(),
-            layout: LayoutTree::new(ROOT_PANE_ID),
+            workspaces: WorkspaceSet::new(ROOT_PANE_ID),
             panes,
             next_pane_id: ROOT_PANE_ID.0 + 1,
         }
@@ -567,7 +611,8 @@ impl DesktopApp {
 
     fn active_pane_ref(&self) -> &TerminalPane {
         let pane_id = self
-            .layout
+            .workspaces
+            .active_layout()
             .active_pane()
             .expect("desktop app should always have an active pane");
         self.panes
@@ -577,7 +622,8 @@ impl DesktopApp {
 
     fn active_pane_mut(&mut self) -> &mut TerminalPane {
         let pane_id = self
-            .layout
+            .workspaces
+            .active_layout()
             .active_pane()
             .expect("desktop app should always have an active pane");
         self.panes
@@ -739,10 +785,13 @@ mod tests {
     fn shellless_app_builds_single_pane_frame() {
         let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
 
+        assert_eq!(app.active_workspace_id(), WorkspaceId::new(1));
+        assert_eq!(app.workspace_ids(), vec![WorkspaceId::new(1)]);
         assert_eq!(app.active_pane_id(), Some(PaneId::new(1)));
         assert_eq!(app.pane_count(), 1);
         assert_eq!(app.pane_layouts().len(), 1);
         let frame = app.frame();
+        assert_eq!(frame.workspace_id, WorkspaceId::new(1));
         assert_eq!(frame.pane_id, PaneId::new(1));
         assert_eq!(frame.surface, LayoutRect::new(0, 0, 120, 80));
         assert_eq!(frame.terminal_size, PtySize::new(10, 3));
@@ -950,6 +999,65 @@ mod tests {
             .close_runtime()?;
         assert!(root_status.is_some());
         assert!(split_status.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn switching_workspaces_creates_and_preserves_independent_session_sets()
+    -> Result<(), Box<dyn StdError>> {
+        let mut app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4))?;
+        let workspace_one_pane = app.active_pane_id().expect("workspace 1 pane should exist");
+        let workspace_one_pid = app
+            .pane_by_id(workspace_one_pane)
+            .and_then(TerminalPane::process_id)
+            .expect("workspace 1 shell should have a process id");
+
+        let workspace_two_pane = app.switch_workspace(WorkspaceId::new(2))?;
+        let workspace_two_pid = app
+            .pane_by_id(workspace_two_pane)
+            .and_then(TerminalPane::process_id)
+            .expect("workspace 2 shell should have a process id");
+
+        assert_eq!(app.active_workspace_id(), WorkspaceId::new(2));
+        assert_ne!(workspace_one_pane, workspace_two_pane);
+        assert_ne!(workspace_one_pid, workspace_two_pid);
+        assert_eq!(
+            app.workspace_ids(),
+            vec![WorkspaceId::new(1), WorkspaceId::new(2)]
+        );
+
+        let switched_back = app.switch_workspace(WorkspaceId::new(1))?;
+        assert_eq!(switched_back, workspace_one_pane);
+        assert_eq!(app.active_workspace_id(), WorkspaceId::new(1));
+        assert_eq!(app.active_pane_id(), Some(workspace_one_pane));
+        assert_eq!(
+            app.pane_by_id(workspace_one_pane)
+                .and_then(TerminalPane::process_id),
+            Some(workspace_one_pid)
+        );
+
+        let first_frame = app.frame();
+        assert_eq!(first_frame.workspace_id, WorkspaceId::new(1));
+
+        let workspace_two = app.switch_workspace(WorkspaceId::new(2))?;
+        assert_eq!(workspace_two, workspace_two_pane);
+        assert_eq!(
+            app.pane_by_id(workspace_two_pane)
+                .and_then(TerminalPane::process_id),
+            Some(workspace_two_pid)
+        );
+        assert_eq!(app.frame().workspace_id, WorkspaceId::new(2));
+
+        let first_status = app
+            .pane_mut_by_id(workspace_one_pane)
+            .ok_or(AppError::PaneNotFound(workspace_one_pane))?
+            .close_runtime()?;
+        let second_status = app
+            .pane_mut_by_id(workspace_two_pane)
+            .ok_or(AppError::PaneNotFound(workspace_two_pane))?
+            .close_runtime()?;
+        assert!(first_status.is_some());
+        assert!(second_status.is_some());
         Ok(())
     }
 

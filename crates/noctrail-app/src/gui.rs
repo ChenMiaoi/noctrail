@@ -717,6 +717,7 @@ impl ApplicationHandler for GuiApp {
 mod tests {
     use super::*;
     use crate::DesktopFrame;
+    use noctrail_layout::WorkspaceId;
     use noctrail_render::{RenderBackend, RenderPlan, RenderRect};
     use noctrail_runtime::PaneId;
 
@@ -735,6 +736,7 @@ mod tests {
     #[test]
     fn frame_title_reflects_state() {
         let frame = DesktopFrame {
+            workspace_id: WorkspaceId::new(1),
             pane_id: PaneId::new(7),
             surface: LayoutRect::new(0, 0, 120, 80),
             terminal_size: PtySize::new(80, 24),

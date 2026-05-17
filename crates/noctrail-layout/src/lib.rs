@@ -5,6 +5,38 @@ use std::collections::HashMap;
 use noctrail_runtime::PaneId;
 use thiserror::Error;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WorkspaceId(pub u8);
+
+impl WorkspaceId {
+    pub const MIN: u8 = 1;
+    pub const MAX: u8 = 9;
+
+    pub const fn new(raw: u8) -> Self {
+        Self(raw)
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum WorkspaceError {
+    #[error("workspace id {0} is outside the supported 1..9 range")]
+    InvalidWorkspaceId(u8),
+}
+
+impl TryFrom<u8> for WorkspaceId {
+    type Error = WorkspaceError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if (Self::MIN..=Self::MAX).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(WorkspaceError::InvalidWorkspaceId(value))
+        }
+    }
+}
+
+pub const DEFAULT_WORKSPACE_ID: WorkspaceId = WorkspaceId(1);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitAxis {
     Horizontal,
@@ -611,6 +643,66 @@ impl Default for LayoutTree {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSet {
+    active: WorkspaceId,
+    layouts: HashMap<WorkspaceId, LayoutTree>,
+}
+
+impl WorkspaceSet {
+    pub fn new(root_pane: PaneId) -> Self {
+        let mut layouts = HashMap::new();
+        layouts.insert(DEFAULT_WORKSPACE_ID, LayoutTree::new(root_pane));
+        Self {
+            active: DEFAULT_WORKSPACE_ID,
+            layouts,
+        }
+    }
+
+    pub fn active_workspace(&self) -> WorkspaceId {
+        self.active
+    }
+
+    pub fn contains_workspace(&self, workspace_id: WorkspaceId) -> bool {
+        self.layouts.contains_key(&workspace_id)
+    }
+
+    pub fn workspace_ids(&self) -> Vec<WorkspaceId> {
+        let mut ids = self.layouts.keys().copied().collect::<Vec<_>>();
+        ids.sort_by_key(|id| id.0);
+        ids
+    }
+
+    pub fn layout(&self, workspace_id: WorkspaceId) -> Option<&LayoutTree> {
+        self.layouts.get(&workspace_id)
+    }
+
+    pub fn layout_mut(&mut self, workspace_id: WorkspaceId) -> Option<&mut LayoutTree> {
+        self.layouts.get_mut(&workspace_id)
+    }
+
+    pub fn active_layout(&self) -> &LayoutTree {
+        self.layouts
+            .get(&self.active)
+            .expect("active workspace should always have a layout entry")
+    }
+
+    pub fn active_layout_mut(&mut self) -> &mut LayoutTree {
+        self.layouts
+            .get_mut(&self.active)
+            .expect("active workspace should always have a layout entry")
+    }
+
+    pub fn switch_to(&mut self, workspace_id: WorkspaceId) -> bool {
+        let existed = self.layouts.contains_key(&workspace_id);
+        self.layouts
+            .entry(workspace_id)
+            .or_insert_with(LayoutTree::empty);
+        self.active = workspace_id;
+        existed
+    }
+}
+
 fn clamp_split_dimension(total: u16, preferred: u16) -> u16 {
     if total <= 1 {
         return total;
@@ -907,6 +999,51 @@ mod tests {
         assert!(matches!(
             tree.insert_root(PaneId::new(2)),
             Err(LayoutError::RootAlreadyPresent)
+        ));
+    }
+
+    #[test]
+    fn workspace_switch_keeps_independent_layout_trees() {
+        let mut workspaces = WorkspaceSet::new(PaneId::new(1));
+        let surface = LayoutRect::new(0, 0, 120, 40);
+        workspaces
+            .active_layout_mut()
+            .split_active(PaneId::new(2), surface)
+            .expect("split should succeed");
+
+        assert_eq!(workspaces.active_workspace(), WorkspaceId::new(1));
+        assert_eq!(workspaces.active_layout().pane_count(), 2);
+
+        let existed = workspaces.switch_to(WorkspaceId::new(2));
+        assert!(!existed);
+        assert_eq!(workspaces.active_layout().pane_count(), 0);
+
+        workspaces
+            .active_layout_mut()
+            .insert_root(PaneId::new(10))
+            .expect("root insert should succeed");
+        assert_eq!(workspaces.active_layout().pane_count(), 1);
+
+        let existed = workspaces.switch_to(WorkspaceId::new(1));
+        assert!(existed);
+        assert_eq!(workspaces.active_layout().pane_count(), 2);
+        assert_eq!(
+            workspaces.active_layout().active_pane(),
+            Some(PaneId::new(2))
+        );
+    }
+
+    #[test]
+    fn workspace_ids_are_limited_to_one_through_nine() {
+        assert!(WorkspaceId::try_from(1).is_ok());
+        assert!(WorkspaceId::try_from(9).is_ok());
+        assert!(matches!(
+            WorkspaceId::try_from(0),
+            Err(WorkspaceError::InvalidWorkspaceId(0))
+        ));
+        assert!(matches!(
+            WorkspaceId::try_from(10),
+            Err(WorkspaceError::InvalidWorkspaceId(10))
         ));
     }
 }
