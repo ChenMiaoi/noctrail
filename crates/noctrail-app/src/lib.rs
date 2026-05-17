@@ -11,7 +11,10 @@ use noctrail_layout::LayoutRect;
 use noctrail_pty::{PtyCommand, PtyError, PtyExitStatus, PtySize};
 use noctrail_render::{RenderBackend, RenderInput, RenderPlan, RenderRect};
 use noctrail_runtime::{PaneId, PaneRuntime};
-use noctrail_term::{DamageSet, LineEnding, TerminalSnapshot, TerminalState};
+use noctrail_term::{
+    Cursor, DamageSet, LineEnding, MouseTrackingMode, Position, Selection, SelectionMode,
+    TerminalSnapshot, TerminalState,
+};
 use thiserror::Error;
 
 const ROOT_PANE_ID: PaneId = PaneId::new(1);
@@ -29,6 +32,7 @@ pub struct TerminalPane {
     terminal: TerminalState,
     runtime: Option<PaneRuntime>,
     terminal_size: PtySize,
+    scrollback_offset: usize,
     last_damage: DamageSet,
 }
 
@@ -56,6 +60,7 @@ impl TerminalPane {
             terminal,
             runtime: None,
             terminal_size,
+            scrollback_offset: 0,
             last_damage: full_frame_damage(terminal_size),
         }
     }
@@ -77,6 +82,7 @@ impl TerminalPane {
             terminal,
             runtime: Some(runtime),
             terminal_size,
+            scrollback_offset: 0,
             last_damage: full_frame_damage(terminal_size),
         })
     }
@@ -117,6 +123,18 @@ impl TerminalPane {
         self.terminal.bracketed_paste_mode()
     }
 
+    pub fn mouse_tracking_mode(&self) -> MouseTrackingMode {
+        self.terminal.mouse_tracking_mode()
+    }
+
+    pub fn mouse_reporting_enabled(&self) -> bool {
+        self.terminal.mouse_reporting_enabled()
+    }
+
+    pub fn sgr_mouse_mode(&self) -> bool {
+        self.terminal.sgr_mouse_mode()
+    }
+
     pub fn copy_selection_text(&self) -> Option<String> {
         self.terminal.selection_text(selection_line_ending())
     }
@@ -131,6 +149,7 @@ impl TerminalPane {
 
     pub fn advance_output(&mut self, bytes: &[u8]) {
         self.last_damage = self.terminal.advance_bytes(bytes).damage;
+        self.clamp_scrollback_offset();
     }
 
     pub fn write_input(&mut self, bytes: &[u8]) -> Result<usize, AppError> {
@@ -151,6 +170,7 @@ impl TerminalPane {
         self.terminal
             .resize(usize::from(size.cols), usize::from(size.rows));
         self.terminal_size = size;
+        self.clamp_scrollback_offset();
         self.last_damage = full_frame_damage(size);
         let _ = self.terminal.grid_mut().take_dirty_rows();
         Ok(())
@@ -160,8 +180,47 @@ impl TerminalPane {
         self.terminal.snapshot()
     }
 
-    pub fn render_plan(&self, surface: LayoutRect, backend: RenderBackend) -> RenderPlan {
+    pub fn scrollback_offset(&self) -> usize {
+        self.scrollback_offset
+    }
+
+    pub fn scroll_scrollback(&mut self, delta_lines: i32) {
         let snapshot = self.snapshot();
+        let max_offset = max_scrollback_offset(&snapshot);
+        let next_offset = if delta_lines >= 0 {
+            self.scrollback_offset
+                .saturating_add(delta_lines as usize)
+                .min(max_offset)
+        } else {
+            self.scrollback_offset
+                .saturating_sub(delta_lines.unsigned_abs() as usize)
+        };
+
+        if next_offset != self.scrollback_offset {
+            self.scrollback_offset = next_offset;
+            self.last_damage = full_frame_damage(self.terminal_size);
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        if self.terminal.selection().is_some() {
+            self.terminal.clear_selection();
+            self.last_damage = full_frame_damage(self.terminal_size);
+        }
+    }
+
+    pub fn select_viewport_range(&mut self, start: Position, end: Position, mode: SelectionMode) {
+        let Some(selection) = self.viewport_selection(start, end, mode) else {
+            self.clear_selection();
+            return;
+        };
+
+        self.terminal.set_selection(Some(selection));
+        self.last_damage = full_frame_damage(self.terminal_size);
+    }
+
+    pub fn render_plan(&self, surface: LayoutRect, backend: RenderBackend) -> RenderPlan {
+        let snapshot = self.render_snapshot();
         RenderPlan::from_input(RenderInput {
             viewport: RenderRect::new(
                 usize::from(surface.x),
@@ -179,6 +238,63 @@ impl TerminalPane {
     pub fn close_runtime(&mut self) -> Result<Option<PtyExitStatus>, AppError> {
         let runtime = self.runtime.take().ok_or(AppError::MissingRuntime)?;
         runtime.close().map_err(AppError::from)
+    }
+
+    fn clamp_scrollback_offset(&mut self) {
+        let snapshot = self.snapshot();
+        self.scrollback_offset = self.scrollback_offset.min(max_scrollback_offset(&snapshot));
+    }
+
+    fn render_snapshot(&self) -> TerminalSnapshot {
+        let snapshot = self.snapshot();
+        let scrollback_offset = self.scrollback_offset.min(max_scrollback_offset(&snapshot));
+        if scrollback_offset == 0 || snapshot.alternate_screen {
+            return snapshot;
+        }
+
+        let all_rows = collect_all_rows(&snapshot);
+        let visible_range = visible_row_range(
+            &snapshot,
+            usize::from(self.terminal_size.rows),
+            scrollback_offset,
+        );
+        let cursor = remap_cursor(snapshot.cursor, snapshot.scrollback.len(), &visible_range);
+        let selection = snapshot
+            .selection
+            .as_ref()
+            .and_then(|selection| remap_selection(selection, &visible_range));
+
+        TerminalSnapshot {
+            rows: all_rows[visible_range.start..visible_range.end].to_vec(),
+            scrollback: all_rows[..visible_range.start].to_vec(),
+            cursor,
+            alternate_screen: snapshot.alternate_screen,
+            bracketed_paste: snapshot.bracketed_paste,
+            selection,
+        }
+    }
+
+    fn viewport_selection(
+        &self,
+        start: Position,
+        end: Position,
+        mode: SelectionMode,
+    ) -> Option<Selection> {
+        let snapshot = self.snapshot();
+        let visible_range = visible_row_range(
+            &snapshot,
+            usize::from(self.terminal_size.rows),
+            self.scrollback_offset,
+        );
+        if visible_range.is_empty() {
+            return None;
+        }
+
+        Some(Selection {
+            mode,
+            start: viewport_to_terminal_position(start, &visible_range, self.terminal_size),
+            end: viewport_to_terminal_position(end, &visible_range, self.terminal_size),
+        })
     }
 }
 
@@ -263,10 +379,34 @@ impl DesktopApp {
         self.pane.copy_selection_text()
     }
 
+    pub fn mouse_tracking_mode(&self) -> MouseTrackingMode {
+        self.pane.mouse_tracking_mode()
+    }
+
+    pub fn mouse_reporting_enabled(&self) -> bool {
+        self.pane.mouse_reporting_enabled()
+    }
+
+    pub fn sgr_mouse_mode(&self) -> bool {
+        self.pane.sgr_mouse_mode()
+    }
+
     pub fn resize(&mut self, surface: LayoutRect, terminal_size: PtySize) -> Result<(), AppError> {
         self.pane.resize(terminal_size)?;
         self.surface = surface;
         Ok(())
+    }
+
+    pub fn scroll_scrollback(&mut self, delta_lines: i32) {
+        self.pane.scroll_scrollback(delta_lines);
+    }
+
+    pub fn select_viewport_range(&mut self, start: Position, end: Position, mode: SelectionMode) {
+        self.pane.select_viewport_range(start, end, mode);
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.pane.clear_selection();
     }
 
     pub fn frame(&self) -> DesktopFrame {
@@ -297,6 +437,93 @@ fn full_frame_damage(size: PtySize) -> DamageSet {
         dirty_rows: (0..usize::from(size.rows)).collect(),
         full_frame: true,
     }
+}
+
+fn collect_all_rows(snapshot: &TerminalSnapshot) -> Vec<noctrail_term::ScreenRowSnapshot> {
+    let mut rows = snapshot.scrollback.clone();
+    rows.extend(snapshot.rows.clone());
+    rows
+}
+
+fn max_scrollback_offset(snapshot: &TerminalSnapshot) -> usize {
+    snapshot.scrollback.len()
+}
+
+fn visible_row_range(
+    snapshot: &TerminalSnapshot,
+    visible_height: usize,
+    scrollback_offset: usize,
+) -> std::ops::Range<usize> {
+    let total_rows = snapshot.scrollback.len() + snapshot.rows.len();
+    let end = total_rows.saturating_sub(scrollback_offset.min(max_scrollback_offset(snapshot)));
+    let start = end.saturating_sub(visible_height.max(1));
+    start..end
+}
+
+fn viewport_to_terminal_position(
+    position: Position,
+    visible_range: &std::ops::Range<usize>,
+    terminal_size: PtySize,
+) -> Position {
+    Position {
+        row: visible_range.start.saturating_add(
+            position
+                .row
+                .min(usize::from(terminal_size.rows).saturating_sub(1)),
+        ),
+        col: position
+            .col
+            .min(usize::from(terminal_size.cols).saturating_sub(1)),
+    }
+}
+
+fn remap_cursor(
+    cursor: Cursor,
+    scrollback_rows: usize,
+    visible_range: &std::ops::Range<usize>,
+) -> Cursor {
+    let global_row = scrollback_rows.saturating_add(cursor.row);
+    if visible_range.contains(&global_row) {
+        Cursor {
+            row: global_row - visible_range.start,
+            col: cursor.col,
+        }
+    } else {
+        Cursor {
+            row: usize::MAX,
+            col: cursor.col,
+        }
+    }
+}
+
+fn remap_selection(
+    selection: &Selection,
+    visible_range: &std::ops::Range<usize>,
+) -> Option<Selection> {
+    let selection = selection.clone().normalized();
+    if selection.end.row < visible_range.start || selection.start.row >= visible_range.end {
+        return None;
+    }
+
+    Some(Selection {
+        mode: selection.mode,
+        start: Position {
+            row: selection
+                .start
+                .row
+                .clamp(visible_range.start, visible_range.end - 1)
+                - visible_range.start,
+            col: selection.start.col,
+        },
+        end: Position {
+            row: selection
+                .end
+                .row
+                .clamp(visible_range.start, visible_range.end - 1)
+                - visible_range.start,
+            col: selection.end.col,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -348,6 +575,54 @@ mod tests {
         assert!(frame.render_plan.active);
         assert_eq!(frame.render_plan.damage.dirty_rows, vec![0, 1, 2, 3]);
         Ok(())
+    }
+
+    #[test]
+    fn scrollback_offset_changes_visible_render_rows() {
+        let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(8, 2));
+
+        app.advance_output(b"one\r\ntwo\r\nthree");
+        let live_frame = app.frame();
+        assert_eq!(render_row_text(&live_frame.render_plan.rows[0]), "two");
+        assert_eq!(render_row_text(&live_frame.render_plan.rows[1]), "three");
+
+        app.scroll_scrollback(1);
+        let scrolled_frame = app.frame();
+        assert_eq!(render_row_text(&scrolled_frame.render_plan.rows[0]), "one");
+        assert_eq!(render_row_text(&scrolled_frame.render_plan.rows[1]), "two");
+        assert!(scrolled_frame.render_plan.damage.full_frame);
+    }
+
+    #[test]
+    fn viewport_selection_maps_through_scrollback() {
+        let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(8, 2));
+
+        app.advance_output(b"one\r\ntwo\r\nthree");
+        app.scroll_scrollback(1);
+        app.select_viewport_range(
+            Position { row: 0, col: 0 },
+            Position { row: 1, col: 2 },
+            SelectionMode::Normal,
+        );
+
+        assert_eq!(app.copy_selection_text().as_deref(), Some("one     \ntwo"));
+        let frame = app.frame();
+        assert!(frame.render_plan.selection.is_some());
+    }
+
+    #[test]
+    fn mouse_modes_surface_from_terminal_state() {
+        let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(8, 2));
+
+        assert!(!app.mouse_reporting_enabled());
+        assert_eq!(app.mouse_tracking_mode(), MouseTrackingMode::Disabled);
+        assert!(!app.sgr_mouse_mode());
+
+        app.advance_output(b"\x1b[?1002h\x1b[?1006h");
+
+        assert!(app.mouse_reporting_enabled());
+        assert_eq!(app.mouse_tracking_mode(), MouseTrackingMode::Drag);
+        assert!(app.sgr_mouse_mode());
     }
 
     #[test]
@@ -437,6 +712,13 @@ mod tests {
 
     fn shell_exit_bytes() -> Vec<u8> {
         b"exit\r\n".to_vec()
+    }
+
+    fn render_row_text(row: &noctrail_render::RenderRow) -> String {
+        row.glyphs
+            .iter()
+            .map(|glyph| glyph.text.as_str())
+            .collect::<String>()
     }
 
     #[cfg(not(windows))]

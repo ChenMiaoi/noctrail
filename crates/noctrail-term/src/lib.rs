@@ -118,6 +118,15 @@ impl LineEnding {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MouseTrackingMode {
+    #[default]
+    Disabled,
+    Press,
+    Drag,
+    Motion,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Selection {
     pub mode: SelectionMode,
@@ -608,6 +617,8 @@ pub struct TerminalState {
     saved_primary: Option<SavedState>,
     saved_alternate: Option<SavedState>,
     bracketed_paste: bool,
+    mouse_tracking: MouseTrackingMode,
+    mouse_reporting_sgr: bool,
     selection: Option<Selection>,
     parser: Parser,
     pending_scroll: bool,
@@ -624,6 +635,8 @@ impl TerminalState {
             saved_primary: None,
             saved_alternate: None,
             bracketed_paste: false,
+            mouse_tracking: MouseTrackingMode::Disabled,
+            mouse_reporting_sgr: false,
             selection: None,
             parser: Parser::new(),
             pending_scroll: false,
@@ -711,6 +724,18 @@ impl TerminalState {
 
     pub fn set_bracketed_paste_mode(&mut self, enabled: bool) {
         self.bracketed_paste = enabled;
+    }
+
+    pub fn mouse_tracking_mode(&self) -> MouseTrackingMode {
+        self.mouse_tracking
+    }
+
+    pub fn mouse_reporting_enabled(&self) -> bool {
+        self.mouse_tracking != MouseTrackingMode::Disabled
+    }
+
+    pub fn sgr_mouse_mode(&self) -> bool {
+        self.mouse_reporting_sgr
     }
 
     pub fn selection_text(&self, line_ending: LineEnding) -> Option<String> {
@@ -1018,7 +1043,17 @@ impl TerminalState {
         self.saved_primary = None;
         self.saved_alternate = None;
         self.bracketed_paste = false;
+        self.mouse_tracking = MouseTrackingMode::Disabled;
+        self.mouse_reporting_sgr = false;
         self.selection = None;
+    }
+
+    fn set_mouse_tracking_mode(&mut self, mode: MouseTrackingMode) {
+        self.mouse_tracking = mode;
+    }
+
+    fn set_sgr_mouse_mode(&mut self, enabled: bool) {
+        self.mouse_reporting_sgr = enabled;
     }
 
     fn has_private_mode(intermediates: &[u8]) -> bool {
@@ -1188,6 +1223,22 @@ impl Perform for TerminalPerform<'_> {
                 match (mode, action) {
                     (47 | 1047 | 1049, 'h') => self.state.enter_alternate_screen(),
                     (47 | 1047 | 1049, 'l') => self.state.exit_alternate_screen(),
+                    (1000, 'h') => self.state.set_mouse_tracking_mode(MouseTrackingMode::Press),
+                    (1000, 'l') => self
+                        .state
+                        .set_mouse_tracking_mode(MouseTrackingMode::Disabled),
+                    (1002, 'h') => self.state.set_mouse_tracking_mode(MouseTrackingMode::Drag),
+                    (1002, 'l') => self
+                        .state
+                        .set_mouse_tracking_mode(MouseTrackingMode::Disabled),
+                    (1003, 'h') => self
+                        .state
+                        .set_mouse_tracking_mode(MouseTrackingMode::Motion),
+                    (1003, 'l') => self
+                        .state
+                        .set_mouse_tracking_mode(MouseTrackingMode::Disabled),
+                    (1006, 'h') => self.state.set_sgr_mouse_mode(true),
+                    (1006, 'l') => self.state.set_sgr_mouse_mode(false),
                     (2004, 'h') => self.state.set_bracketed_paste_mode(true),
                     (2004, 'l') => self.state.set_bracketed_paste_mode(false),
                     (1048, 'h') => self.state.save_cursor(),
@@ -1277,6 +1328,31 @@ mod tests {
         assert!(terminal.bracketed_paste_mode());
         terminal.advance_bytes(b"\x1b[?2004l");
         assert!(!terminal.bracketed_paste_mode());
+    }
+
+    #[test]
+    fn mouse_tracking_modes_follow_private_csi_sequences() {
+        let mut terminal = TerminalState::new(4, 1);
+
+        assert_eq!(terminal.mouse_tracking_mode(), MouseTrackingMode::Disabled);
+        assert!(!terminal.sgr_mouse_mode());
+
+        terminal.advance_bytes(b"\x1b[?1000h");
+        assert_eq!(terminal.mouse_tracking_mode(), MouseTrackingMode::Press);
+
+        terminal.advance_bytes(b"\x1b[?1002h");
+        assert_eq!(terminal.mouse_tracking_mode(), MouseTrackingMode::Drag);
+
+        terminal.advance_bytes(b"\x1b[?1003h");
+        assert_eq!(terminal.mouse_tracking_mode(), MouseTrackingMode::Motion);
+
+        terminal.advance_bytes(b"\x1b[?1006h");
+        assert!(terminal.sgr_mouse_mode());
+
+        terminal.advance_bytes(b"\x1b[?1003l");
+        terminal.advance_bytes(b"\x1b[?1006l");
+        assert_eq!(terminal.mouse_tracking_mode(), MouseTrackingMode::Disabled);
+        assert!(!terminal.sgr_mouse_mode());
     }
 
     #[test]

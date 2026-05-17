@@ -10,10 +10,11 @@ use std::{
 use noctrail_layout::LayoutRect;
 use noctrail_pty::{PtyOutputReader, PtySize};
 use noctrail_render::GpuRenderer;
+use noctrail_term::{MouseTrackingMode, Position, SelectionMode};
 use winit::{
     application::ApplicationHandler,
-    dpi::{LogicalSize, PhysicalSize},
-    event::{Ime, WindowEvent},
+    dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize},
+    event::{ElementState, Ime, MouseButton as WinitMouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::ModifiersState,
     window::{Window, WindowId},
@@ -87,12 +88,21 @@ fn saturating_u32_to_u16(value: u32) -> u16 {
     value.min(u16::MAX as u32) as u16
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MouseSelectionDrag {
+    anchor: Position,
+    cursor: Position,
+}
+
 struct GuiApp {
     app: DesktopApp,
     window: Option<Arc<Window>>,
     renderer: Option<GpuRenderer>,
     gpu_fallback_error: Option<String>,
     ime_preedit: Option<String>,
+    mouse_position: Option<PhysicalPosition<f64>>,
+    mouse_selection: Option<MouseSelectionDrag>,
+    mouse_button: Option<input::MouseButton>,
     output_rx: Option<Receiver<OutputPumpEvent>>,
     output_thread: Option<JoinHandle<()>>,
     next_frame_at: Instant,
@@ -111,6 +121,9 @@ impl GuiApp {
             renderer: None,
             gpu_fallback_error: None,
             ime_preedit: None,
+            mouse_position: None,
+            mouse_selection: None,
+            mouse_button: None,
             output_rx: None,
             output_thread: None,
             next_frame_at: now,
@@ -267,6 +280,164 @@ impl GuiApp {
             }
         }
     }
+
+    fn cell_position_at(&self, position: PhysicalPosition<f64>) -> Option<Position> {
+        let logical = if let Some(window) = self.window.as_ref() {
+            position.to_logical::<f64>(window.scale_factor())
+        } else {
+            LogicalPosition::new(position.x, position.y)
+        };
+        if logical.x.is_sign_negative() || logical.y.is_sign_negative() {
+            return None;
+        }
+
+        let terminal_size = self.app.pane().terminal_size();
+        let col = (logical.x / f64::from(DEFAULT_CELL_WIDTH)).floor() as usize;
+        let row = (logical.y / f64::from(DEFAULT_CELL_HEIGHT)).floor() as usize;
+        if row >= usize::from(terminal_size.rows) || col >= usize::from(terminal_size.cols) {
+            return None;
+        }
+
+        Some(Position { row, col })
+    }
+
+    fn handle_cursor_moved(
+        &mut self,
+        position: PhysicalPosition<f64>,
+    ) -> Result<(), Box<dyn Error>> {
+        self.mouse_position = Some(position);
+
+        if self.app.mouse_reporting_enabled() {
+            if self.app.mouse_tracking_mode() == MouseTrackingMode::Motion
+                && self.mouse_button.is_none()
+                && let Some(cell) = self.cell_position_at(position)
+            {
+                self.write_mouse_report(input::MouseReportKind::Move, cell)?;
+            } else if matches!(
+                self.app.mouse_tracking_mode(),
+                MouseTrackingMode::Drag | MouseTrackingMode::Motion
+            ) && let (Some(button), Some(cell)) =
+                (self.mouse_button, self.cell_position_at(position))
+            {
+                self.write_mouse_report(input::MouseReportKind::Drag(button), cell)?;
+            }
+            return Ok(());
+        }
+
+        let cell = self.cell_position_at(position);
+        if let (Some(selection), Some(cell)) = (self.mouse_selection.as_mut(), cell) {
+            selection.cursor = cell;
+            self.app.select_viewport_range(
+                selection.anchor,
+                selection.cursor,
+                SelectionMode::Normal,
+            );
+            self.request_redraw();
+            self.update_title();
+        }
+
+        Ok(())
+    }
+
+    fn handle_mouse_input(
+        &mut self,
+        state: ElementState,
+        button: WinitMouseButton,
+    ) -> Result<(), Box<dyn Error>> {
+        let button = mouse_button(button);
+        let Some(button) = button else {
+            return Ok(());
+        };
+
+        let cell = self
+            .mouse_position
+            .and_then(|position| self.cell_position_at(position));
+
+        if self.app.mouse_reporting_enabled() {
+            self.app.clear_selection();
+            self.mouse_selection = None;
+            match state {
+                ElementState::Pressed => {
+                    self.mouse_button = Some(button);
+                    if let Some(cell) = cell {
+                        self.write_mouse_report(input::MouseReportKind::Press(button), cell)?;
+                    }
+                }
+                ElementState::Released => {
+                    self.mouse_button = None;
+                    if let Some(cell) = cell {
+                        self.write_mouse_report(input::MouseReportKind::Release(button), cell)?;
+                    }
+                }
+            }
+            self.request_redraw();
+            self.update_title();
+            return Ok(());
+        }
+
+        if button != input::MouseButton::Left {
+            return Ok(());
+        }
+
+        match state {
+            ElementState::Pressed => {
+                if let Some(cell) = cell {
+                    self.mouse_selection = Some(MouseSelectionDrag {
+                        anchor: cell,
+                        cursor: cell,
+                    });
+                    self.app
+                        .select_viewport_range(cell, cell, SelectionMode::Normal);
+                    self.request_redraw();
+                    self.update_title();
+                }
+            }
+            ElementState::Released => {
+                self.mouse_selection = None;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) -> Result<(), Box<dyn Error>> {
+        let lines = scroll_lines(delta);
+        if lines == 0 {
+            return Ok(());
+        }
+
+        if self.app.mouse_reporting_enabled() {
+            if let Some(cell) = self
+                .mouse_position
+                .and_then(|position| self.cell_position_at(position))
+            {
+                let kind = if lines > 0 {
+                    input::MouseReportKind::WheelUp
+                } else {
+                    input::MouseReportKind::WheelDown
+                };
+                for _ in 0..lines.unsigned_abs() {
+                    self.write_mouse_report(kind, cell)?;
+                }
+            }
+        } else {
+            self.app.scroll_scrollback(lines);
+            self.request_redraw();
+            self.update_title();
+        }
+
+        Ok(())
+    }
+
+    fn write_mouse_report(
+        &mut self,
+        kind: input::MouseReportKind,
+        cell: Position,
+    ) -> Result<(), Box<dyn Error>> {
+        let bytes = input::mouse_report_bytes(kind, cell.row, cell.col, self.app.sgr_mouse_mode());
+        self.app.write_input(&bytes)?;
+        Ok(())
+    }
 }
 
 enum OutputPumpEvent {
@@ -294,6 +465,29 @@ fn pump_output(mut reader: PtyOutputReader, tx: mpsc::Sender<OutputPumpEvent>) {
             Err(error) => {
                 let _ = tx.send(OutputPumpEvent::Error(error.to_string()));
                 break;
+            }
+        }
+    }
+}
+
+fn mouse_button(button: WinitMouseButton) -> Option<input::MouseButton> {
+    match button {
+        WinitMouseButton::Left => Some(input::MouseButton::Left),
+        WinitMouseButton::Middle => Some(input::MouseButton::Middle),
+        WinitMouseButton::Right => Some(input::MouseButton::Right),
+        _ => None,
+    }
+}
+
+fn scroll_lines(delta: MouseScrollDelta) -> i32 {
+    match delta {
+        MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
+        MouseScrollDelta::PixelDelta(delta) => {
+            let lines = delta.y / f64::from(DEFAULT_CELL_HEIGHT);
+            if lines.abs() >= 1.0 {
+                lines.round() as i32
+            } else {
+                delta.y.signum() as i32
             }
         }
     }
@@ -334,6 +528,21 @@ impl ApplicationHandler for GuiApp {
             }
             WindowEvent::Ime(ime) => {
                 if self.handle_ime_event(ime).is_err() {
+                    event_loop.exit();
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if self.handle_cursor_moved(position).is_err() {
+                    event_loop.exit();
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if self.handle_mouse_input(state, button).is_err() {
+                    event_loop.exit();
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if self.handle_mouse_wheel(delta).is_err() {
                     event_loop.exit();
                 }
             }
@@ -501,6 +710,40 @@ mod tests {
     }
 
     #[test]
+    fn mouse_drag_updates_selection() -> Result<(), Box<dyn Error>> {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(8, 2));
+        let mut gui = GuiApp::new(app);
+        gui.app.advance_output(b"hello");
+
+        gui.handle_cursor_moved(PhysicalPosition::new(1.0, 1.0))?;
+        gui.handle_mouse_input(ElementState::Pressed, WinitMouseButton::Left)?;
+        gui.handle_cursor_moved(PhysicalPosition::new(25.0, 1.0))?;
+        gui.handle_mouse_input(ElementState::Released, WinitMouseButton::Left)?;
+
+        assert_eq!(gui.app.copy_selection_text().as_deref(), Some("hell"));
+        assert!(gui.app.frame().render_plan.selection.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn wheel_scroll_moves_scrollback_view() -> Result<(), Box<dyn Error>> {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(8, 2));
+        let mut gui = GuiApp::new(app);
+        gui.app.advance_output(b"one\r\ntwo\r\nthree");
+
+        gui.handle_mouse_wheel(MouseScrollDelta::LineDelta(0.0, 1.0))?;
+        let scrolled = rendered_text(&gui.app.frame());
+        assert!(scrolled.contains("one"));
+        assert!(scrolled.contains("two"));
+
+        gui.handle_mouse_wheel(MouseScrollDelta::LineDelta(0.0, -1.0))?;
+        let live = rendered_text(&gui.app.frame());
+        assert!(live.contains("two"));
+        assert!(live.contains("three"));
+        Ok(())
+    }
+
+    #[test]
     fn output_pump_feeds_shell_output_into_render_plan() -> Result<(), Box<dyn Error>> {
         let app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24))?;
         let mut gui = GuiApp::new(app);
@@ -593,6 +836,32 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn mouse_reporting_writes_reports_to_the_pty() -> Result<(), Box<dyn Error>> {
+        let app = DesktopApp::spawn(
+            LayoutRect::new(0, 0, 120, 80),
+            mouse_report_hex_dump_command(),
+            PtySize::new(80, 24),
+        )?;
+        let mut gui = GuiApp::new(app);
+        gui.app.advance_output(b"\x1b[?1000h\x1b[?1006h");
+
+        gui.handle_cursor_moved(PhysicalPosition::new(9.0, 17.0))?;
+        gui.handle_mouse_input(ElementState::Pressed, WinitMouseButton::Left)?;
+
+        let output = read_all_runtime_output(&mut gui.app)?;
+        let text = String::from_utf8_lossy(&output);
+        let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let _ = gui.app.close_runtime()?;
+        assert!(
+            normalized.contains("1b 5b 3c 30 3b 32 3b 32 4d"),
+            "mouse report bytes did not reach the foreground process: {text:?}"
+        );
+        Ok(())
+    }
+
     fn shell_command_text(marker: &str) -> String {
         #[cfg(windows)]
         {
@@ -611,5 +880,47 @@ mod tests {
 
     fn shell_exit_bytes() -> Vec<u8> {
         b"exit\r\n".to_vec()
+    }
+
+    #[cfg(not(windows))]
+    fn read_all_runtime_output(app: &mut DesktopApp) -> Result<Vec<u8>, Box<dyn Error>> {
+        let runtime = app
+            .pane_mut()
+            .runtime_mut()
+            .ok_or("active pane is missing a runtime")?;
+        let mut output = Vec::new();
+        let mut chunk = [0_u8; 1024];
+
+        loop {
+            let count = runtime.read_output(&mut chunk)?;
+            if count == 0 {
+                break;
+            }
+            output.extend_from_slice(&chunk[..count]);
+        }
+
+        Ok(output)
+    }
+
+    #[cfg(not(windows))]
+    fn mouse_report_hex_dump_command() -> noctrail_pty::PtyCommand {
+        let mut command = noctrail_pty::PtyCommand::new("sh");
+        command.args(["-lc", "stty raw -echo; od -An -tx1 -N9"]);
+        command
+    }
+
+    fn rendered_text(frame: &DesktopFrame) -> String {
+        frame
+            .render_plan
+            .rows
+            .iter()
+            .map(|row| {
+                row.glyphs
+                    .iter()
+                    .map(|glyph| glyph.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

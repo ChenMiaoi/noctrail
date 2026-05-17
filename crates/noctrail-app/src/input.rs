@@ -9,6 +9,23 @@ pub enum ShortcutAction {
     Paste,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseReportKind {
+    Press(MouseButton),
+    Release(MouseButton),
+    Drag(MouseButton),
+    Move,
+    WheelUp,
+    WheelDown,
+}
+
 pub fn shortcut_action(logical_key: &Key, modifiers: ModifiersState) -> Option<ShortcutAction> {
     if modifiers.alt_key() || modifiers.super_key() {
         return None;
@@ -93,6 +110,30 @@ pub fn key_event_to_pty_bytes(
     key_to_pty_bytes(logical_key, text, modifiers)
 }
 
+pub fn mouse_report_bytes(kind: MouseReportKind, row: usize, col: usize, sgr: bool) -> Vec<u8> {
+    let row = row.saturating_add(1);
+    let col = col.saturating_add(1);
+    let button = mouse_button_code(kind);
+
+    if sgr {
+        let suffix = match kind {
+            MouseReportKind::Release(_) => 'm',
+            _ => 'M',
+        };
+        format!("\x1b[<{button};{col};{row}{suffix}").into_bytes()
+    } else {
+        let encoded_col = u8::try_from(col.min(223))
+            .ok()
+            .and_then(|value| value.checked_add(32))
+            .unwrap_or(u8::MAX);
+        let encoded_row = u8::try_from(row.min(223))
+            .ok()
+            .and_then(|value| value.checked_add(32))
+            .unwrap_or(u8::MAX);
+        vec![b'\x1b', b'[', b'M', button + 32, encoded_col, encoded_row]
+    }
+}
+
 fn character_bytes(ch: &str, text: Option<&str>, modifiers: ModifiersState) -> Option<Vec<u8>> {
     let text = text.unwrap_or(ch);
 
@@ -127,6 +168,23 @@ fn control_byte(ch: char) -> Option<u8> {
         '7' => Some(0x1f),
         '8' => Some(0x7f),
         _ => None,
+    }
+}
+
+fn mouse_button_code(kind: MouseReportKind) -> u8 {
+    match kind {
+        MouseReportKind::Press(MouseButton::Left) => 0,
+        MouseReportKind::Press(MouseButton::Middle) => 1,
+        MouseReportKind::Press(MouseButton::Right) => 2,
+        MouseReportKind::Release(MouseButton::Left)
+        | MouseReportKind::Release(MouseButton::Middle)
+        | MouseReportKind::Release(MouseButton::Right) => 3,
+        MouseReportKind::Drag(MouseButton::Left) => 32,
+        MouseReportKind::Drag(MouseButton::Middle) => 33,
+        MouseReportKind::Drag(MouseButton::Right) => 34,
+        MouseReportKind::Move => 35,
+        MouseReportKind::WheelUp => 64,
+        MouseReportKind::WheelDown => 65,
     }
 }
 
@@ -257,6 +315,38 @@ mod tests {
     fn paste_bytes_wraps_when_bracketed() {
         assert_eq!(paste_bytes("hello", true), b"\x1b[200~hello\x1b[201~");
         assert_eq!(paste_bytes("hello", false), b"hello");
+    }
+
+    #[test]
+    fn sgr_mouse_reports_use_one_based_coordinates() {
+        assert_eq!(
+            mouse_report_bytes(MouseReportKind::Press(MouseButton::Left), 4, 9, true),
+            b"\x1b[<0;10;5M"
+        );
+        assert_eq!(
+            mouse_report_bytes(MouseReportKind::Release(MouseButton::Left), 4, 9, true),
+            b"\x1b[<3;10;5m"
+        );
+        assert_eq!(
+            mouse_report_bytes(MouseReportKind::WheelDown, 1, 2, true),
+            b"\x1b[<65;3;2M"
+        );
+        assert_eq!(
+            mouse_report_bytes(MouseReportKind::Move, 0, 0, true),
+            b"\x1b[<35;1;1M"
+        );
+    }
+
+    #[test]
+    fn legacy_mouse_reports_use_x10_encoding() {
+        assert_eq!(
+            mouse_report_bytes(MouseReportKind::Press(MouseButton::Left), 0, 0, false),
+            vec![0x1b, b'[', b'M', 32, 33, 33]
+        );
+        assert_eq!(
+            mouse_report_bytes(MouseReportKind::Drag(MouseButton::Left), 1, 2, false),
+            vec![0x1b, b'[', b'M', 64, 35, 34]
+        );
     }
 
     #[test]
