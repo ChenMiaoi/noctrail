@@ -1,0 +1,490 @@
+{
+  "cases": [
+    {
+      "name": "ascii_write",
+      "width": 4,
+      "height": 2,
+      "input_hex": "6162",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "a" }, { "text": "b" }, {}, {}] },
+          { "cells": [{}, {}, {}, {}] }
+        ],
+        "cursor": { "row": 0, "col": 2 }
+      }
+    },
+    {
+      "name": "wide_char",
+      "width": 4,
+      "height": 1,
+      "input_hex": "e4b8ad",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "\u4e2d" }, { "wide_continuation": true }, {}, {}] }
+        ],
+        "cursor": { "row": 0, "col": 2 }
+      }
+    },
+    {
+      "name": "combining_mark",
+      "width": 2,
+      "height": 1,
+      "input_hex": "65cc81",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "e\u0301" }, {}] }
+        ],
+        "cursor": { "row": 0, "col": 1 }
+      }
+    },
+    {
+      "name": "cr_overwrite",
+      "width": 3,
+      "height": 1,
+      "input_hex": "61620d63",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "c" }, { "text": "b" }, {}] }
+        ],
+        "cursor": { "row": 0, "col": 1 }
+      }
+    },
+    {
+      "name": "lf_preserves_column",
+      "width": 4,
+      "height": 2,
+      "input_hex": "61620a63",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "a" }, { "text": "b" }, {}, {}] },
+          { "cells": [{}, {}, { "text": "c" }, {}] }
+        ],
+        "cursor": { "row": 1, "col": 3 }
+      }
+    },
+    {
+      "name": "wrap_to_next_line",
+      "width": 2,
+      "height": 2,
+      "input_hex": "616263",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "a" }, { "text": "b" }] },
+          { "cells": [{ "text": "c" }, {}], "wrapped": true }
+        ],
+        "cursor": { "row": 1, "col": 1 }
+      }
+    },
+    {
+      "name": "scrollback_limit_two",
+      "width": 2,
+      "height": 2,
+      "scrollback_limit": 2,
+      "input_hex": "610d0a620d0a630d0a640d0a650d0a660d0a",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "f" }, {}] },
+          { "cells": [{}, {}] }
+        ],
+        "scrollback": [
+          { "cells": [{ "text": "d" }, {}] },
+          { "cells": [{ "text": "e" }, {}] }
+        ],
+        "cursor": { "row": 1, "col": 0 }
+      }
+    },
+    {
+      "name": "clear_scrollback_only",
+      "width": 2,
+      "height": 2,
+      "scrollback_limit": 2,
+      "input_hex": "610d0a620d0a630d0a1b5b334a",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "c" }, {}] },
+          { "cells": [{}, {}] }
+        ],
+        "cursor": { "row": 1, "col": 0 }
+      }
+    },
+    {
+      "name": "alt_restore_primary",
+      "width": 2,
+      "height": 2,
+      "input_hex": "701b5b3f313034396878791b5b3f313034396c",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "p" }, {}] },
+          { "cells": [{}, {}] }
+        ],
+        "cursor": { "row": 0, "col": 1 }
+      }
+    },
+    {
+      "name": "alt_no_scrollback",
+      "width": 2,
+      "height": 2,
+      "input_hex": "701b5b3f313034396861626364",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "c" }, { "text": "d" }], "wrapped": true },
+          { "cells": [{}, {}], "wrapped": true }
+        ],
+        "cursor": { "row": 1, "col": 0 },
+        "alternate_screen": true
+      }
+    },
+    {
+      "name": "selection_normal",
+      "width": 4,
+      "height": 2,
+      "input_hex": "6162630d0a646566",
+      "selection": {
+        "mode": "Normal",
+        "start": { "row": 0, "col": 1 },
+        "end": { "row": 1, "col": 1 }
+      },
+      "expected_selection_text": "bc \nde",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "a" }, { "text": "b" }, { "text": "c" }, {}] },
+          { "cells": [{ "text": "d" }, { "text": "e" }, { "text": "f" }, {}] }
+        ],
+        "cursor": { "row": 1, "col": 3 },
+        "selection": {
+          "mode": "Normal",
+          "start": { "row": 0, "col": 1 },
+          "end": { "row": 1, "col": 1 }
+        }
+      }
+    },
+    {
+      "name": "selection_line_wrap",
+      "width": 2,
+      "height": 2,
+      "input_hex": "616263",
+      "selection": {
+        "mode": "Line",
+        "start": { "row": 0, "col": 0 },
+        "end": { "row": 1, "col": 0 }
+      },
+      "expected_selection_text": "abc",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "a" }, { "text": "b" }] },
+          { "cells": [{ "text": "c" }, {}], "wrapped": true }
+        ],
+        "cursor": { "row": 1, "col": 1 },
+        "selection": {
+          "mode": "Line",
+          "start": { "row": 0, "col": 0 },
+          "end": { "row": 1, "col": 0 }
+        }
+      }
+    },
+    {
+      "name": "selection_block",
+      "width": 4,
+      "height": 2,
+      "input_hex": "6162630d0a646566",
+      "selection": {
+        "mode": "Block",
+        "start": { "row": 0, "col": 1 },
+        "end": { "row": 1, "col": 2 }
+      },
+      "expected_selection_text": "bc\nef",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "a" }, { "text": "b" }, { "text": "c" }, {}] },
+          { "cells": [{ "text": "d" }, { "text": "e" }, { "text": "f" }, {}] }
+        ],
+        "cursor": { "row": 1, "col": 3 },
+        "selection": {
+          "mode": "Block",
+          "start": { "row": 0, "col": 1 },
+          "end": { "row": 1, "col": 2 }
+        }
+      }
+    },
+    {
+      "name": "erase_line_right",
+      "width": 5,
+      "height": 1,
+      "input_hex": "616263641b5b32441b5b4b",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "a" }, { "text": "b" }, {}, {}, {}] }
+        ],
+        "cursor": { "row": 0, "col": 2 }
+      }
+    },
+    {
+      "name": "erase_line_left",
+      "width": 5,
+      "height": 1,
+      "input_hex": "616263641b5b32441b5b314b",
+      "expected": {
+        "rows": [
+          { "cells": [{}, {}, {}, { "text": "d" }, {}] }
+        ],
+        "cursor": { "row": 0, "col": 2 }
+      }
+    },
+    {
+      "name": "erase_display_all",
+      "width": 3,
+      "height": 2,
+      "input_hex": "6162631b5b324a",
+      "expected": {
+        "rows": [
+          { "cells": [{}, {}, {}] },
+          { "cells": [{}, {}, {}], "wrapped": true }
+        ],
+        "cursor": { "row": 1, "col": 0 }
+      }
+    },
+    {
+      "name": "resize_clamps_cursor",
+      "width": 4,
+      "height": 2,
+      "input_hex": "61626364",
+      "resizes": [[2, 2]],
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "a" }, { "text": "b" }] },
+          { "cells": [{}, {}], "wrapped": true }
+        ],
+        "cursor": { "row": 1, "col": 0 }
+      }
+    },
+    {
+      "name": "resize_wide_repair",
+      "width": 3,
+      "height": 2,
+      "input_hex": "6162e4b8ad",
+      "resizes": [[2, 2]],
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "a" }, { "text": "b" }] },
+          { "cells": [{ "text": "\u4e2d" }, { "wide_continuation": true }], "wrapped": true }
+        ],
+        "cursor": { "row": 1, "col": 1 }
+      }
+    },
+    {
+      "name": "resize_multiple_steps",
+      "width": 3,
+      "height": 2,
+      "input_hex": "616263",
+      "resizes": [[4, 2], [2, 2], [3, 3]],
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "a" }, { "text": "b" }, {}] },
+          { "cells": [{}, {}, {}], "wrapped": true },
+          { "cells": [{}, {}, {}] }
+        ],
+        "cursor": { "row": 1, "col": 0 }
+      }
+    },
+    {
+      "name": "scrollback_limit_one",
+      "width": 2,
+      "height": 2,
+      "scrollback_limit": 1,
+      "input_hex": "610d0a620d0a630d0a",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "c" }, {}] },
+          { "cells": [{}, {}] }
+        ],
+        "scrollback": [
+          { "cells": [{ "text": "b" }, {}] }
+        ],
+        "cursor": { "row": 1, "col": 0 }
+      }
+    },
+    {
+      "name": "scrollback_after_resize",
+      "width": 2,
+      "height": 2,
+      "scrollback_limit": 2,
+      "input_hex": "610d0a620d0a630d0a",
+      "resizes": [[1, 2]],
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "c" }] },
+          { "cells": [{}] }
+        ],
+        "scrollback": [
+          { "cells": [{ "text": "a" }, {}] },
+          { "cells": [{ "text": "b" }, {}] }
+        ],
+        "cursor": { "row": 1, "col": 0 }
+      }
+    },
+    {
+      "name": "backspace_moves_left",
+      "width": 4,
+      "height": 1,
+      "input_hex": "61620863",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "a" }, { "text": "c" }, {}, {}] }
+        ],
+        "cursor": { "row": 0, "col": 2 }
+      }
+    },
+    {
+      "name": "tab_advances_to_next_stop",
+      "width": 8,
+      "height": 2,
+      "input_hex": "610962",
+      "expected": {
+        "rows": [
+          {
+            "cells": [
+              { "text": "a" },
+              { "text": " " },
+              { "text": " " },
+              { "text": " " },
+              { "text": " " },
+              { "text": " " },
+              { "text": " " },
+              { "text": " " }
+            ]
+          },
+          {
+            "cells": [
+              { "text": "b" },
+              {},
+              {},
+              {},
+              {},
+              {},
+              {},
+              {}
+            ],
+            "wrapped": true
+          }
+        ],
+        "cursor": { "row": 1, "col": 1 }
+      }
+    },
+    {
+      "name": "cursor_save_restore_primary",
+      "width": 4,
+      "height": 1,
+      "input_hex": "6162631b371b5b32441b38",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "a" }, { "text": "b" }, { "text": "c" }, {}] }
+        ],
+        "cursor": { "row": 0, "col": 3 }
+      }
+    },
+    {
+      "name": "cursor_save_restore_alt",
+      "width": 4,
+      "height": 2,
+      "input_hex": "1b5b3f31303439686162631b371b5b32441b38",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "a" }, { "text": "b" }, { "text": "c" }, {}] },
+          { "cells": [{}, {}, {}, {}] }
+        ],
+        "cursor": { "row": 0, "col": 3 },
+        "alternate_screen": true
+      }
+    },
+    {
+      "name": "mixed_crlf",
+      "width": 4,
+      "height": 2,
+      "input_hex": "61620d0a6364",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "a" }, { "text": "b" }, {}, {}] },
+          { "cells": [{ "text": "c" }, { "text": "d" }, {}, {}] }
+        ],
+        "cursor": { "row": 1, "col": 2 }
+      }
+    },
+    {
+      "name": "line_selection_across_scrollback",
+      "width": 2,
+      "height": 2,
+      "scrollback_limit": 2,
+      "input_hex": "610d0a620d0a630d0a",
+      "selection": {
+        "mode": "Line",
+        "start": { "row": 0, "col": 0 },
+        "end": { "row": 2, "col": 0 }
+      },
+      "expected_selection_text": "a\nb\nc",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "c" }, {}] },
+          { "cells": [{}, {}] }
+        ],
+        "scrollback": [
+          { "cells": [{ "text": "a" }, {}] },
+          { "cells": [{ "text": "b" }, {}] }
+        ],
+        "cursor": { "row": 1, "col": 0 },
+        "selection": {
+          "mode": "Line",
+          "start": { "row": 0, "col": 0 },
+          "end": { "row": 2, "col": 0 }
+        }
+      }
+    },
+    {
+      "name": "block_selection_with_wide",
+      "width": 4,
+      "height": 1,
+      "input_hex": "e4b8ad61",
+      "selection": {
+        "mode": "Block",
+        "start": { "row": 0, "col": 0 },
+        "end": { "row": 0, "col": 2 }
+      },
+      "expected_selection_text": "\u4e2d a",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "\u4e2d" }, { "wide_continuation": true }, { "text": "a" }, {}] }
+        ],
+        "cursor": { "row": 0, "col": 3 },
+        "selection": {
+          "mode": "Block",
+          "start": { "row": 0, "col": 0 },
+          "end": { "row": 0, "col": 2 }
+        }
+      }
+    },
+    {
+      "name": "alt_clear_then_restore",
+      "width": 4,
+      "height": 1,
+      "input_hex": "701b5b3f31303439681b5b324a78791b5b3f313034396c",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "p" }, {}, {}, {}] }
+        ],
+        "cursor": { "row": 0, "col": 1 }
+      }
+    },
+    {
+      "name": "wrap_variant",
+      "width": 2,
+      "height": 2,
+      "input_hex": "78797a",
+      "expected": {
+        "rows": [
+          { "cells": [{ "text": "x" }, { "text": "y" }] },
+          { "cells": [{ "text": "z" }, {}], "wrapped": true }
+        ],
+        "cursor": { "row": 1, "col": 1 }
+      }
+    }
+  ]
+}
