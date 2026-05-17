@@ -20,6 +20,7 @@ use noctrail_term::{
 use thiserror::Error;
 
 const ROOT_PANE_ID: PaneId = PaneId::new(1);
+const SCRATCH_HEIGHT_DIVISOR: u16 = 3;
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -318,6 +319,7 @@ impl TerminalPane {
 #[derive(Debug)]
 pub struct DesktopFrame {
     pub workspace_id: WorkspaceId,
+    pub is_scratch: bool,
     pub pane_id: PaneId,
     pub surface: LayoutRect,
     pub terminal_size: PtySize,
@@ -331,6 +333,8 @@ pub struct DesktopApp {
     terminal_size: PtySize,
     backend: RenderBackend,
     workspaces: WorkspaceSet,
+    scratch_pane_id: Option<PaneId>,
+    scratch_visible: bool,
     panes: HashMap<PaneId, TerminalPane>,
     next_pane_id: u64,
 }
@@ -377,7 +381,11 @@ impl DesktopApp {
     }
 
     pub fn active_pane_id(&self) -> Option<PaneId> {
-        self.workspaces.active_layout().active_pane()
+        if self.scratch_visible {
+            self.scratch_pane_id
+        } else {
+            self.workspaces.active_layout().active_pane()
+        }
     }
 
     pub fn active_workspace_id(&self) -> WorkspaceId {
@@ -394,6 +402,14 @@ impl DesktopApp {
 
     pub fn workspace_ids(&self) -> Vec<WorkspaceId> {
         self.workspaces.workspace_ids()
+    }
+
+    pub fn scratch_visible(&self) -> bool {
+        self.scratch_visible
+    }
+
+    pub fn scratch_pane_id(&self) -> Option<PaneId> {
+        self.scratch_pane_id
     }
 
     pub fn pane(&self) -> &TerminalPane {
@@ -501,6 +517,30 @@ impl DesktopApp {
         self.active_pane_mut().clear_selection();
     }
 
+    pub fn toggle_scratch(&mut self) -> Result<PaneId, AppError> {
+        if self.scratch_visible {
+            self.scratch_visible = false;
+            return self.active_workspace_pane_id();
+        }
+
+        let pane_id = if let Some(pane_id) = self.scratch_pane_id {
+            pane_id
+        } else {
+            let pane_id = self.allocate_pane_id()?;
+            let pane = TerminalPane::spawn_shell(
+                pane_id,
+                scratch_terminal_size(self.surface, self.terminal_size),
+            )?;
+            self.panes.insert(pane_id, pane);
+            self.scratch_pane_id = Some(pane_id);
+            pane_id
+        };
+
+        self.scratch_visible = true;
+        self.sync_pane_terminal_sizes()?;
+        Ok(pane_id)
+    }
+
     pub fn switch_workspace(&mut self, workspace_id: WorkspaceId) -> Result<PaneId, AppError> {
         self.workspaces.switch_to(workspace_id);
         let active = if let Some(pane_id) = self.active_pane_id() {
@@ -531,15 +571,20 @@ impl DesktopApp {
         let pane = self
             .pane_by_id(pane_id)
             .ok_or(AppError::PaneNotFound(pane_id))?;
-        let pane_surface = self
-            .pane_layouts()
-            .into_iter()
-            .find(|layout| layout.pane_id == pane_id)
-            .map(|layout| layout.rect)
-            .ok_or(AppError::PaneNotFound(pane_id))?;
+        let is_scratch = self.scratch_pane_id == Some(pane_id);
+        let pane_surface = if is_scratch {
+            scratch_surface(self.surface)
+        } else {
+            self.pane_layouts()
+                .into_iter()
+                .find(|layout| layout.pane_id == pane_id)
+                .map(|layout| layout.rect)
+                .ok_or(AppError::PaneNotFound(pane_id))?
+        };
 
         Ok(DesktopFrame {
             workspace_id,
+            is_scratch,
             pane_id,
             surface: pane_surface,
             terminal_size: pane.terminal_size(),
@@ -553,6 +598,26 @@ impl DesktopApp {
     }
 
     pub fn close_active_pane(&mut self) -> Result<(PaneId, Option<PtyExitStatus>), AppError> {
+        if self.scratch_visible {
+            let scratch_pane_id = self.scratch_pane_id.ok_or(AppError::MissingActivePane)?;
+            let status = if self
+                .pane_by_id(scratch_pane_id)
+                .ok_or(AppError::PaneNotFound(scratch_pane_id))?
+                .runtime_present()
+            {
+                self.pane_mut_by_id(scratch_pane_id)
+                    .ok_or(AppError::PaneNotFound(scratch_pane_id))?
+                    .close_runtime()?
+            } else {
+                None
+            };
+
+            self.panes.remove(&scratch_pane_id);
+            self.scratch_pane_id = None;
+            self.scratch_visible = false;
+            return Ok((self.active_workspace_pane_id()?, status));
+        }
+
         if self.pane_count() <= 1 {
             return Err(AppError::CannotCloseLastPane);
         }
@@ -592,6 +657,8 @@ impl DesktopApp {
             terminal_size,
             backend: RenderBackend::default(),
             workspaces: WorkspaceSet::new(ROOT_PANE_ID),
+            scratch_pane_id: None,
+            scratch_visible: false,
             panes,
             next_pane_id: ROOT_PANE_ID.0 + 1,
         }
@@ -611,9 +678,7 @@ impl DesktopApp {
 
     fn active_pane_ref(&self) -> &TerminalPane {
         let pane_id = self
-            .workspaces
-            .active_layout()
-            .active_pane()
+            .active_pane_id()
             .expect("desktop app should always have an active pane");
         self.panes
             .get(&pane_id)
@@ -622,9 +687,7 @@ impl DesktopApp {
 
     fn active_pane_mut(&mut self) -> &mut TerminalPane {
         let pane_id = self
-            .workspaces
-            .active_layout()
-            .active_pane()
+            .active_pane_id()
             .expect("desktop app should always have an active pane");
         self.panes
             .get_mut(&pane_id)
@@ -639,7 +702,22 @@ impl DesktopApp {
                 .ok_or(AppError::PaneNotFound(layout.pane_id))?
                 .resize(pane_size)?;
         }
+
+        if let Some(scratch_pane_id) = self.scratch_pane_id {
+            let pane_size = scratch_terminal_size(self.surface, self.terminal_size);
+            self.pane_mut_by_id(scratch_pane_id)
+                .ok_or(AppError::PaneNotFound(scratch_pane_id))?
+                .resize(pane_size)?;
+        }
+
         Ok(())
+    }
+
+    fn active_workspace_pane_id(&self) -> Result<PaneId, AppError> {
+        self.workspaces
+            .active_layout()
+            .active_pane()
+            .ok_or(AppError::MissingActivePane)
     }
 }
 
@@ -765,6 +843,15 @@ fn pane_terminal_size(
     PtySize::new(cols, rows)
 }
 
+fn scratch_surface(surface: LayoutRect) -> LayoutRect {
+    let height = (surface.height / SCRATCH_HEIGHT_DIVISOR).max(1);
+    LayoutRect::new(surface.x, surface.y, surface.width, height)
+}
+
+fn scratch_terminal_size(surface: LayoutRect, terminal_size: PtySize) -> PtySize {
+    pane_terminal_size(surface, terminal_size, scratch_surface(surface))
+}
+
 fn projected_cells(offset: u16, span: u16, total_span: u16, total_cells: u16) -> u16 {
     if total_span == 0 || total_cells <= 1 {
         return total_cells.max(1);
@@ -792,6 +879,7 @@ mod tests {
         assert_eq!(app.pane_layouts().len(), 1);
         let frame = app.frame();
         assert_eq!(frame.workspace_id, WorkspaceId::new(1));
+        assert!(!frame.is_scratch);
         assert_eq!(frame.pane_id, PaneId::new(1));
         assert_eq!(frame.surface, LayoutRect::new(0, 0, 120, 80));
         assert_eq!(frame.terminal_size, PtySize::new(10, 3));
@@ -1038,6 +1126,7 @@ mod tests {
 
         let first_frame = app.frame();
         assert_eq!(first_frame.workspace_id, WorkspaceId::new(1));
+        assert!(!first_frame.is_scratch);
 
         let workspace_two = app.switch_workspace(WorkspaceId::new(2))?;
         assert_eq!(workspace_two, workspace_two_pane);
@@ -1047,6 +1136,7 @@ mod tests {
             Some(workspace_two_pid)
         );
         assert_eq!(app.frame().workspace_id, WorkspaceId::new(2));
+        assert!(!app.frame().is_scratch);
 
         let first_status = app
             .pane_mut_by_id(workspace_one_pane)
@@ -1176,6 +1266,108 @@ mod tests {
             .close_runtime()?;
         assert!(root_status.is_some());
         assert!(split_status.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn scratch_toggle_preserves_main_layout_and_reuses_its_session() -> Result<(), Box<dyn StdError>>
+    {
+        let mut app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4))?;
+        let main_active = app.split_active_pane_shell()?;
+        let main_layouts = app.pane_layouts();
+
+        let scratch = app.toggle_scratch()?;
+        let scratch_pid = app
+            .pane_by_id(scratch)
+            .and_then(TerminalPane::process_id)
+            .expect("scratch pane should have a process id");
+
+        assert!(app.scratch_visible());
+        assert_eq!(app.scratch_pane_id(), Some(scratch));
+        assert_eq!(app.active_pane_id(), Some(scratch));
+        assert_eq!(app.pane_layouts(), main_layouts);
+        assert_eq!(app.frame().surface, scratch_surface(app.surface()));
+        assert!(app.frame().is_scratch);
+
+        let restored = app.toggle_scratch()?;
+        assert_eq!(restored, main_active);
+        assert!(!app.scratch_visible());
+        assert_eq!(app.active_pane_id(), Some(main_active));
+        assert_eq!(app.pane_layouts(), main_layouts);
+
+        let scratch_again = app.toggle_scratch()?;
+        assert_eq!(scratch_again, scratch);
+        assert_eq!(
+            app.pane_by_id(scratch_again)
+                .and_then(TerminalPane::process_id),
+            Some(scratch_pid)
+        );
+
+        let scratch_status = app
+            .pane_mut_by_id(scratch)
+            .ok_or(AppError::PaneNotFound(scratch))?
+            .close_runtime()?;
+        let main_status = app
+            .pane_mut_by_id(main_active)
+            .ok_or(AppError::PaneNotFound(main_active))?
+            .close_runtime()?;
+        assert!(scratch_status.is_some());
+        assert!(main_status.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn scratch_pane_keeps_an_independent_shell_session() -> Result<(), Box<dyn StdError>> {
+        let mut app =
+            DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 40), PtySize::new(80, 24))?;
+        let main_pane = app.active_pane_id().expect("main pane should exist");
+        let scratch_pane = app.toggle_scratch()?;
+
+        app.write_input(shell_command_bytes("NOCTRAIL_SCRATCH").as_slice())?;
+        app.write_input(shell_exit_bytes().as_slice())?;
+
+        let restored = app.toggle_scratch()?;
+        assert_eq!(restored, main_pane);
+
+        app.pane_mut_by_id(main_pane)
+            .ok_or(AppError::PaneNotFound(main_pane))?
+            .write_input(shell_command_bytes("NOCTRAIL_MAIN").as_slice())?;
+        app.pane_mut_by_id(main_pane)
+            .ok_or(AppError::PaneNotFound(main_pane))?
+            .write_input(shell_exit_bytes().as_slice())?;
+
+        let scratch_output = read_all_runtime_output_for_pane(&mut app, scratch_pane)?;
+        let main_output = read_all_runtime_output_for_pane(&mut app, main_pane)?;
+        let scratch_text = String::from_utf8_lossy(&scratch_output);
+        let main_text = String::from_utf8_lossy(&main_output);
+
+        assert!(
+            scratch_text.contains("NOCTRAIL_SCRATCH"),
+            "scratch pane output missing its marker: {scratch_text:?}"
+        );
+        assert!(
+            !scratch_text.contains("NOCTRAIL_MAIN"),
+            "scratch pane output leaked main marker: {scratch_text:?}"
+        );
+        assert!(
+            main_text.contains("NOCTRAIL_MAIN"),
+            "main pane output missing its marker: {main_text:?}"
+        );
+        assert!(
+            !main_text.contains("NOCTRAIL_SCRATCH"),
+            "main pane output leaked scratch marker: {main_text:?}"
+        );
+
+        let scratch_status = app
+            .pane_mut_by_id(scratch_pane)
+            .ok_or(AppError::PaneNotFound(scratch_pane))?
+            .close_runtime()?;
+        let main_status = app
+            .pane_mut_by_id(main_pane)
+            .ok_or(AppError::PaneNotFound(main_pane))?
+            .close_runtime()?;
+        assert!(scratch_status.is_some());
+        assert!(main_status.is_some());
         Ok(())
     }
 

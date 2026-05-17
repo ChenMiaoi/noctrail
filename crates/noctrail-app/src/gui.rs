@@ -91,10 +91,14 @@ pub(crate) fn frame_title(frame: &DesktopFrame, cursor_visible: bool) -> String 
         .map(|pid| pid.to_string())
         .unwrap_or_else(|| "starting".to_string());
     let cursor = if cursor_visible { "on" } else { "off" };
+    let pane_label = if frame.is_scratch {
+        format!("scratch {}", frame.pane_id.0)
+    } else {
+        format!("pane {}", frame.pane_id.0)
+    };
 
     format!(
-        "Noctrail | pane {} | pid {pid} | {}x{} px | {}x{} cells | rows {} | {backend} | cursor {cursor}",
-        frame.pane_id.0,
+        "Noctrail | {pane_label} | pid {pid} | {}x{} px | {}x{} cells | rows {} | {backend} | cursor {cursor}",
         frame.surface.width,
         frame.surface.height,
         frame.terminal_size.cols,
@@ -737,6 +741,7 @@ mod tests {
     fn frame_title_reflects_state() {
         let frame = DesktopFrame {
             workspace_id: WorkspaceId::new(1),
+            is_scratch: false,
             pane_id: PaneId::new(7),
             surface: LayoutRect::new(0, 0, 120, 80),
             terminal_size: PtySize::new(80, 24),
