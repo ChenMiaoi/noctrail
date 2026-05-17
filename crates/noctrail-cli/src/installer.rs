@@ -426,6 +426,7 @@ fn temp_smoke_dir(prefix: &str) -> Result<PathBuf, String> {
     Ok(root)
 }
 
+#[cfg(target_os = "macos")]
 fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
     if source.is_file() {
         if let Some(parent) = destination.parent() {
