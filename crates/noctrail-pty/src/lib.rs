@@ -500,6 +500,8 @@ fn closed_error(action: &'static str) -> PtyError {
 mod tests {
     use super::*;
     use std::error::Error as StdError;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn shell_command_resolves_to_a_program() {
@@ -577,10 +579,17 @@ mod tests {
             text.contains("PTY_EOF_OK"),
             "finite PTY command output missing marker: {text:?}"
         );
-        assert!(
-            session.try_wait()?.is_some(),
-            "finite PTY command should exit after EOF"
-        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if session.try_wait()?.is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "finite PTY command should exit after EOF"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
         assert!(
             session.close()?.is_some(),
             "close should reap the already-exited child handle"
