@@ -159,6 +159,108 @@ pub fn review_panel_smoke() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+pub fn patch_preview_smoke() -> Result<(), Box<dyn Error>> {
+    let app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24))?;
+    let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
+    let original_path =
+        std::env::temp_dir().join(format!("noctrail-patch-preview-{}.txt", std::process::id()));
+    std::fs::write(&original_path, "original\n")?;
+    let fixture_path = std::env::temp_dir().join(format!(
+        "noctrail-patch-preview-payload-{}.json",
+        std::process::id()
+    ));
+
+    let diff = format!(
+        "--- a/{0}\n+++ b/{0}\n@@ -1 +1 @@\n-original\n+patched\n",
+        original_path.display()
+    );
+    std::fs::write(
+        &fixture_path,
+        serde_json::json!({
+            "patches": [
+                {
+                    "path": original_path.display().to_string(),
+                    "reason": "Preview a one-line patch without applying it.",
+                    "diff": diff
+                }
+            ]
+        })
+        .to_string(),
+    )?;
+
+    let mut preview_app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24));
+    preview_app.set_block_observer_enabled(true);
+    preview_app.advance_output(&shell_integration_probe_bytes(
+        "cargo test -p noctrail-app",
+        "/tmp/noctrail-agent-patch",
+        0,
+        21,
+        "patch context\n",
+    ));
+    let _ = preview_app.select_newest_command_block();
+    preview_app.set_agent_explicit_files(vec![original_path.clone()]);
+    let prompt =
+        crate::redaction::redact_agent_context_preview(&preview_app.agent_context_preview());
+    let prompt = format!(
+        "cwd: {}\nfiles:\n- {}\ncommand: {}\noutput:\n{}",
+        prompt
+            .cwd
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "/tmp/noctrail-agent-patch".to_string()),
+        original_path.display(),
+        prompt
+            .current_block
+            .as_ref()
+            .and_then(|block| block.command.as_deref())
+            .unwrap_or("cargo test -p noctrail-app"),
+        prompt
+            .current_block
+            .as_ref()
+            .map(|block| block.output.as_str())
+            .unwrap_or("")
+    );
+
+    let adapter = noctrail_agent::ProviderAdapter::from_provider_config(
+        &noctrail_config::AgentProviderConfig {
+            kind: noctrail_config::AgentProviderKind::Cli,
+            model: None,
+            endpoint: None,
+            command: review_patch_cli_command(&fixture_path),
+        },
+    )?;
+    let previews = adapter.propose_patches(&prompt)?;
+    gui.app.set_agent_patch_previews(previews);
+    gui.toggle_patch_preview_browser();
+    let title = gui.title_text();
+    if !title.contains("patch-preview") || !title.contains("diff --- a/") {
+        return Err("patch preview title did not expose the unified diff".into());
+    }
+
+    gui.app.write_input(
+        shell_submission_bytes(&review_output_command("NOCTRAIL_PATCH_PREVIEW_OK")).as_slice(),
+    )?;
+    gui.app.write_input(shell_exit_bytes().as_slice())?;
+    std::thread::sleep(Duration::from_millis(100));
+    let output = read_all_runtime_output_for_gui(&mut gui.app)?;
+    let _ = gui.app.close_runtime()?;
+
+    let text = String::from_utf8_lossy(&output);
+    if !text.contains("NOCTRAIL_PATCH_PREVIEW_OK") {
+        return Err("patch preview flow broke foreground shell output".into());
+    }
+    let contents = std::fs::read_to_string(&original_path)?;
+    if contents != "original\n" {
+        return Err("patch preview unexpectedly modified the target file".into());
+    }
+
+    let _ = std::fs::remove_file(&original_path);
+    let _ = std::fs::remove_file(&fixture_path);
+    println!("patches=1 file_unchanged=yes shell=ok");
+    println!("agent patch preview smoke ok");
+    Ok(())
+}
+
 pub fn run_with_options(options: GuiLaunchOptions) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new()?;
     let initial_surface = LayoutRect::new(
@@ -489,10 +591,13 @@ impl CommandPalette {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct BlockBrowser;
+struct AgentContextBrowser;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct AgentContextBrowser;
+struct PatchPreviewBrowser;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct BlockBrowser;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct ReviewPanel {
@@ -512,6 +617,7 @@ struct GuiApp {
     font_preferences: FontPreferences,
     ime_preedit: Option<String>,
     agent_context_browser: Option<AgentContextBrowser>,
+    patch_preview_browser: Option<PatchPreviewBrowser>,
     review_panel: Option<ReviewPanel>,
     block_browser: Option<BlockBrowser>,
     command_palette: Option<CommandPalette>,
@@ -553,6 +659,7 @@ impl GuiApp {
             font_preferences: font_preferences_from_config(&font),
             ime_preedit: None,
             agent_context_browser: None,
+            patch_preview_browser: None,
             review_panel: None,
             block_browser: None,
             command_palette: None,
@@ -1014,6 +1121,21 @@ impl GuiApp {
                 }
             }
         }
+        if self.patch_preview_browser.is_some() {
+            title.push_str(" | patch-preview");
+            if let Some(index) = self.app.selected_agent_patch_preview_index() {
+                title.push_str(" sel ");
+                title.push_str(&(index + 1).to_string());
+            }
+            if let Some(preview) = self.app.selected_agent_patch_preview() {
+                title.push_str(" | file ");
+                title.push_str(&display_status_path(&preview.path));
+                title.push_str(" | reason ");
+                title.push_str(&preview_text(&preview.reason, 32));
+                title.push_str(" | diff ");
+                title.push_str(&preview_diff(&preview.diff, 48));
+            }
+        }
         if let Some(palette) = self.command_palette.as_ref() {
             title.push_str(" | palette ");
             if palette.query.is_empty() {
@@ -1393,6 +1515,20 @@ impl GuiApp {
         self.request_redraw();
     }
 
+    fn toggle_patch_preview_browser(&mut self) {
+        if self.patch_preview_browser.is_some() {
+            self.patch_preview_browser = None;
+        } else if !self.app.agent_patch_previews().is_empty() {
+            if self.app.selected_agent_patch_preview_index().is_none() {
+                let _ = self.app.select_oldest_agent_patch_preview();
+            }
+            self.patch_preview_browser = Some(PatchPreviewBrowser);
+        }
+        self.touch_cursor_blink();
+        self.update_title();
+        self.request_redraw();
+    }
+
     fn toggle_agent_context_preview(&mut self) {
         if self.agent_context_browser.is_some() {
             self.agent_context_browser = None;
@@ -1592,6 +1728,43 @@ impl GuiApp {
         Ok(true)
     }
 
+    fn handle_patch_preview_key(
+        &mut self,
+        event: &winit::event::KeyEvent,
+    ) -> Result<bool, Box<dyn Error>> {
+        if self.patch_preview_browser.is_none() {
+            return Ok(false);
+        }
+        if !event.state.is_pressed() {
+            return Ok(true);
+        }
+
+        match event.logical_key.as_ref() {
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape) => {
+                self.patch_preview_browser = None;
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp) => {
+                let _ = self.app.select_previous_agent_patch_preview();
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowDown)
+            | winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab) => {
+                let _ = self.app.select_next_agent_patch_preview();
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Home) => {
+                let _ = self.app.select_oldest_agent_patch_preview();
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::End) => {
+                let _ = self.app.select_newest_agent_patch_preview();
+            }
+            _ => {}
+        }
+
+        self.touch_cursor_blink();
+        self.update_title();
+        self.request_redraw();
+        Ok(true)
+    }
+
     fn handle_block_browser_key(
         &mut self,
         event: &winit::event::KeyEvent,
@@ -1713,6 +1886,16 @@ fn preview_paths(paths: &[PathBuf], max_chars: usize) -> String {
     preview_text(&joined, max_chars)
 }
 
+fn preview_diff(diff: &str, max_chars: usize) -> String {
+    let normalized = diff
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(4)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    preview_text(&normalized, max_chars)
+}
+
 fn shell_submission_bytes(command: &str) -> Vec<u8> {
     let mut bytes = command.as_bytes().to_vec();
     bytes.push(b'\r');
@@ -1745,6 +1928,54 @@ fn review_file_command(path: &Path) -> String {
     {
         format!("sh -lc 'printf review-high > \"{}\"'", path.display())
     }
+}
+
+fn review_patch_cli_command(path: &Path) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        vec![
+            "cmd".to_string(),
+            "/C".to_string(),
+            format!("type \"{}\"", path.display()),
+        ]
+    }
+
+    #[cfg(not(windows))]
+    {
+        vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            format!("cat \"{}\"", path.display()),
+        ]
+    }
+}
+
+fn shell_integration_probe_bytes(
+    command: &str,
+    cwd: &str,
+    exit_code: i32,
+    duration_ms: u64,
+    output: &str,
+) -> Vec<u8> {
+    [
+        osc_marker_bytes("Prompt").as_slice(),
+        osc_marker_bytes("CommandStart").as_slice(),
+        osc_marker_pair_bytes("CommandText", command).as_slice(),
+        osc_marker_pair_bytes("Cwd", cwd).as_slice(),
+        output.as_bytes(),
+        osc_marker_pair_bytes("ExitCode", exit_code.to_string().as_str()).as_slice(),
+        osc_marker_pair_bytes("DurationMs", duration_ms.to_string().as_str()).as_slice(),
+        osc_marker_bytes("CommandEnd").as_slice(),
+    ]
+    .concat()
+}
+
+fn osc_marker_bytes(marker: &str) -> Vec<u8> {
+    format!("\x1b]1337;Noctrail;{marker}\x07").into_bytes()
+}
+
+fn osc_marker_pair_bytes(marker: &str, value: &str) -> Vec<u8> {
+    format!("\x1b]1337;Noctrail;{marker};{value}\x07").into_bytes()
 }
 
 fn read_all_runtime_output_for_gui(app: &mut DesktopApp) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -1918,6 +2149,13 @@ impl ApplicationHandler for GuiApp {
                 }
                 if matches!(
                     input::shortcut_action(&event.logical_key, self.modifiers),
+                    Some(input::ShortcutAction::TogglePatchPreview)
+                ) {
+                    self.toggle_patch_preview_browser();
+                    return;
+                }
+                if matches!(
+                    input::shortcut_action(&event.logical_key, self.modifiers),
                     Some(input::ShortcutAction::ToggleReviewPanel)
                 ) {
                     self.toggle_review_panel();
@@ -1931,6 +2169,14 @@ impl ApplicationHandler for GuiApp {
                     return;
                 }
                 match self.handle_review_panel_key(&event) {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(_) => {
+                        event_loop.exit();
+                        return;
+                    }
+                }
+                match self.handle_patch_preview_key(&event) {
                     Ok(true) => return,
                     Ok(false) => {}
                     Err(_) => {
@@ -1959,6 +2205,7 @@ impl ApplicationHandler for GuiApp {
                         input::ShortcutAction::ToggleAgentContextPreview => unreachable!(),
                         input::ShortcutAction::ToggleBlockBrowser => unreachable!(),
                         input::ShortcutAction::ToggleCommandPalette => unreachable!(),
+                        input::ShortcutAction::TogglePatchPreview => unreachable!(),
                         input::ShortcutAction::ToggleReviewPanel => unreachable!(),
                         input::ShortcutAction::Copy => {
                             if let Some(text) = self.app.copy_selection_text() {
@@ -2474,6 +2721,27 @@ mod tests {
         assert!(title.contains("permission review"));
         assert!(title.contains("cmd git status"));
         assert!(title.contains("reason Inspect the repository state."));
+    }
+
+    #[test]
+    fn patch_preview_title_reflects_selected_diff() {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
+        gui.app
+            .set_agent_patch_previews(vec![noctrail_agent::PatchPreview {
+                path: PathBuf::from("src/lib.rs"),
+                reason: "Preview a one-line patch.".to_string(),
+                diff: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,2 @@\n-foo\n+foo\n+bar\n"
+                    .to_string(),
+            }]);
+
+        gui.toggle_patch_preview_browser();
+        let title = gui.title_text();
+
+        assert!(title.contains("patch-preview"));
+        assert!(title.contains("file src/lib.rs"));
+        assert!(title.contains("reason Preview a one-line patch."));
+        assert!(title.contains("diff --- a/src/lib.rs"));
     }
 
     #[test]

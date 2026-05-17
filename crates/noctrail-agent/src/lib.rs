@@ -1,5 +1,6 @@
 use std::{
     io::Write,
+    path::PathBuf,
     process::{Command, Stdio},
 };
 
@@ -105,6 +106,13 @@ pub struct CommandProposal {
     pub permission: CommandPermission,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchPreview {
+    pub path: PathBuf,
+    pub reason: String,
+    pub diff: String,
+}
+
 #[derive(Debug, Error)]
 pub enum CommandProposalError {
     #[error("command proposal payload was not valid JSON: {source}")]
@@ -129,11 +137,30 @@ pub enum CommandProposalError {
 }
 
 #[derive(Debug, Error)]
+pub enum PatchPreviewError {
+    #[error("patch preview payload was not valid JSON: {source}")]
+    Json {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("patch preview payload must contain a non-empty patches array")]
+    MissingPatches,
+    #[error("patch preview #{index} must contain a non-empty path")]
+    MissingPath { index: usize },
+    #[error("patch preview #{index} must contain a non-empty reason")]
+    MissingReason { index: usize },
+    #[error("patch preview #{index} must contain a unified diff")]
+    MissingDiff { index: usize },
+}
+
+#[derive(Debug, Error)]
 pub enum SuggestionError {
     #[error(transparent)]
     Provider(#[from] ProviderError),
     #[error(transparent)]
     Proposal(#[from] CommandProposalError),
+    #[error(transparent)]
+    Patch(#[from] PatchPreviewError),
 }
 
 #[derive(Debug, Error)]
@@ -256,6 +283,11 @@ impl ProviderAdapter {
         let response = self.invoke(prompt)?;
         CommandProposal::parse_many(&response.text).map_err(SuggestionError::from)
     }
+
+    pub fn propose_patches(&self, prompt: &str) -> Result<Vec<PatchPreview>, SuggestionError> {
+        let response = self.invoke(prompt)?;
+        PatchPreview::parse_many(&response.text).map_err(SuggestionError::from)
+    }
 }
 
 impl CommandProposal {
@@ -343,6 +375,59 @@ impl CommandProposal {
             risk,
             permission,
         })
+    }
+}
+
+impl PatchPreview {
+    pub fn parse_many(text: &str) -> Result<Vec<Self>, PatchPreviewError> {
+        let value = serde_json::from_str::<JsonValue>(text)
+            .map_err(|source| PatchPreviewError::Json { source })?;
+        let raw_patches = match &value {
+            JsonValue::Array(patches) => patches,
+            JsonValue::Object(object) => object
+                .get("patches")
+                .and_then(JsonValue::as_array)
+                .ok_or(PatchPreviewError::MissingPatches)?,
+            _ => return Err(PatchPreviewError::MissingPatches),
+        };
+        if raw_patches.is_empty() {
+            return Err(PatchPreviewError::MissingPatches);
+        }
+
+        raw_patches
+            .iter()
+            .enumerate()
+            .map(|(index, patch)| Self::from_value(index, patch))
+            .collect()
+    }
+
+    fn from_value(index: usize, value: &JsonValue) -> Result<Self, PatchPreviewError> {
+        let Some(object) = value.as_object() else {
+            return Err(PatchPreviewError::MissingPath { index });
+        };
+        let path = object
+            .get("path")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .ok_or(PatchPreviewError::MissingPath { index })?;
+        let reason = object
+            .get("reason")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or(PatchPreviewError::MissingReason { index })?;
+        let diff = object
+            .get("diff")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|diff| !diff.is_empty() && looks_like_unified_diff(diff))
+            .map(ToOwned::to_owned)
+            .ok_or(PatchPreviewError::MissingDiff { index })?;
+
+        Ok(Self { path, reason, diff })
     }
 }
 
@@ -452,6 +537,12 @@ fn extract_output_text(value: &JsonValue) -> Option<String> {
                 .and_then(JsonValue::as_str)
                 .map(ToOwned::to_owned)
         })
+}
+
+fn looks_like_unified_diff(diff: &str) -> bool {
+    diff.starts_with("diff --git")
+        || (diff.contains("\n--- ") && diff.contains("\n+++ "))
+        || (diff.starts_with("--- ") && diff.contains("\n+++ "))
 }
 
 fn required_endpoint(
@@ -685,6 +776,59 @@ mod tests {
         assert_eq!(proposals[0].permission, CommandPermission::Review);
     }
 
+    #[test]
+    fn patch_previews_parse_path_reason_and_diff() {
+        let previews = PatchPreview::parse_many(
+            &json!({
+                "patches": [
+                    {
+                        "path": "src/lib.rs",
+                        "reason": "Guard a missing check.",
+                        "diff": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,2 @@\n-foo\n+foo\n+bar\n"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0].path, PathBuf::from("src/lib.rs"));
+        assert!(previews[0].diff.contains("@@"));
+    }
+
+    #[test]
+    fn patch_previews_require_unified_diff() {
+        let error = PatchPreview::parse_many(
+            &json!([
+                {
+                    "path": "src/lib.rs",
+                    "reason": "Guard a missing check.",
+                    "diff": "replace foo with bar"
+                }
+            ])
+            .to_string(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, PatchPreviewError::MissingDiff { .. }));
+    }
+
+    #[test]
+    fn propose_patches_runs_provider_and_parses_json_payload() {
+        let provider = AgentProviderConfig {
+            kind: AgentProviderKind::Cli,
+            model: None,
+            endpoint: None,
+            command: patch_cli_command(),
+        };
+
+        let adapter = ProviderAdapter::from_provider_config(&provider).unwrap();
+        let previews = adapter.propose_patches("hello provider").unwrap();
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0].path, PathBuf::from("src/lib.rs"));
+    }
+
     fn spawn_fake_http_server(
         status_line: &'static str,
         body: String,
@@ -790,6 +934,35 @@ mod tests {
                 "reason": "Inspect the repository state.",
                 "risk": "low",
                 "permission": "review"
+            }
+        ])
+        .to_string();
+
+        #[cfg(windows)]
+        {
+            vec![
+                "cmd".to_string(),
+                "/C".to_string(),
+                format!("echo {payload}"),
+            ]
+        }
+
+        #[cfg(not(windows))]
+        {
+            vec![
+                "sh".to_string(),
+                "-lc".to_string(),
+                format!("printf '%s' '{payload}'"),
+            ]
+        }
+    }
+
+    fn patch_cli_command() -> Vec<String> {
+        let payload = json!([
+            {
+                "path": "src/lib.rs",
+                "reason": "Guard a missing check.",
+                "diff": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,2 @@\n-foo\n+foo\n+bar\n"
             }
         ])
         .to_string();

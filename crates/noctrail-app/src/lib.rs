@@ -13,7 +13,7 @@ pub mod gui;
 pub mod input;
 pub mod redaction;
 
-use noctrail_agent::CommandProposal;
+use noctrail_agent::{CommandProposal, PatchPreview};
 use noctrail_layout::{
     FocusDirection, LayoutError, LayoutRect, PaneLayout, SplitAxis, WorkspaceId, WorkspaceSet,
 };
@@ -146,6 +146,76 @@ struct CommandBlockObserver {
 struct AgentProposalState {
     proposals: Vec<CommandProposal>,
     selected: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct AgentPatchPreviewState {
+    previews: Vec<PatchPreview>,
+    selected: Option<usize>,
+}
+
+impl AgentPatchPreviewState {
+    fn previews(&self) -> &[PatchPreview] {
+        &self.previews
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        self.selected
+    }
+
+    fn selected(&self) -> Option<&PatchPreview> {
+        self.selected.and_then(|index| self.previews.get(index))
+    }
+
+    fn set_previews(&mut self, previews: Vec<PatchPreview>) {
+        self.previews = previews;
+        self.selected = (!self.previews.is_empty()).then_some(0);
+    }
+
+    fn clear(&mut self) {
+        self.previews.clear();
+        self.selected = None;
+    }
+
+    fn select_oldest(&mut self) -> Option<usize> {
+        self.selected = (!self.previews.is_empty()).then_some(0);
+        self.selected
+    }
+
+    fn select_newest(&mut self) -> Option<usize> {
+        self.selected = self.previews.len().checked_sub(1);
+        self.selected
+    }
+
+    fn select_previous(&mut self) -> Option<usize> {
+        let len = self.previews.len();
+        if len == 0 {
+            self.selected = None;
+            return None;
+        }
+
+        let next = match self.selected {
+            Some(0) | None => len - 1,
+            Some(index) => index - 1,
+        };
+        self.selected = Some(next);
+        self.selected
+    }
+
+    fn select_next(&mut self) -> Option<usize> {
+        let len = self.previews.len();
+        if len == 0 {
+            self.selected = None;
+            return None;
+        }
+
+        let next = match self.selected {
+            Some(index) => (index + 1) % len,
+            None => 0,
+        };
+        self.selected = Some(next);
+        self.selected
+    }
 }
 
 impl AgentProposalState {
@@ -429,6 +499,7 @@ pub struct TerminalPane {
     status_line: PaneStatusLine,
     block_observer: CommandBlockObserver,
     agent_proposals: AgentProposalState,
+    patch_previews: AgentPatchPreviewState,
 }
 
 impl fmt::Debug for TerminalPane {
@@ -460,6 +531,7 @@ impl TerminalPane {
             status_line: PaneStatusLine::default(),
             block_observer: CommandBlockObserver::default(),
             agent_proposals: AgentProposalState::default(),
+            patch_previews: AgentPatchPreviewState::default(),
         }
     }
 
@@ -486,6 +558,7 @@ impl TerminalPane {
             status_line,
             block_observer: CommandBlockObserver::default(),
             agent_proposals: AgentProposalState::default(),
+            patch_previews: AgentPatchPreviewState::default(),
         })
     }
 
@@ -656,6 +729,42 @@ impl TerminalPane {
 
     pub fn clear_agent_command_proposals(&mut self) {
         self.agent_proposals.clear();
+    }
+
+    pub fn agent_patch_previews(&self) -> &[PatchPreview] {
+        self.patch_previews.previews()
+    }
+
+    pub fn selected_agent_patch_preview_index(&self) -> Option<usize> {
+        self.patch_previews.selected_index()
+    }
+
+    pub fn selected_agent_patch_preview(&self) -> Option<&PatchPreview> {
+        self.patch_previews.selected()
+    }
+
+    pub fn set_agent_patch_previews(&mut self, previews: Vec<PatchPreview>) {
+        self.patch_previews.set_previews(previews);
+    }
+
+    pub fn clear_agent_patch_previews(&mut self) {
+        self.patch_previews.clear();
+    }
+
+    pub fn select_oldest_agent_patch_preview(&mut self) -> Option<usize> {
+        self.patch_previews.select_oldest()
+    }
+
+    pub fn select_newest_agent_patch_preview(&mut self) -> Option<usize> {
+        self.patch_previews.select_newest()
+    }
+
+    pub fn select_previous_agent_patch_preview(&mut self) -> Option<usize> {
+        self.patch_previews.select_previous()
+    }
+
+    pub fn select_next_agent_patch_preview(&mut self) -> Option<usize> {
+        self.patch_previews.select_next()
     }
 
     pub fn select_oldest_agent_command_proposal(&mut self) -> Option<usize> {
@@ -1217,6 +1326,42 @@ impl DesktopApp {
     pub fn submit_selected_agent_command_proposal(&mut self) -> Result<usize, AppError> {
         self.active_pane_mut()
             .submit_selected_agent_command_proposal()
+    }
+
+    pub fn agent_patch_previews(&self) -> &[PatchPreview] {
+        self.active_pane_ref().agent_patch_previews()
+    }
+
+    pub fn selected_agent_patch_preview_index(&self) -> Option<usize> {
+        self.active_pane_ref().selected_agent_patch_preview_index()
+    }
+
+    pub fn selected_agent_patch_preview(&self) -> Option<&PatchPreview> {
+        self.active_pane_ref().selected_agent_patch_preview()
+    }
+
+    pub fn set_agent_patch_previews(&mut self, previews: Vec<PatchPreview>) {
+        self.active_pane_mut().set_agent_patch_previews(previews);
+    }
+
+    pub fn clear_agent_patch_previews(&mut self) {
+        self.active_pane_mut().clear_agent_patch_previews();
+    }
+
+    pub fn select_oldest_agent_patch_preview(&mut self) -> Option<usize> {
+        self.active_pane_mut().select_oldest_agent_patch_preview()
+    }
+
+    pub fn select_newest_agent_patch_preview(&mut self) -> Option<usize> {
+        self.active_pane_mut().select_newest_agent_patch_preview()
+    }
+
+    pub fn select_previous_agent_patch_preview(&mut self) -> Option<usize> {
+        self.active_pane_mut().select_previous_agent_patch_preview()
+    }
+
+    pub fn select_next_agent_patch_preview(&mut self) -> Option<usize> {
+        self.active_pane_mut().select_next_agent_patch_preview()
     }
 
     pub fn mouse_tracking_mode(&self) -> MouseTrackingMode {
@@ -2588,6 +2733,28 @@ mod tests {
 
         app.clear_agent_command_proposals();
         assert!(app.agent_command_proposals().is_empty());
+    }
+
+    #[test]
+    fn agent_patch_previews_stay_read_only_on_desktop_state() {
+        let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(20, 4));
+        app.set_agent_patch_previews(vec![PatchPreview {
+            path: PathBuf::from("src/lib.rs"),
+            reason: "Guard a missing check.".to_string(),
+            diff: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,2 @@\n-foo\n+foo\n+bar\n"
+                .to_string(),
+        }]);
+
+        assert_eq!(app.agent_patch_previews().len(), 1);
+        assert_eq!(
+            app.selected_agent_patch_preview()
+                .map(|preview| preview.path.as_path()),
+            Some(Path::new("src/lib.rs"))
+        );
+
+        let _ = app.select_next_agent_patch_preview();
+        app.clear_agent_patch_previews();
+        assert!(app.agent_patch_previews().is_empty());
     }
 
     #[test]

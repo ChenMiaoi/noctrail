@@ -33,6 +33,7 @@ Usage:
 Commands:
   agent-context-smoke Run the read-only agent context preview probe
   agent-default-smoke Run the default-off agent policy probe
+  agent-patch-preview-smoke Run the patch preview diff probe
   agent-proposal-smoke Run the command proposal suggestion probe
   agent-review-smoke Run the review panel confirmation probe
   agent-provider-smoke Run the provider failure isolation probe
@@ -64,6 +65,7 @@ struct StartupOptions {
 enum StartupCommand {
     AgentContextSmoke,
     AgentDefaultSmoke,
+    AgentPatchPreviewSmoke,
     AgentProposalSmoke,
     AgentReviewSmoke,
     AgentProviderSmoke,
@@ -136,6 +138,12 @@ fn main() {
         }
         StartupCommand::AgentDefaultSmoke => {
             if let Err(error) = run_agent_default_smoke() {
+                eprintln!("{error}");
+                process::exit(1);
+            }
+        }
+        StartupCommand::AgentPatchPreviewSmoke => {
+            if let Err(error) = gui::patch_preview_smoke() {
                 eprintln!("{error}");
                 process::exit(1);
             }
@@ -230,6 +238,10 @@ fn parse_startup_options(args: &[String]) -> Result<StartupOptions, StartupError
             }
             "agent-default-smoke" if !command_set => {
                 command = StartupCommand::AgentDefaultSmoke;
+                command_set = true;
+            }
+            "agent-patch-preview-smoke" if !command_set => {
+                command = StartupCommand::AgentPatchPreviewSmoke;
                 command_set = true;
             }
             "agent-proposal-smoke" if !command_set => {
@@ -1817,6 +1829,16 @@ mod tests {
             .expect("options should parse");
 
         assert_eq!(options.command, StartupCommand::AgentProposalSmoke);
+        assert_eq!(options.config_path, None);
+        assert!(!options.safe_mode);
+    }
+
+    #[test]
+    fn parses_agent_patch_preview_smoke_command() {
+        let options = parse_startup_options(&["agent-patch-preview-smoke".to_string()])
+            .expect("options should parse");
+
+        assert_eq!(options.command, StartupCommand::AgentPatchPreviewSmoke);
         assert_eq!(options.config_path, None);
         assert!(!options.safe_mode);
     }

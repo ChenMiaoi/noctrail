@@ -12,6 +12,7 @@ pub enum ShortcutAction {
     ToggleAgentContextPreview,
     ToggleBlockBrowser,
     ToggleCommandPalette,
+    TogglePatchPreview,
     ToggleReviewPanel,
 }
 
@@ -60,6 +61,7 @@ pub fn shortcut_action(logical_key: &Key, modifiers: ModifiersState) -> Option<S
                 "a" => Some(ShortcutAction::ToggleAgentContextPreview),
                 "b" => Some(ShortcutAction::ToggleBlockBrowser),
                 "c" => Some(ShortcutAction::Copy),
+                "d" => Some(ShortcutAction::TogglePatchPreview),
                 "p" => Some(ShortcutAction::ToggleCommandPalette),
                 "r" => Some(ShortcutAction::ToggleReviewPanel),
                 "v" => Some(ShortcutAction::Paste),
@@ -402,6 +404,13 @@ mod tests {
         assert_eq!(
             shortcut_action(&Key::Named(NamedKey::Insert), ModifiersState::SHIFT),
             Some(ShortcutAction::Paste)
+        );
+        assert_eq!(
+            shortcut_action(
+                &Key::Character("d".into()),
+                ModifiersState::CONTROL | ModifiersState::SHIFT,
+            ),
+            Some(ShortcutAction::TogglePatchPreview)
         );
         assert_eq!(
             shortcut_action(
