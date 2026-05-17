@@ -12,6 +12,22 @@ real machines and be uploaded outside this repository workflow.
 See [docs/release-blockers.md](../release-blockers.md) for the active
 scope language.
 
+## External Evidence Ledger
+
+The repository now distinguishes between:
+
+- branch-local macOS validation that is runnable here
+- external native Linux and Windows validation that must be attached
+  from outside this local workspace
+
+Current evidence state:
+
+| Platform | Core smoke commands | Current state |
+|---|---|---|
+| macOS | local commands in this document | verified locally |
+| Linux | equivalent native smoke run | awaiting uploaded native evidence |
+| Windows | equivalent native smoke run | awaiting uploaded native evidence |
+
 ## Core Smoke Commands
 
 Current macOS-local platform smoke commands are:
@@ -57,3 +73,7 @@ auditing non-blocking behavior:
 The current GitHub workflows still define broader multi-platform
 matrices, but the branch's active release gate does not require remote
 Linux or Windows success until those external native runs are supplied.
+
+When those uploads arrive, they should be attached as the authoritative
+evidence for the Linux and Windows rows above rather than inferred from
+this macOS-local workspace.

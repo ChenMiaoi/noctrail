@@ -9,6 +9,10 @@ Current acceptance scope for this branch is `macOS only`. Linux and
 Windows validation will be run separately on native machines and the
 results will be uploaded outside this repository workflow.
 
+This means `READY` below is only a statement about the active
+macOS-local beta gate. It is not evidence that the broader
+cross-platform roadmap requirement has already been satisfied.
+
 ## Summary
 
 - `OPEN`: 0
@@ -36,3 +40,14 @@ results will be uploaded outside this repository workflow.
 
 Within the current macOS-only scope, Noctrail must not be labeled beta
 until every blocker above is `CLOSED`.
+
+## External Validation Pending
+
+The following evidence is still expected before anyone claims the full
+cross-platform Phase 10 requirement is complete:
+
+| Platform | Installer smoke | Build/test matrix | Evidence source |
+|---|---|---|---|
+| macOS | local pass recorded | local pass recorded | this repository state |
+| Linux | pending external native run | pending external native run | upload not yet attached |
+| Windows | pending external native run | pending external native run | upload not yet attached |
