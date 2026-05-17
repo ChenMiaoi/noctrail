@@ -1,9 +1,10 @@
 //! Render plan and backend boundary for Noctrail.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use cosmic_text::{
-    Attrs as FontAttrs, Buffer as FontBuffer, Family as FontFamily, FontSystem, Metrics, Shaping,
+    Attrs as FontAttrs, Buffer as FontBuffer, CacheKey, Family as FontFamily, FontSystem,
+    LayoutGlyph, Metrics, Shaping,
     fontdb::{self, Query},
 };
 use noctrail_term::{
@@ -264,9 +265,64 @@ struct FontCandidate {
     label: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlyphRasterConfig {
+    pub font: FontPreferences,
+    pub scale: f32,
+    pub cell_width: f32,
+    pub line_height: f32,
+}
+
+impl Default for GlyphRasterConfig {
+    fn default() -> Self {
+        Self {
+            font: FontPreferences::default(),
+            scale: 1.0,
+            cell_width: DEFAULT_FONT_SIZE,
+            line_height: DEFAULT_FONT_SIZE * 1.4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedGlyph {
+    pub row: usize,
+    pub col: usize,
+    pub text: String,
+    pub cache_key: CacheKey,
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PreparedGlyphFrame {
+    pub glyphs: Vec<PreparedGlyph>,
+    pub unique_cache_keys: Vec<CacheKey>,
+}
+
+impl PreparedGlyphFrame {
+    pub fn raster_jobs(&self) -> usize {
+        self.unique_cache_keys.len()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum GlyphPrepareError {
+    #[error("no fonts available for glyph preparation")]
+    NoFonts,
+}
+
 pub fn probe_font_diagnostics(preferences: &FontPreferences) -> FontDiagnostics {
     let mut font_system = FontSystem::new();
     collect_font_diagnostics(&mut font_system, preferences)
+}
+
+pub fn prepare_glyph_frame(
+    plan: &RenderPlan,
+    config: &GlyphRasterConfig,
+) -> Result<PreparedGlyphFrame, GlyphPrepareError> {
+    let mut font_system = FontSystem::new();
+    prepare_glyph_frame_with_font_system(&mut font_system, plan, config)
 }
 
 fn collect_font_diagnostics(
@@ -577,6 +633,98 @@ fn diagnose_font_sample(
         fonts,
         missing_glyphs,
     }
+}
+
+fn prepare_glyph_frame_with_font_system(
+    font_system: &mut FontSystem,
+    plan: &RenderPlan,
+    config: &GlyphRasterConfig,
+) -> Result<PreparedGlyphFrame, GlyphPrepareError> {
+    if font_system.db().faces().next().is_none() {
+        return Err(GlyphPrepareError::NoFonts);
+    }
+
+    let mut glyphs = Vec::new();
+    let mut unique_cache_keys = BTreeSet::new();
+
+    for row in &plan.rows {
+        for glyph in &row.glyphs {
+            if glyph.wide_continuation || glyph.text.is_empty() {
+                continue;
+            }
+
+            let attrs = font_attrs_for_render_glyph(glyph.style, config);
+            let shaped_glyphs = shape_cluster(
+                font_system,
+                &glyph.text,
+                attrs,
+                Metrics::new(config.font.size, config.line_height),
+                config.cell_width.max(config.font.size * 2.0),
+                config.line_height,
+            );
+            let offset = (
+                glyph.col as f32 * config.cell_width,
+                row.row as f32 * config.line_height,
+            );
+
+            for layout_glyph in shaped_glyphs {
+                let physical = layout_glyph.physical(offset, config.scale);
+                unique_cache_keys.insert(physical.cache_key);
+                glyphs.push(PreparedGlyph {
+                    row: row.row,
+                    col: glyph.col,
+                    text: glyph.text.clone(),
+                    cache_key: physical.cache_key,
+                    x: physical.x,
+                    y: physical.y,
+                });
+            }
+        }
+    }
+
+    Ok(PreparedGlyphFrame {
+        glyphs,
+        unique_cache_keys: unique_cache_keys.into_iter().collect(),
+    })
+}
+
+fn font_attrs_for_render_glyph<'a>(style: Style, config: &'a GlyphRasterConfig) -> FontAttrs<'a> {
+    let metrics = Metrics::new(config.font.size, config.line_height);
+    let mut attrs = FontAttrs::new()
+        .family(FontFamily::Name(&config.font.family))
+        .metrics(metrics);
+
+    if style.bold {
+        attrs = attrs.weight(fontdb::Weight::BOLD);
+    }
+
+    if style.italic {
+        attrs = attrs.style(fontdb::Style::Italic);
+    }
+
+    if !style.bold && !style.italic {
+        attrs = attrs.weight(fontdb::Weight::NORMAL);
+    }
+
+    attrs
+}
+
+fn shape_cluster(
+    font_system: &mut FontSystem,
+    text: &str,
+    attrs: FontAttrs<'_>,
+    metrics: Metrics,
+    width: f32,
+    height: f32,
+) -> Vec<LayoutGlyph> {
+    let mut buffer = FontBuffer::new(font_system, metrics);
+    let mut buffer = buffer.borrow_with(font_system);
+    buffer.set_size(Some(width), Some(height));
+    buffer.set_text(text, &attrs, Shaping::Advanced, None);
+    buffer
+        .layout_runs()
+        .flat_map(|run| run.glyphs.iter().cloned())
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -965,6 +1113,56 @@ mod tests {
                 .all(|sample| sample.status == FontSampleStatus::Missing)
         );
         assert!(!diagnostics.logs.is_empty());
+    }
+
+    #[test]
+    fn glyph_frame_dedupes_repeated_ascii_raster_jobs() {
+        let snapshot = TerminalSnapshot {
+            rows: vec![ScreenRowSnapshot {
+                cells: vec![cell("A"), cell("A"), cell("A"), cell("A")],
+                wrapped: false,
+            }],
+            ..TerminalSnapshot::default()
+        };
+        let plan = RenderPlan::from_terminal(
+            RenderRect::new(0, 0, 4, 1),
+            RenderBackend::Software,
+            &snapshot,
+        );
+
+        let prepared = prepare_glyph_frame(&plan, &GlyphRasterConfig::default()).unwrap();
+
+        assert_eq!(prepared.glyphs.len(), 4);
+        assert_eq!(prepared.raster_jobs(), 1);
+    }
+
+    #[test]
+    fn glyph_frame_scale_changes_cache_keys() {
+        let snapshot = TerminalSnapshot {
+            rows: vec![ScreenRowSnapshot {
+                cells: vec![cell("A")],
+                wrapped: false,
+            }],
+            ..TerminalSnapshot::default()
+        };
+        let plan = RenderPlan::from_terminal(
+            RenderRect::new(0, 0, 1, 1),
+            RenderBackend::Software,
+            &snapshot,
+        );
+        let frame_at_1x = prepare_glyph_frame(&plan, &GlyphRasterConfig::default()).unwrap();
+        let frame_at_2x = prepare_glyph_frame(
+            &plan,
+            &GlyphRasterConfig {
+                scale: 2.0,
+                ..GlyphRasterConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(frame_at_1x.raster_jobs(), 1);
+        assert_eq!(frame_at_2x.raster_jobs(), 1);
+        assert_ne!(frame_at_1x.unique_cache_keys, frame_at_2x.unique_cache_keys);
     }
 
     #[test]
