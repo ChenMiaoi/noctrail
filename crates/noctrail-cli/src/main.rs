@@ -36,6 +36,7 @@ Commands:
   doctor font Print font fallback diagnostics
   replay      Replay one or more terminal recording fixtures
   shell-matrix Run the shell compatibility smoke matrix
+  prompt-matrix Run the prompt compatibility smoke matrix
   tui-matrix  Run the TUI compatibility smoke matrix
   render-fixtures  Run deterministic render fixtures
   render-smoke Run the render smoke check
@@ -87,6 +88,13 @@ fn main() {
         Some("shell-matrix") => {
             let targets: Vec<String> = args.collect();
             if let Err(error) = run_shell_matrix(&targets) {
+                eprintln!("{error}");
+                process::exit(1);
+            }
+        }
+        Some("prompt-matrix") => {
+            let targets: Vec<String> = args.collect();
+            if let Err(error) = run_prompt_matrix(&targets) {
                 eprintln!("{error}");
                 process::exit(1);
             }
@@ -328,6 +336,85 @@ struct ShellProbeReport {
     status: ShellProbeStatus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptCapability {
+    Layout,
+    Escape,
+}
+
+impl PromptCapability {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Layout => "layout",
+            Self::Escape => "escape",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PromptTargetSpec {
+    name: &'static str,
+    build_probe: Option<PromptProbeBuilder>,
+    required: &'static [PromptCapability],
+    skip_hint: &'static str,
+}
+
+type PromptProbeBuilder = fn() -> Result<PromptProbe, String>;
+
+#[derive(Debug, Clone)]
+struct PromptProbe {
+    target: &'static str,
+    source: String,
+    command: noctrail_pty::PtyCommand,
+    initial_size: PtySize,
+    prompt_lines: Vec<String>,
+    input_line: String,
+    input_row: usize,
+    expected_result: String,
+    required: &'static [PromptCapability],
+    cleanup_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ObservedPromptCapabilities {
+    layout: bool,
+    escape: bool,
+}
+
+impl ObservedPromptCapabilities {
+    fn contains(self, capability: PromptCapability) -> bool {
+        match capability {
+            PromptCapability::Layout => self.layout,
+            PromptCapability::Escape => self.escape,
+        }
+    }
+
+    fn labels(self) -> Vec<&'static str> {
+        let mut labels = Vec::new();
+        for capability in [PromptCapability::Layout, PromptCapability::Escape] {
+            if self.contains(capability) {
+                labels.push(capability.label());
+            }
+        }
+        labels
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromptProbeStatus {
+    Passed,
+    Skipped(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromptProbeReport {
+    target: &'static str,
+    source: String,
+    observed: ObservedPromptCapabilities,
+    required: Vec<&'static str>,
+    status: PromptProbeStatus,
+}
+
 fn print_doctor_shell() {
     let shell = ResolvedShell::detect();
 
@@ -436,6 +523,388 @@ fn run_shell_matrix(filters: &[String]) -> Result<(), String> {
         println!("shell matrix ok");
     }
     Ok(())
+}
+
+fn run_prompt_matrix(filters: &[String]) -> Result<(), String> {
+    let specs = prompt_target_specs();
+    let selected = select_prompt_targets(&specs, filters)?;
+    let mut ran_any = false;
+    let mut failures = Vec::new();
+
+    for spec in selected {
+        match run_prompt_target(spec) {
+            Ok(report) => {
+                println!("{}", format_prompt_report(&report));
+                if matches!(report.status, PromptProbeStatus::Passed) {
+                    ran_any = true;
+                }
+            }
+            Err(error) => failures.push(format!("{}: {error}", spec.name)),
+        }
+    }
+
+    if !failures.is_empty() {
+        return Err(failures.join("\n"));
+    }
+
+    if !ran_any {
+        println!("prompt-matrix: all selected targets were skipped");
+    } else {
+        println!("prompt matrix ok");
+    }
+    Ok(())
+}
+
+fn run_prompt_target(spec: &PromptTargetSpec) -> Result<PromptProbeReport, String> {
+    let Some(build_probe) = spec.build_probe else {
+        return Ok(PromptProbeReport {
+            target: spec.name,
+            source: "unavailable".to_string(),
+            observed: ObservedPromptCapabilities::default(),
+            required: spec.required.iter().map(|cap| cap.label()).collect(),
+            status: PromptProbeStatus::Skipped(spec.skip_hint.to_string()),
+        });
+    };
+
+    let probe = build_probe()?;
+    let result = run_prompt_probe(&probe);
+    cleanup_prompt_probe(&probe);
+    let observed = result?;
+    let missing = probe
+        .required
+        .iter()
+        .filter(|capability| !observed.contains(**capability))
+        .map(|capability| capability.label())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "missing capabilities [{}] from {}",
+            missing.join(", "),
+            probe.source
+        ));
+    }
+
+    Ok(PromptProbeReport {
+        target: probe.target,
+        source: probe.source,
+        observed,
+        required: probe.required.iter().map(|cap| cap.label()).collect(),
+        status: PromptProbeStatus::Passed,
+    })
+}
+
+fn run_prompt_probe(probe: &PromptProbe) -> Result<ObservedPromptCapabilities, String> {
+    let mut session = PtySession::spawn(probe.command.clone(), probe.initial_size)
+        .map_err(|error| format!("failed to spawn {} prompt probe: {error}", probe.target))?;
+    let reader = session
+        .clone_output_reader()
+        .map_err(|error| format!("failed to clone {} prompt reader: {error}", probe.target))?;
+    let (tx, rx) = mpsc::channel();
+    let reader_handle = thread::spawn(move || pump_tui_output(reader, tx));
+    let mut terminal = TerminalState::new(
+        usize::from(probe.initial_size.cols),
+        usize::from(probe.initial_size.rows),
+    );
+    let _ = terminal.grid_mut().take_dirty_rows();
+    let mut observed = ObservedPromptCapabilities::default();
+    let mut input_sent = false;
+    let mut prompt_ready = false;
+    let mut exit_seen = false;
+    let started_at = Instant::now();
+    let timeout = Duration::from_secs(4);
+
+    while started_at.elapsed() <= timeout {
+        match rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(TuiProbeReaderEvent::Bytes(bytes)) => {
+                terminal.advance_bytes(&bytes);
+                if !input_sent && prompt_is_ready(&terminal.snapshot(), probe) {
+                    prompt_ready = true;
+                    session
+                        .write(probe.input_line.as_bytes())
+                        .map_err(|error| {
+                            format!("failed to write {} prompt input: {error}", probe.target)
+                        })?;
+                    session.write(b"\r").map_err(|error| {
+                        format!("failed to submit {} prompt input: {error}", probe.target)
+                    })?;
+                    input_sent = true;
+                }
+            }
+            Ok(TuiProbeReaderEvent::Eof) => {
+                exit_seen = session.try_wait().ok().flatten().is_some();
+                break;
+            }
+            Ok(TuiProbeReaderEvent::Error(error)) => {
+                let _ = session.close();
+                let _ = reader_handle.join();
+                return Err(format!("{} prompt reader error: {error}", probe.target));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if session.try_wait().ok().flatten().is_some() {
+                    exit_seen = true;
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                exit_seen = true;
+                break;
+            }
+        }
+    }
+
+    let status = session
+        .close()
+        .map_err(|error| format!("failed to close {} prompt probe: {error}", probe.target))?;
+    let _ = reader_handle.join();
+    exit_seen |= status.as_ref().is_some_and(|status| status.success());
+    if !exit_seen {
+        return Err(format!("{} prompt probe timed out", probe.target));
+    }
+
+    let snapshot = terminal.snapshot();
+    let rendered_rows = snapshot
+        .rows
+        .iter()
+        .map(ScreenRowSnapshot::rendered_text)
+        .collect::<Vec<_>>();
+    observed.layout = prompt_ready && prompt_layout_matches(&rendered_rows, probe);
+    observed.escape = prompt_escape_is_clean(&snapshot, &rendered_rows, probe);
+
+    Ok(observed)
+}
+
+fn prompt_is_ready(snapshot: &TerminalSnapshot, probe: &PromptProbe) -> bool {
+    if snapshot.cursor.row != probe.input_row {
+        return false;
+    }
+    if snapshot.cursor.col != probe.prompt_lines.last().map_or(0, String::len) {
+        return false;
+    }
+
+    prompt_rows_match(
+        &snapshot
+            .rows
+            .iter()
+            .map(ScreenRowSnapshot::rendered_text)
+            .collect::<Vec<_>>(),
+        probe,
+    )
+}
+
+fn prompt_layout_matches(rendered_rows: &[String], probe: &PromptProbe) -> bool {
+    prompt_rows_match(rendered_rows, probe)
+        && rendered_rows.get(probe.input_row).is_some_and(|row| {
+            row.starts_with(&format!(
+                "{}{}",
+                probe.prompt_lines[probe.input_row], probe.input_line
+            ))
+        })
+        && rendered_rows
+            .iter()
+            .any(|row| row.contains(&probe.expected_result))
+}
+
+fn prompt_rows_match(rendered_rows: &[String], probe: &PromptProbe) -> bool {
+    probe
+        .prompt_lines
+        .iter()
+        .enumerate()
+        .all(|(index, expected)| {
+            rendered_rows
+                .get(index)
+                .is_some_and(|row| row.starts_with(expected))
+        })
+}
+
+fn prompt_escape_is_clean(
+    snapshot: &TerminalSnapshot,
+    rendered_rows: &[String],
+    probe: &PromptProbe,
+) -> bool {
+    if rendered_rows.iter().any(|row| row.contains('\u{1b}')) {
+        return false;
+    }
+
+    prompt_rows_match(rendered_rows, probe) && prompt_has_non_default_style(snapshot, probe)
+}
+
+fn prompt_has_non_default_style(snapshot: &TerminalSnapshot, probe: &PromptProbe) -> bool {
+    probe
+        .prompt_lines
+        .iter()
+        .enumerate()
+        .all(|(row_index, expected)| {
+            let Some(row) = snapshot.rows.get(row_index) else {
+                return false;
+            };
+            row.cells
+                .iter()
+                .take(expected.len())
+                .filter(|cell| !cell.text.is_empty())
+                .any(|cell| !cell.style.is_default())
+        })
+}
+
+fn cleanup_prompt_probe(probe: &PromptProbe) {
+    for path in &probe.cleanup_paths {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn format_prompt_report(report: &PromptProbeReport) -> String {
+    let required = if report.required.is_empty() {
+        "none".to_string()
+    } else {
+        report.required.join(",")
+    };
+    let observed = {
+        let labels = report.observed.labels();
+        if labels.is_empty() {
+            "none".to_string()
+        } else {
+            labels.join(",")
+        }
+    };
+
+    match &report.status {
+        PromptProbeStatus::Passed => format!(
+            "pass {} source={} required={} observed={}",
+            report.target, report.source, required, observed
+        ),
+        PromptProbeStatus::Skipped(reason) => format!(
+            "skip {} source={} required={} reason={}",
+            report.target, report.source, required, reason
+        ),
+    }
+}
+
+fn select_prompt_targets<'a>(
+    specs: &'a [PromptTargetSpec],
+    filters: &[String],
+) -> Result<Vec<&'a PromptTargetSpec>, String> {
+    if filters.is_empty() {
+        return Ok(specs.iter().collect());
+    }
+
+    let mut selected = Vec::new();
+    for filter in filters {
+        let Some(spec) = specs.iter().find(|spec| spec.name == filter) else {
+            return Err(format!("unknown prompt target: {filter}"));
+        };
+        if !selected
+            .iter()
+            .any(|existing: &&PromptTargetSpec| existing.name == spec.name)
+        {
+            selected.push(spec);
+        }
+    }
+
+    Ok(selected)
+}
+
+fn prompt_target_specs() -> Vec<PromptTargetSpec> {
+    vec![
+        PromptTargetSpec {
+            name: "starship",
+            build_probe: prompt_probe_builder(starship_prompt_probe),
+            required: &[PromptCapability::Layout, PromptCapability::Escape],
+            skip_hint: "prompt emulation is unavailable on this platform",
+        },
+        PromptTargetSpec {
+            name: "oh-my-zsh",
+            build_probe: prompt_probe_builder(oh_my_zsh_prompt_probe),
+            required: &[PromptCapability::Layout, PromptCapability::Escape],
+            skip_hint: "prompt emulation is unavailable on this platform",
+        },
+        PromptTargetSpec {
+            name: "powerlevel10k",
+            build_probe: prompt_probe_builder(powerlevel10k_prompt_probe),
+            required: &[PromptCapability::Layout, PromptCapability::Escape],
+            skip_hint: "prompt emulation is unavailable on this platform",
+        },
+    ]
+}
+
+#[cfg(not(windows))]
+fn prompt_probe_builder(builder: PromptProbeBuilder) -> Option<PromptProbeBuilder> {
+    Some(builder)
+}
+
+#[cfg(windows)]
+fn prompt_probe_builder(_builder: PromptProbeBuilder) -> Option<PromptProbeBuilder> {
+    None
+}
+
+#[cfg(not(windows))]
+fn starship_prompt_probe() -> Result<PromptProbe, String> {
+    prompt_script_probe(
+        "starship",
+        "printf '\\033[32mSTARSHIP\\033[0m \\033[34mPROMPT\\033[0m > '\n",
+        vec!["STARSHIP PROMPT > ".to_string()],
+        0,
+        "status",
+    )
+}
+
+#[cfg(not(windows))]
+fn oh_my_zsh_prompt_probe() -> Result<PromptProbe, String> {
+    prompt_script_probe(
+        "oh-my-zsh",
+        "printf '\\033[35mOHMYZSH\\033[0m \\033[33m%%\\033[0m '\n",
+        vec!["OHMYZSH % ".to_string()],
+        0,
+        "pwd",
+    )
+}
+
+#[cfg(not(windows))]
+fn powerlevel10k_prompt_probe() -> Result<PromptProbe, String> {
+    prompt_script_probe(
+        "powerlevel10k",
+        "printf '\\033[36mP10K-L1\\033[0m\\n\\033[35mP10K>\\033[0m '\n",
+        vec!["P10K-L1".to_string(), "P10K> ".to_string()],
+        1,
+        "build",
+    )
+}
+
+#[cfg(not(windows))]
+fn prompt_script_probe(
+    target: &'static str,
+    prompt_body: &str,
+    prompt_lines: Vec<String>,
+    input_row: usize,
+    input_line: &str,
+) -> Result<PromptProbe, String> {
+    let script_path = temp_fixture_path(target, "sh");
+    fs::write(
+        &script_path,
+        format!(
+            "#!/bin/sh\n{prompt_body}IFS= read -r line || exit 1\nprintf '\\nRESULT:%s\\n' \"$line\"\n"
+        ),
+    )
+    .map_err(|error| format!("failed to write {target} prompt script: {error}"))?;
+    make_executable_path(&script_path)?;
+
+    let mut command = noctrail_pty::PtyCommand::new("/bin/sh");
+    command.arg(&script_path);
+    command.cwd_path(
+        env::current_dir()
+            .map_err(|error| format!("failed to resolve current working directory: {error}"))?,
+    );
+
+    Ok(PromptProbe {
+        target,
+        source: format!("builtin:{}", script_path.display()),
+        command,
+        initial_size: PtySize::new(120, 24),
+        prompt_lines,
+        input_line: input_line.to_string(),
+        input_row,
+        expected_result: format!("RESULT:{input_line}"),
+        required: &[PromptCapability::Layout, PromptCapability::Escape],
+        cleanup_paths: vec![script_path],
+    })
 }
 
 fn run_shell_target(spec: &'static ShellTargetSpec) -> Result<ShellProbeReport, String> {
@@ -2330,6 +2799,20 @@ mod tests {
         assert_eq!(selected[0].name, "WSL");
     }
 
+    #[test]
+    fn prompt_target_filter_accepts_named_targets() {
+        let specs = prompt_target_specs();
+        let selected = select_prompt_targets(
+            &specs,
+            &[String::from("starship"), String::from("powerlevel10k")],
+        )
+        .expect("filters should resolve");
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].name, "starship");
+        assert_eq!(selected[1].name, "powerlevel10k");
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn tui_matrix_accepts_override_probe() {
@@ -2384,6 +2867,12 @@ mod tests {
         let _ = fs::remove_file(&script_path);
 
         result.expect("override probe should pass");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn prompt_matrix_builtin_emulations_pass() {
+        run_prompt_matrix(&[]).expect("builtin prompt probes should pass");
     }
 
     fn env_test_lock() -> &'static Mutex<()> {
