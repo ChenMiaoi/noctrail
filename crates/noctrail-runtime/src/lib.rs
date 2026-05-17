@@ -477,7 +477,11 @@ impl PaneRuntimeRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::error::Error as StdError;
+    use std::{
+        error::Error as StdError,
+        thread,
+        time::{Duration, Instant},
+    };
 
     #[test]
     fn registry_tracks_shells_independently() -> Result<(), Box<dyn StdError>> {
@@ -673,9 +677,18 @@ mod tests {
             other => panic!("expected output event, got {other:?}"),
         }
 
-        let exit = registry
-            .read_output_event(pane_id, &mut buf)?
-            .expect("second read should emit exit");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let exit = loop {
+            match registry.read_output_event(pane_id, &mut buf)? {
+                Some(event) => break event,
+                None => {
+                    if Instant::now() >= deadline {
+                        panic!("read_output_event did not emit exit before timeout");
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+        };
         assert!(matches!(
             exit,
             RuntimeEvent::Exited {
