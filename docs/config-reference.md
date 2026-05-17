@@ -109,7 +109,23 @@ foreground = "#ffffff"
 - Default: `1.0`
 - Constraint: `0.0..=1.0`
 
-Color fields
+`theme.color.background`
+- Type: color string
+- Default: `"#050a0f"`
+
+`theme.color.foreground`
+- Type: color string
+- Default: `"#c0caf5"`
+
+`theme.border.active`
+- Type: color string
+- Default: `"#7aa2f7"`
+
+`theme.border.inactive`
+- Type: color string
+- Default: `"#3b4261"`
+
+Color-valued fields
 - Type: string
 - Format: `#RRGGBB` or `#RRGGBBAA`
 
@@ -151,10 +167,22 @@ Color fields
 - Type: bool
 - Default: `false`
 
+`theme.cursor.color`
+- Type: color string
+- Default: `"#c0caf5"`
+
 `theme.cursor.blink-interval-ms`
 - Type: integer
 - Default: `600`
 - Constraint: `> 0`
+
+`theme.selection.background`
+- Type: color string
+- Default: `"#264f78cc"`
+
+`theme.selection.foreground`
+- Type: color string
+- Default: `"#ffffff"`
 
 ## Keymap
 
@@ -259,6 +287,20 @@ command = []
 `agent.provider.type`
 - Type: string
 - Accepted values: `"openai-compatible"`, `"local"`, `"cli"`
+
+`agent.provider.model`
+- Type: optional string
+- Required for: `"openai-compatible"`, `"local"`
+
+`agent.provider.endpoint`
+- Type: optional string
+- Required for: `"openai-compatible"`
+
+`agent.provider.command`
+- Type: string array
+- Required for: `"cli"`
+- Example:
+  `command = ["sh", "-lc", "printf '{\\\"commands\\\":[]}'"]`
 
 Provider validation:
 - If `agent.enabled = true`, `agent.provider` must exist
