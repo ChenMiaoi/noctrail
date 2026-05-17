@@ -1997,8 +1997,10 @@ mod tests {
         let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
         let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
 
-        gui.handle_ime_event(Ime::Preedit("zhong".to_string(), None))?;
-        assert_eq!(gui.ime_preedit.as_deref(), Some("zhong"));
+        gui.handle_ime_event(Ime::Preedit("中🙂".to_string(), None))?;
+        assert_eq!(gui.ime_preedit.as_deref(), Some("中🙂"));
+        assert_eq!(gui.app.frame().render_plan.cursor.col, 0);
+        assert!(rendered_text(&gui.app.frame()).trim().is_empty());
 
         gui.handle_ime_event(Ime::Preedit(String::new(), None))?;
         assert!(gui.ime_preedit.is_none());
@@ -2102,8 +2104,9 @@ mod tests {
         let app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24))?;
         let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
         gui.attach_output_pump()?;
+        let marker = "中🙂e\u{301}";
 
-        gui.handle_ime_event(Ime::Commit("NOCTRAIL_IME".to_string()))?;
+        gui.handle_ime_event(Ime::Commit(marker.to_string()))?;
         gui.app.write_input(b"\r")?;
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2123,7 +2126,7 @@ mod tests {
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                if text.contains("NOCTRAIL_IME") {
+                if text.contains(marker) {
                     observed = true;
                     break;
                 }
