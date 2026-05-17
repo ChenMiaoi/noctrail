@@ -9,3 +9,5 @@ description = "PTY/process boundary for Noctrail."
 publish = false
 
 [dependencies]
+portable-pty = "0.9"
+thiserror = "2"
