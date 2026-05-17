@@ -237,23 +237,41 @@ fn run_pty_smoke() -> Result<(), String> {
 }
 
 fn run_single_shell_pty_smoke() -> Result<(), String> {
-    let probe = pty_smoke_probe("NOCTRAIL_PTY_SMOKE")?;
+    let probe = pty_resize_smoke_probe()?;
     let mut session = PtySession::spawn_shell(PtySize::new(80, 24))
         .map_err(|error| format!("failed to spawn PTY shell: {error}"))?;
     session
-        .write(&probe.input)
-        .map_err(|error| format!("failed to write PTY smoke input: {error}"))?;
-    let output = read_all_output(&mut session)
+        .write(&probe.initial_input)
+        .map_err(|error| format!("failed to write initial PTY smoke input: {error}"))?;
+    let initial_output = read_until_fragments(&mut session, &probe.initial_expected_fragments)
+        .map_err(|error| format!("failed to read initial PTY smoke output: {error}"))?;
+    session
+        .resize(probe.resized_size)
+        .map_err(|error| format!("failed to resize PTY smoke session: {error}"))?;
+    session
+        .write(&probe.resized_input)
+        .map_err(|error| format!("failed to write resized PTY smoke input: {error}"))?;
+    let resized_output = read_all_output(&mut session)
         .map_err(|error| format!("failed to read PTY smoke output: {error}"))?;
     let _ = session.close();
 
-    let haystack = String::from_utf8_lossy(&output);
+    let initial_haystack = String::from_utf8_lossy(&initial_output);
+    let resized_haystack = String::from_utf8_lossy(&resized_output);
 
-    for expected in &probe.expected_fragments {
-        if !haystack.contains(expected) {
+    for expected in &probe.initial_expected_fragments {
+        if !initial_haystack.contains(expected) {
             return Err(format!(
-                "PTY smoke output missing {:?}; output was {:?}",
-                expected, haystack
+                "initial PTY smoke output missing {:?}; output was {:?}",
+                expected, initial_haystack
+            ));
+        }
+    }
+
+    for expected in &probe.resized_expected_fragments {
+        if !resized_haystack.contains(expected) {
+            return Err(format!(
+                "resized PTY smoke output missing {:?}; output was {:?}",
+                expected, resized_haystack
             ));
         }
     }
@@ -261,10 +279,99 @@ fn run_single_shell_pty_smoke() -> Result<(), String> {
     Ok(())
 }
 
+struct PtyResizeSmokeProbe {
+    initial_input: Vec<u8>,
+    resized_input: Vec<u8>,
+    resized_size: PtySize,
+    initial_expected_fragments: Vec<String>,
+    resized_expected_fragments: Vec<String>,
+}
+
 struct PtySmokeProbe {
     marker: String,
     input: Vec<u8>,
     expected_fragments: Vec<String>,
+}
+
+fn pty_resize_smoke_probe() -> Result<PtyResizeSmokeProbe, String> {
+    let cwd = env::current_dir()
+        .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
+    let resized_size = PtySize::new(100, 30);
+
+    #[cfg(windows)]
+    {
+        let shell = ResolvedShell::detect();
+        let cwd = cwd.display().to_string();
+
+        match shell.source() {
+            ShellSource::PathPwsh | ShellSource::PathPowerShell => Ok(PtyResizeSmokeProbe {
+                initial_input: "Write-Output 'NOCTRAIL_PTY_SMOKE_PRE'; (Get-Location).Path; Write-Output \"$($Host.UI.RawUI.WindowSize.Height) $($Host.UI.RawUI.WindowSize.Width)\"\r".to_string().into_bytes(),
+                resized_input: "Write-Output 'NOCTRAIL_PTY_SMOKE_POST'; Write-Output \"$($Host.UI.RawUI.WindowSize.Height) $($Host.UI.RawUI.WindowSize.Width)\"; exit\r".to_string().into_bytes(),
+                resized_size,
+                initial_expected_fragments: vec![
+                    "NOCTRAIL_PTY_SMOKE_PRE".to_string(),
+                    cwd,
+                    "24 80".to_string(),
+                ],
+                resized_expected_fragments: vec![
+                    "NOCTRAIL_PTY_SMOKE_POST".to_string(),
+                    "30 100".to_string(),
+                ],
+            }),
+            ShellSource::PathWsl => Ok(PtyResizeSmokeProbe {
+                initial_input: b"printf 'NOCTRAIL_PTY_SMOKE_PRE\\n'; pwd; stty size\r".to_vec(),
+                resized_input: b"printf 'NOCTRAIL_PTY_SMOKE_POST\\n'; stty size; exit\r".to_vec(),
+                resized_size,
+                initial_expected_fragments: vec![
+                    "NOCTRAIL_PTY_SMOKE_PRE".to_string(),
+                    cwd,
+                    "24 80".to_string(),
+                ],
+                resized_expected_fragments: vec![
+                    "NOCTRAIL_PTY_SMOKE_POST".to_string(),
+                    "30 100".to_string(),
+                ],
+            }),
+            ShellSource::EnvComSpec | ShellSource::FallbackCmd => Ok(PtyResizeSmokeProbe {
+                initial_input: b"echo NOCTRAIL_PTY_SMOKE_PRE\r\ncd\r\nmode con\r\n".to_vec(),
+                resized_input: b"echo NOCTRAIL_PTY_SMOKE_POST\r\nmode con\r\nexit\r\n".to_vec(),
+                resized_size,
+                initial_expected_fragments: vec![
+                    "NOCTRAIL_PTY_SMOKE_PRE".to_string(),
+                    cwd,
+                    "80".to_string(),
+                    "24".to_string(),
+                ],
+                resized_expected_fragments: vec![
+                    "NOCTRAIL_PTY_SMOKE_POST".to_string(),
+                    "100".to_string(),
+                    "30".to_string(),
+                ],
+            }),
+            ShellSource::EnvShell | ShellSource::FallbackSh => Err(
+                "unexpected Unix shell source while building Windows PTY resize probe"
+                    .to_string(),
+            ),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(PtyResizeSmokeProbe {
+            initial_input: b"printf 'NOCTRAIL_PTY_SMOKE_PRE\\n'; pwd; stty size\r".to_vec(),
+            resized_input: b"printf 'NOCTRAIL_PTY_SMOKE_POST\\n'; stty size; exit\r".to_vec(),
+            resized_size,
+            initial_expected_fragments: vec![
+                "NOCTRAIL_PTY_SMOKE_PRE".to_string(),
+                cwd.display().to_string(),
+                "24 80".to_string(),
+            ],
+            resized_expected_fragments: vec![
+                "NOCTRAIL_PTY_SMOKE_POST".to_string(),
+                "30 100".to_string(),
+            ],
+        })
+    }
 }
 
 fn pty_smoke_probe(marker: &str) -> Result<PtySmokeProbe, String> {
@@ -388,6 +495,32 @@ fn read_all_output(session: &mut PtySession) -> Result<Vec<u8>, noctrail_pty::Pt
             break;
         }
         output.extend_from_slice(&chunk[..count]);
+    }
+
+    Ok(output)
+}
+
+fn read_until_fragments(
+    session: &mut PtySession,
+    expected_fragments: &[String],
+) -> Result<Vec<u8>, noctrail_pty::PtyError> {
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 1024];
+
+    loop {
+        let count = session.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        output.extend_from_slice(&chunk[..count]);
+
+        let haystack = String::from_utf8_lossy(&output);
+        if expected_fragments
+            .iter()
+            .all(|expected| haystack.contains(expected))
+        {
+            break;
+        }
     }
 
     Ok(output)
