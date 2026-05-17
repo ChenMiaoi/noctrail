@@ -1,13 +1,15 @@
 # Noctrail
 
-Noctrail is a Rust-native, GPU-oriented, agent-aware terminal project inspired by Hyprland-style workflows.
+Noctrail is a Rust-native terminal project being rebooted around a
+stable terminal-core-first roadmap.
 
-The project is at the repository bootstrap stage. The product plan lives in [docs/plan.md](docs/plan.md).
+The active plan lives in [docs/real-plan.md](docs/real-plan.md). The old
+[docs/plan.md](docs/plan.md) file is retained only as a legacy pointer.
 
 ## Goals
 
 - Build a reliable cross-platform terminal first.
-- Add Hyprland-inspired workspaces, panes, themes, and keyboard-first UI.
+- Keep workspace, layout, and visual polish ahead of agent features.
 - Add agent workflows behind explicit permission, redaction, and review boundaries.
 - Keep AI features optional; the terminal must remain useful with agent features disabled.
 
@@ -17,10 +19,11 @@ The project is at the repository bootstrap stage. The product plan lives in [doc
 crates/
   noctrail-cli/   # `noctrail` command-line entry point
 docs/
-  plan.md         # product and engineering plan
+  real-plan.md    # active restart roadmap
+  plan.md         # legacy pointer to the new roadmap
 ```
 
-More crates will be added only when there is real implementation ownership for the boundary.
+More crates will be added only when there is clear implementation ownership for the boundary.
 
 ## Development
 
