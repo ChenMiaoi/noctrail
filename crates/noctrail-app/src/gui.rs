@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use noctrail_layout::LayoutRect;
+use noctrail_layout::{FocusDirection, LayoutRect, SplitAxis, WorkspaceId};
 use noctrail_pty::{PtyOutputReader, PtySize};
 use noctrail_render::{GpuRenderer, RenderBackend};
 use noctrail_term::{MouseTrackingMode, Position, SelectionMode};
@@ -27,6 +27,7 @@ const DEFAULT_WINDOW_HEIGHT: u32 = 800;
 const DEFAULT_CELL_WIDTH: u32 = 8;
 const DEFAULT_CELL_HEIGHT: u32 = 16;
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(600);
+const PALETTE_RESIZE_DELTA: u16 = 5;
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     run_with_options(GuiLaunchOptions::default())
@@ -117,6 +118,177 @@ struct MouseSelectionDrag {
     cursor: Position,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaletteCommand {
+    NewPane,
+    SplitHorizontal,
+    SplitVertical,
+    Focus(FocusDirection),
+    Resize(FocusDirection),
+    Swap(FocusDirection),
+    ClosePane,
+    Workspace(WorkspaceId),
+    ToggleScratch,
+}
+
+impl PaletteCommand {
+    fn all() -> Vec<Self> {
+        let mut commands = vec![
+            Self::NewPane,
+            Self::SplitHorizontal,
+            Self::SplitVertical,
+            Self::Focus(FocusDirection::Left),
+            Self::Focus(FocusDirection::Right),
+            Self::Focus(FocusDirection::Up),
+            Self::Focus(FocusDirection::Down),
+            Self::Resize(FocusDirection::Left),
+            Self::Resize(FocusDirection::Right),
+            Self::Resize(FocusDirection::Up),
+            Self::Resize(FocusDirection::Down),
+            Self::Swap(FocusDirection::Left),
+            Self::Swap(FocusDirection::Right),
+            Self::Swap(FocusDirection::Up),
+            Self::Swap(FocusDirection::Down),
+            Self::ClosePane,
+            Self::ToggleScratch,
+        ];
+        commands.extend(
+            (WorkspaceId::MIN..=WorkspaceId::MAX).map(|id| Self::Workspace(WorkspaceId::new(id))),
+        );
+        commands
+    }
+
+    fn label(self) -> String {
+        match self {
+            Self::NewPane => "new pane".to_string(),
+            Self::SplitHorizontal => "split horizontal".to_string(),
+            Self::SplitVertical => "split vertical".to_string(),
+            Self::Focus(direction) => format!("focus {}", direction_name(direction)),
+            Self::Resize(direction) => format!("resize {}", direction_name(direction)),
+            Self::Swap(direction) => format!("move {}", direction_name(direction)),
+            Self::ClosePane => "close pane".to_string(),
+            Self::Workspace(workspace_id) => format!("workspace {}", workspace_id.0),
+            Self::ToggleScratch => "scratch show hide".to_string(),
+        }
+    }
+
+    fn haystack(self) -> String {
+        match self {
+            Self::NewPane => "new pane split create shell".to_string(),
+            Self::SplitHorizontal => "split horizontal top bottom".to_string(),
+            Self::SplitVertical => "split vertical left right".to_string(),
+            Self::Focus(direction) => format!("focus {}", direction_name(direction)),
+            Self::Resize(direction) => format!("resize {}", direction_name(direction)),
+            Self::Swap(direction) => format!("move swap pane {}", direction_name(direction)),
+            Self::ClosePane => "close pane kill active".to_string(),
+            Self::Workspace(workspace_id) => {
+                format!("workspace {} switch session", workspace_id.0)
+            }
+            Self::ToggleScratch => "scratch show hide dropdown terminal".to_string(),
+        }
+    }
+
+    fn matches_query(self, query: &str) -> bool {
+        if query.trim().is_empty() {
+            return true;
+        }
+
+        let haystack = self.haystack();
+        query
+            .split_whitespace()
+            .all(|token| haystack.contains(&token.to_ascii_lowercase()))
+    }
+
+    fn execute(self, app: &mut DesktopApp) -> Result<(), Box<dyn Error>> {
+        match self {
+            Self::NewPane => {
+                let _ = app.split_active_pane_shell()?;
+            }
+            Self::SplitHorizontal => {
+                let _ = app.split_active_pane_shell_with_axis(SplitAxis::Horizontal)?;
+            }
+            Self::SplitVertical => {
+                let _ = app.split_active_pane_shell_with_axis(SplitAxis::Vertical)?;
+            }
+            Self::Focus(direction) => {
+                let _ = app.focus_direction(direction)?;
+            }
+            Self::Resize(direction) => {
+                app.resize_active_split(direction, PALETTE_RESIZE_DELTA)?;
+            }
+            Self::Swap(direction) => {
+                let _ = app.swap_active_pane(direction)?;
+            }
+            Self::ClosePane => {
+                let _ = app.close_active_pane()?;
+            }
+            Self::Workspace(workspace_id) => {
+                let _ = app.switch_workspace(workspace_id)?;
+            }
+            Self::ToggleScratch => {
+                let _ = app.toggle_scratch()?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommandPalette {
+    query: String,
+    selected: usize,
+}
+
+impl CommandPalette {
+    fn new() -> Self {
+        Self {
+            query: String::new(),
+            selected: 0,
+        }
+    }
+
+    fn filtered_commands(&self) -> Vec<PaletteCommand> {
+        PaletteCommand::all()
+            .into_iter()
+            .filter(|command| command.matches_query(&self.query))
+            .collect()
+    }
+
+    fn selected_command(&self) -> Option<PaletteCommand> {
+        let commands = self.filtered_commands();
+        commands
+            .get(self.selected.min(commands.len().saturating_sub(1)))
+            .copied()
+    }
+
+    fn push_query_text(&mut self, text: &str) {
+        for ch in text.chars().filter(|ch| !ch.is_control()) {
+            self.query.push(ch);
+        }
+        self.selected = 0;
+    }
+
+    fn pop_query_char(&mut self) {
+        self.query.pop();
+        self.selected = 0;
+    }
+
+    fn select_next(&mut self) {
+        let len = self.filtered_commands().len();
+        if len > 0 {
+            self.selected = (self.selected + 1) % len;
+        }
+    }
+
+    fn select_previous(&mut self) {
+        let len = self.filtered_commands().len();
+        if len > 0 {
+            self.selected = (self.selected + len - 1) % len;
+        }
+    }
+}
+
 struct GuiApp {
     app: DesktopApp,
     launch_options: GuiLaunchOptions,
@@ -124,6 +296,7 @@ struct GuiApp {
     renderer: Option<GpuRenderer>,
     gpu_fallback_error: Option<String>,
     ime_preedit: Option<String>,
+    command_palette: Option<CommandPalette>,
     mouse_position: Option<PhysicalPosition<f64>>,
     mouse_selection: Option<MouseSelectionDrag>,
     mouse_button: Option<input::MouseButton>,
@@ -147,6 +320,7 @@ impl GuiApp {
             renderer: None,
             gpu_fallback_error: None,
             ime_preedit: None,
+            command_palette: None,
             mouse_position: None,
             mouse_selection: None,
             mouse_button: None,
@@ -244,6 +418,18 @@ impl GuiApp {
             {
                 title.push_str(" | ime ");
                 title.push_str(preedit);
+            }
+            if let Some(palette) = self.command_palette.as_ref() {
+                title.push_str(" | palette ");
+                if palette.query.is_empty() {
+                    title.push_str("(all)");
+                } else {
+                    title.push_str(&palette.query);
+                }
+                if let Some(command) = palette.selected_command() {
+                    title.push_str(" -> ");
+                    title.push_str(&command.label());
+                }
             }
             window.set_title(&title);
         }
@@ -501,6 +687,83 @@ impl GuiApp {
         self.app.write_input(&bytes)?;
         Ok(())
     }
+
+    fn toggle_command_palette(&mut self) {
+        if self.command_palette.is_some() {
+            self.command_palette = None;
+        } else {
+            self.command_palette = Some(CommandPalette::new());
+        }
+        self.touch_cursor_blink();
+        self.update_title();
+        self.request_redraw();
+    }
+
+    fn handle_command_palette_key(
+        &mut self,
+        event: &winit::event::KeyEvent,
+    ) -> Result<bool, Box<dyn Error>> {
+        if !event.state.is_pressed() {
+            return Ok(self.command_palette.is_some());
+        }
+
+        let Some(palette) = self.command_palette.as_mut() else {
+            return Ok(false);
+        };
+
+        match event.logical_key.as_ref() {
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape) => {
+                self.command_palette = None;
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter) => {
+                let command = palette.selected_command();
+                self.command_palette = None;
+                if let Some(command) = command {
+                    command.execute(&mut self.app)?;
+                }
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowDown)
+            | winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab) => {
+                palette.select_next();
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp) => {
+                palette.select_previous();
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace) => {
+                palette.pop_query_char();
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Space)
+                if !self.modifiers.control_key()
+                    && !self.modifiers.alt_key()
+                    && !self.modifiers.super_key() =>
+            {
+                palette.push_query_text(" ");
+            }
+            _ if !self.modifiers.control_key()
+                && !self.modifiers.alt_key()
+                && !self.modifiers.super_key() =>
+            {
+                if let Some(text) = event.text.as_deref() {
+                    palette.push_query_text(text);
+                }
+            }
+            _ => {}
+        }
+
+        self.touch_cursor_blink();
+        self.update_title();
+        self.request_redraw();
+        Ok(true)
+    }
+}
+
+fn direction_name(direction: FocusDirection) -> &'static str {
+    match direction {
+        FocusDirection::Left => "left",
+        FocusDirection::Right => "right",
+        FocusDirection::Up => "up",
+        FocusDirection::Down => "down",
+    }
 }
 
 enum OutputPumpEvent {
@@ -617,8 +880,24 @@ impl ApplicationHandler for GuiApp {
                 if is_synthetic {
                     return;
                 }
+                if matches!(
+                    input::shortcut_action(&event.logical_key, self.modifiers),
+                    Some(input::ShortcutAction::ToggleCommandPalette)
+                ) {
+                    self.toggle_command_palette();
+                    return;
+                }
+                match self.handle_command_palette_key(&event) {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(_) => {
+                        event_loop.exit();
+                        return;
+                    }
+                }
                 if let Some(action) = input::shortcut_action(&event.logical_key, self.modifiers) {
                     match action {
+                        input::ShortcutAction::ToggleCommandPalette => unreachable!(),
                         input::ShortcutAction::Copy => {
                             if let Some(text) = self.app.copy_selection_text() {
                                 self.clipboard.set_text(text);
@@ -809,6 +1088,78 @@ mod tests {
         );
 
         assert!(!gui.should_attempt_gpu_renderer());
+    }
+
+    #[test]
+    fn command_palette_filters_commands_by_query() {
+        let mut palette = CommandPalette::new();
+        palette.push_query_text("workspace 2");
+
+        assert_eq!(
+            palette.selected_command(),
+            Some(PaletteCommand::Workspace(WorkspaceId::new(2)))
+        );
+    }
+
+    #[test]
+    fn command_palette_executes_split_horizontal() -> Result<(), Box<dyn Error>> {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
+
+        PaletteCommand::SplitHorizontal.execute(&mut gui.app)?;
+
+        assert_eq!(
+            gui.app.frame_for_pane(PaneId::new(1))?.surface,
+            LayoutRect::new(0, 0, 120, 20)
+        );
+        let split = gui
+            .app
+            .active_pane_id()
+            .expect("split pane should be active");
+        assert_eq!(
+            gui.app.frame_for_pane(split)?.surface,
+            LayoutRect::new(0, 20, 120, 20)
+        );
+        let split_status = gui
+            .app
+            .pane_mut_by_id(split)
+            .expect("split pane should exist")
+            .close_runtime()?;
+        assert!(split_status.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn command_palette_executes_workspace_and_scratch_commands() -> Result<(), Box<dyn Error>> {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
+
+        PaletteCommand::Workspace(WorkspaceId::new(2)).execute(&mut gui.app)?;
+        assert_eq!(gui.app.active_workspace_id(), WorkspaceId::new(2));
+
+        PaletteCommand::ToggleScratch.execute(&mut gui.app)?;
+        assert!(gui.app.scratch_visible());
+        assert!(gui.app.frame().is_scratch);
+
+        let scratch_pane = gui
+            .app
+            .scratch_pane_id()
+            .expect("scratch pane should exist");
+        let scratch_status = gui
+            .app
+            .pane_mut_by_id(scratch_pane)
+            .expect("scratch pane should exist")
+            .close_runtime()?;
+        assert!(scratch_status.is_some());
+
+        let workspace_pane = gui.app.toggle_scratch()?;
+        let workspace_status = gui
+            .app
+            .pane_mut_by_id(workspace_pane)
+            .expect("workspace pane should exist")
+            .close_runtime()?;
+        assert!(workspace_status.is_some());
+        Ok(())
     }
 
     #[test]

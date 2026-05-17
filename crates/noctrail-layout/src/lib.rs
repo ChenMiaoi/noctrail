@@ -563,6 +563,15 @@ impl LayoutTree {
         self.split(active, new_pane, surface)
     }
 
+    pub fn split_active_with_axis(
+        &mut self,
+        new_pane: PaneId,
+        axis: SplitAxis,
+    ) -> Result<PaneId, LayoutError> {
+        let active = self.active.ok_or(LayoutError::Empty)?;
+        self.split_with_axis(active, new_pane, axis)
+    }
+
     pub fn split(
         &mut self,
         target: PaneId,
@@ -578,6 +587,30 @@ impl LayoutTree {
             .find_rect(target, surface)
             .ok_or(LayoutError::PaneNotFound(target))?;
         let axis = SplitAxis::from_rect(target_rect);
+        self.split_node_with_axis(root, target, new_pane, axis)
+    }
+
+    pub fn split_with_axis(
+        &mut self,
+        target: PaneId,
+        new_pane: PaneId,
+        axis: SplitAxis,
+    ) -> Result<PaneId, LayoutError> {
+        if self.contains(new_pane) {
+            return Err(LayoutError::DuplicatePane(new_pane));
+        }
+
+        let root = self.root.take().ok_or(LayoutError::Empty)?;
+        self.split_node_with_axis(root, target, new_pane, axis)
+    }
+
+    fn split_node_with_axis(
+        &mut self,
+        root: LayoutNode,
+        target: PaneId,
+        new_pane: PaneId,
+        axis: SplitAxis,
+    ) -> Result<PaneId, LayoutError> {
         let (root, inserted) = root.split_leaf(target, new_pane, axis);
 
         if !inserted {
@@ -839,6 +872,17 @@ mod tests {
         let layouts = map_layouts(tree.arrange(LayoutRect::new(0, 0, 40, 120)));
         assert_eq!(layouts[&PaneId::new(10)], LayoutRect::new(0, 0, 40, 60));
         assert_eq!(layouts[&PaneId::new(11)], LayoutRect::new(0, 60, 40, 60));
+    }
+
+    #[test]
+    fn explicit_split_axis_overrides_surface_heuristic() {
+        let mut tree = LayoutTree::new(PaneId::new(1));
+        tree.split_active_with_axis(PaneId::new(2), SplitAxis::Horizontal)
+            .expect("split should succeed");
+
+        let layouts = map_layouts(tree.arrange(LayoutRect::new(0, 0, 120, 40)));
+        assert_eq!(layouts[&PaneId::new(1)], LayoutRect::new(0, 0, 120, 20));
+        assert_eq!(layouts[&PaneId::new(2)], LayoutRect::new(0, 20, 120, 20));
     }
 
     #[test]

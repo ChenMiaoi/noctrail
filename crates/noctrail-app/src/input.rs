@@ -9,6 +9,7 @@ pub enum ShortcutAction {
     Copy,
     Paste,
     Focus(FocusDirection),
+    ToggleCommandPalette,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +55,7 @@ pub fn shortcut_action(logical_key: &Key, modifiers: ModifiersState) -> Option<S
         Key::Character(text) if modifiers.control_key() && modifiers.shift_key() => {
             match text.to_ascii_lowercase().as_str() {
                 "c" => Some(ShortcutAction::Copy),
+                "p" => Some(ShortcutAction::ToggleCommandPalette),
                 "v" => Some(ShortcutAction::Paste),
                 _ => None,
             }
@@ -387,6 +389,13 @@ mod tests {
         assert_eq!(
             shortcut_action(&Key::Named(NamedKey::Insert), ModifiersState::SHIFT),
             Some(ShortcutAction::Paste)
+        );
+        assert_eq!(
+            shortcut_action(
+                &Key::Character("p".into()),
+                ModifiersState::CONTROL | ModifiersState::SHIFT,
+            ),
+            Some(ShortcutAction::ToggleCommandPalette)
         );
     }
 

@@ -8,7 +8,7 @@ pub mod gui;
 pub mod input;
 
 use noctrail_layout::{
-    FocusDirection, LayoutError, LayoutRect, PaneLayout, WorkspaceId, WorkspaceSet,
+    FocusDirection, LayoutError, LayoutRect, PaneLayout, SplitAxis, WorkspaceId, WorkspaceSet,
 };
 use noctrail_pty::{PtyCommand, PtyError, PtyExitStatus, PtySize};
 use noctrail_render::{RenderBackend, RenderInput, RenderPlan, RenderRect};
@@ -457,6 +457,13 @@ impl DesktopApp {
         self.split_active_pane_with(PtyCommand::shell())
     }
 
+    pub fn split_active_pane_shell_with_axis(
+        &mut self,
+        axis: SplitAxis,
+    ) -> Result<PaneId, AppError> {
+        self.split_active_pane_with_axis(PtyCommand::shell(), axis)
+    }
+
     pub fn split_active_pane_with(&mut self, command: PtyCommand) -> Result<PaneId, AppError> {
         let new_pane_id = self.allocate_pane_id()?;
         let terminal_size = self.active_pane_ref().terminal_size();
@@ -465,6 +472,23 @@ impl DesktopApp {
         self.workspaces
             .active_layout_mut()
             .split_active(new_pane_id, self.surface)?;
+        self.panes.insert(new_pane_id, pane);
+        self.sync_pane_terminal_sizes()?;
+        Ok(new_pane_id)
+    }
+
+    pub fn split_active_pane_with_axis(
+        &mut self,
+        command: PtyCommand,
+        axis: SplitAxis,
+    ) -> Result<PaneId, AppError> {
+        let new_pane_id = self.allocate_pane_id()?;
+        let terminal_size = self.active_pane_ref().terminal_size();
+        let pane = TerminalPane::spawn(new_pane_id, command, terminal_size)?;
+
+        self.workspaces
+            .active_layout_mut()
+            .split_active_with_axis(new_pane_id, axis)?;
         self.panes.insert(new_pane_id, pane);
         self.sync_pane_terminal_sizes()?;
         Ok(new_pane_id)
@@ -913,6 +937,23 @@ mod tests {
         assert!(!original_frame.render_plan.active);
         assert!(new_frame.render_plan.active);
         assert_eq!(app.frame().pane_id, new_pane);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_split_axis_overrides_auto_split_direction() -> Result<(), Box<dyn StdError>> {
+        let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
+
+        let split = app.split_active_pane_shell_with_axis(SplitAxis::Horizontal)?;
+
+        assert_eq!(
+            app.frame_for_pane(PaneId::new(1))?.surface,
+            LayoutRect::new(0, 0, 120, 20)
+        );
+        assert_eq!(
+            app.frame_for_pane(split)?.surface,
+            LayoutRect::new(0, 20, 120, 20)
+        );
         Ok(())
     }
 
