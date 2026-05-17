@@ -784,6 +784,8 @@ name = "noctrail-cli"
 version = "0.1.0"
 dependencies = [
  "glob",
+ "noctrail-pty",
+ "noctrail-render",
  "noctrail-term",
 ]
 

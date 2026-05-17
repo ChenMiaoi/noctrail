@@ -1,6 +1,9 @@
 use std::{env, path::PathBuf, process};
 
+use noctrail_pty::{PtyCommand, PtySession, PtySize};
+use noctrail_render::{RenderBackend, RenderPlan, RenderRect};
 use noctrail_term::recording::replay_recording_file;
+use noctrail_term::{Cell, Color, Cursor, ScreenRowSnapshot, Style, TerminalSnapshot};
 
 const HELP: &str = "\
 Noctrail development CLI
@@ -11,6 +14,8 @@ Usage:
 Commands:
   doctor      Print basic environment diagnostics
   replay      Replay one or more terminal recording fixtures
+  render-smoke Run the render smoke check
+  pty-smoke   Run the PTY smoke check
   help        Print this help text
 
 Options:
@@ -25,6 +30,18 @@ fn main() {
         None | Some("help" | "-h" | "--help") => print!("{HELP}"),
         Some("-V" | "--version") => println!("noctrail {}", env!("CARGO_PKG_VERSION")),
         Some("doctor") => print_doctor(),
+        Some("render-smoke") => {
+            if let Err(error) = run_render_smoke() {
+                eprintln!("{error}");
+                process::exit(1);
+            }
+        }
+        Some("pty-smoke") => {
+            if let Err(error) = run_pty_smoke() {
+                eprintln!("{error}");
+                process::exit(1);
+            }
+        }
         Some("replay") => {
             let patterns: Vec<String> = args.collect();
             if patterns.is_empty() {
@@ -82,4 +99,144 @@ fn replay_fixtures(patterns: &[String]) -> Result<(), String> {
 
 fn contains_glob_meta(pattern: &str) -> bool {
     pattern.chars().any(|ch| matches!(ch, '*' | '?' | '['))
+}
+
+fn run_render_smoke() -> Result<(), String> {
+    let snapshot = TerminalSnapshot {
+        rows: vec![ScreenRowSnapshot {
+            cells: vec![
+                Cell {
+                    text: "A".to_string(),
+                    style: Style {
+                        foreground: Color::Indexed(2),
+                        background: Color::Default,
+                        bold: true,
+                        italic: false,
+                        underline: false,
+                    },
+                    wide_continuation: false,
+                },
+                Cell {
+                    text: "界".to_string(),
+                    style: Style::default(),
+                    wide_continuation: false,
+                },
+                Cell::wide_continuation(Style::default()),
+            ],
+            wrapped: false,
+        }],
+        cursor: Cursor { row: 0, col: 2 },
+        ..TerminalSnapshot::default()
+    };
+
+    let plan = RenderPlan::from_terminal(
+        RenderRect::new(0, 0, 96, 32),
+        RenderBackend::Software,
+        &snapshot,
+    );
+
+    if plan.rows.len() != 1 {
+        return Err(format!(
+            "render smoke expected 1 row, got {}",
+            plan.rows.len()
+        ));
+    }
+
+    let glyphs = &plan.rows[0].glyphs;
+    if glyphs.len() != 3 {
+        return Err(format!(
+            "render smoke expected 3 glyph entries, got {}",
+            glyphs.len()
+        ));
+    }
+
+    if glyphs[0].text != "A" || !glyphs[0].style.bold {
+        return Err("render smoke did not preserve ASCII glyph style".to_string());
+    }
+
+    if glyphs[1].text != "界" || glyphs[1].span != 2 {
+        return Err("render smoke did not preserve wide glyph metadata".to_string());
+    }
+
+    if !glyphs[2].wide_continuation || glyphs[2].span != 0 {
+        return Err("render smoke did not preserve wide continuation cell".to_string());
+    }
+
+    println!("render smoke ok");
+    Ok(())
+}
+
+fn run_pty_smoke() -> Result<(), String> {
+    let command = pty_smoke_command();
+    let mut session = PtySession::spawn(command, PtySize::new(80, 24))
+        .map_err(|error| format!("failed to spawn PTY smoke command: {error}"))?;
+    let output = read_all_output(&mut session)
+        .map_err(|error| format!("failed to read PTY smoke output: {error}"))?;
+    let _ = session.close();
+
+    let haystack = String::from_utf8_lossy(&output);
+    if !haystack.contains("NOCTRAIL_PTY_SMOKE") {
+        return Err(format!(
+            "PTY smoke output did not contain sentinel; output was {:?}",
+            haystack
+        ));
+    }
+
+    println!("pty smoke ok");
+    Ok(())
+}
+
+fn pty_smoke_command() -> PtyCommand {
+    #[cfg(windows)]
+    {
+        let program = env::var_os("COMSPEC").unwrap_or_else(|| std::ffi::OsString::from("cmd.exe"));
+        let mut command = PtyCommand::new(program);
+        command.args(["/C", "echo", "NOCTRAIL_PTY_SMOKE"]);
+        command
+    }
+
+    #[cfg(not(windows))]
+    {
+        let mut command = PtyCommand::new("sh");
+        command.args(["-lc", "printf 'NOCTRAIL_PTY_SMOKE'"]);
+        command
+    }
+}
+
+fn read_all_output(session: &mut PtySession) -> Result<Vec<u8>, noctrail_pty::PtyError> {
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 1024];
+
+    loop {
+        let count = session.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        output.extend_from_slice(&chunk[..count]);
+    }
+
+    Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_detection_matches_shell_like_patterns() {
+        assert!(contains_glob_meta("tests/fixtures/*.json"));
+        assert!(contains_glob_meta("tests/fixtures/[ab].json"));
+        assert!(!contains_glob_meta("tests/fixtures/core.ntrec"));
+    }
+
+    #[test]
+    fn render_smoke_succeeds() {
+        run_render_smoke().expect("render smoke should pass");
+    }
+
+    #[test]
+    fn pty_smoke_command_has_a_program() {
+        let command = pty_smoke_command();
+        assert!(!command.program().is_empty());
+    }
 }
