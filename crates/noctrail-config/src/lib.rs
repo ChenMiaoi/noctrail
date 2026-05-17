@@ -22,6 +22,7 @@ const DEFAULT_PANE_GAP: u16 = 4;
 const DEFAULT_PANE_PADDING: u16 = 2;
 const DEFAULT_PANE_RADIUS: u16 = 8;
 const DEFAULT_BLUR_FALLBACK_TINT_OPACITY: f32 = 0.92;
+const DEFAULT_ANIMATION_DURATION_MS: u64 = 120;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -199,12 +200,30 @@ impl Default for BlurTheme {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
+pub struct AnimationTheme {
+    pub enabled: bool,
+    #[serde(rename = "duration-ms")]
+    pub duration_ms: u64,
+}
+
+impl Default for AnimationTheme {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            duration_ms: DEFAULT_ANIMATION_DURATION_MS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
 pub struct ThemeConfig {
     pub opacity: f32,
     pub color: ThemeColors,
     pub border: BorderTheme,
     pub pane: PaneTheme,
     pub blur: BlurTheme,
+    pub animation: AnimationTheme,
     pub cursor: CursorTheme,
     pub selection: SelectionTheme,
 }
@@ -217,6 +236,7 @@ impl Default for ThemeConfig {
             border: BorderTheme::default(),
             pane: PaneTheme::default(),
             blur: BlurTheme::default(),
+            animation: AnimationTheme::default(),
             cursor: CursorTheme::default(),
             selection: SelectionTheme::default(),
         }
@@ -340,6 +360,12 @@ fn validate_config(path: &Path, config: &Config) -> Result<(), ConfigError> {
             ),
         });
     }
+    if config.theme.animation.duration_ms == 0 {
+        return Err(ConfigError::Validation {
+            path: path.to_path_buf(),
+            reason: "theme.animation.duration-ms must be greater than 0".to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -404,6 +430,11 @@ mod tests {
             config.theme.blur.fallback_tint_opacity,
             DEFAULT_BLUR_FALLBACK_TINT_OPACITY
         );
+        assert!(config.theme.animation.enabled);
+        assert_eq!(
+            config.theme.animation.duration_ms,
+            DEFAULT_ANIMATION_DURATION_MS
+        );
     }
 
     #[test]
@@ -411,7 +442,7 @@ mod tests {
         let path = temp_config_path("theme-load");
         fs::write(
             &path,
-            "[renderer]\nbackend = \"software\"\n\n[font]\nfamily = \"Iosevka\"\nsize = 16.5\nfallback = [\"Noto Sans CJK SC\"]\n\n[theme]\nopacity = 0.8\n\n[theme.color]\nbackground = \"#112233\"\nforeground = \"#abcdef\"\n\n[theme.border]\nactive = \"#7aa2f7\"\ninactive = \"#3b4261\"\nwidth = 2\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.blur]\nenabled = true\nfallback-tint-opacity = 0.94\n\n[theme.cursor]\ncolor = \"#ffeeaa\"\nblink-interval-ms = 450\n\n[theme.selection]\nbackground = \"#264f78cc\"\nforeground = \"#ffffff\"\n",
+            "[renderer]\nbackend = \"software\"\n\n[font]\nfamily = \"Iosevka\"\nsize = 16.5\nfallback = [\"Noto Sans CJK SC\"]\n\n[theme]\nopacity = 0.8\n\n[theme.color]\nbackground = \"#112233\"\nforeground = \"#abcdef\"\n\n[theme.border]\nactive = \"#7aa2f7\"\ninactive = \"#3b4261\"\nwidth = 2\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.blur]\nenabled = true\nfallback-tint-opacity = 0.94\n\n[theme.animation]\nenabled = false\nduration-ms = 180\n\n[theme.cursor]\ncolor = \"#ffeeaa\"\nblink-interval-ms = 450\n\n[theme.selection]\nbackground = \"#264f78cc\"\nforeground = \"#ffffff\"\n",
         )
         .expect("write config");
 
@@ -431,6 +462,8 @@ mod tests {
         assert_eq!(config.theme.pane.radius, 12);
         assert!(config.theme.blur.enabled);
         assert_eq!(config.theme.blur.fallback_tint_opacity, 0.94);
+        assert!(!config.theme.animation.enabled);
+        assert_eq!(config.theme.animation.duration_ms, 180);
         assert_eq!(
             config.theme.cursor.color,
             RgbaColor::from_rgb(0xff, 0xee, 0xaa)

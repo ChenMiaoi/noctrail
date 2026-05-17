@@ -188,7 +188,7 @@ fn run_smoke(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>>
 
     let frame = app.frame();
     println!(
-        "pane={:?} pid={:?} backend={:?} pane={}x{} content={}x{} terminal={}x{} rows={} font={} size={} opacity={} requested_opacity={} transparency_fallback={} blur={} blur_fallback={}",
+        "pane={:?} pid={:?} backend={:?} pane={}x{} content={}x{} terminal={}x{} rows={} font={} size={} opacity={} requested_opacity={} transparency_fallback={} blur={} blur_fallback={} animation={} animation_duration_ms={}",
         frame.pane_id,
         frame.process_id,
         frame.render_plan.backend,
@@ -206,6 +206,12 @@ fn run_smoke(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>>
         effects.transparency_fallback_reason.unwrap_or("none"),
         effects.blur_mode,
         effects.blur_fallback_reason.unwrap_or("none"),
+        if launch_options.theme.animation.enabled {
+            "on"
+        } else {
+            "off"
+        },
+        launch_options.theme.animation.duration_ms,
     );
 
     app.write_input(shell_marker_command("NOCTRAIL_APP_SMOKE_WRITE").as_bytes())?;
@@ -434,7 +440,7 @@ mod tests {
         let path = temp_config_path("theme-font");
         fs::write(
             &path,
-            "[font]\nfamily = \"Iosevka\"\nsize = 15.5\n\n[theme]\nopacity = 0.85\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.blur]\nenabled = true\nfallback-tint-opacity = 0.94\n\n[theme.cursor]\nblink-interval-ms = 420\n",
+            "[font]\nfamily = \"Iosevka\"\nsize = 15.5\n\n[theme]\nopacity = 0.85\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.blur]\nenabled = true\nfallback-tint-opacity = 0.94\n\n[theme.animation]\nenabled = false\nduration-ms = 180\n\n[theme.cursor]\nblink-interval-ms = 420\n",
         )
         .expect("write config");
         let options = StartupOptions {
@@ -452,6 +458,8 @@ mod tests {
         assert_eq!(launch.theme.pane.radius, 12);
         assert!(launch.theme.blur.enabled);
         assert_eq!(launch.theme.blur.fallback_tint_opacity, 0.94);
+        assert!(!launch.theme.animation.enabled);
+        assert_eq!(launch.theme.animation.duration_ms, 180);
         assert_eq!(launch.theme.cursor.blink_interval_ms, 420);
         assert_eq!(launch.config_path, Some(path.clone()));
 

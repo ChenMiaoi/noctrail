@@ -29,6 +29,7 @@ const DEFAULT_WINDOW_HEIGHT: u32 = 800;
 const DEFAULT_CELL_WIDTH: u32 = 8;
 const DEFAULT_CELL_HEIGHT: u32 = 16;
 const PALETTE_RESIZE_DELTA: u16 = 5;
+const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct VisualEffectsPolicy {
@@ -139,6 +140,58 @@ fn saturating_u32_to_u16(value: u32) -> u16 {
 struct MouseSelectionDrag {
     anchor: Position,
     cursor: Position,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransitionKind {
+    Pane,
+    Workspace,
+}
+
+impl TransitionKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pane => "pane",
+            Self::Workspace => "workspace",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransitionRect {
+    pane_id: noctrail_runtime::PaneId,
+    from: Option<LayoutRect>,
+    to: Option<LayoutRect>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct TransitionSnapshot {
+    workspace_id: Option<WorkspaceId>,
+    scratch_visible: bool,
+    panes: Vec<(noctrail_runtime::PaneId, LayoutRect)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveTransition {
+    kind: TransitionKind,
+    started_at: Instant,
+    next_frame_at: Instant,
+    duration: Duration,
+    panes: Vec<TransitionRect>,
+}
+
+impl ActiveTransition {
+    fn deadline(&self) -> Instant {
+        self.started_at + self.duration
+    }
+
+    fn progress(&self, now: Instant) -> f32 {
+        let total = self.duration.as_secs_f32();
+        if total <= 0.0 {
+            return 1.0;
+        }
+        ((now - self.started_at).as_secs_f32() / total).clamp(0.0, 1.0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,6 +308,20 @@ impl PaletteCommand {
 
         Ok(())
     }
+
+    fn transition_kind(self) -> Option<TransitionKind> {
+        match self {
+            Self::NewPane
+            | Self::SplitHorizontal
+            | Self::SplitVertical
+            | Self::Resize(_)
+            | Self::Swap(_)
+            | Self::ClosePane
+            | Self::ToggleScratch => Some(TransitionKind::Pane),
+            Self::Workspace(_) => Some(TransitionKind::Workspace),
+            Self::Focus(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,6 +397,7 @@ struct GuiApp {
     mouse_button: Option<input::MouseButton>,
     output_rx: Option<Receiver<OutputPumpEvent>>,
     output_thread: Option<JoinHandle<()>>,
+    transition: Option<ActiveTransition>,
     next_cursor_blink_at: Instant,
     cursor_visible: bool,
     frame_interval: Duration,
@@ -367,6 +435,7 @@ impl GuiApp {
             mouse_button: None,
             output_rx: None,
             output_thread: None,
+            transition: None,
             next_cursor_blink_at: now + Duration::from_millis(theme.cursor.blink_interval_ms),
             cursor_visible: true,
             frame_interval: Duration::from_millis(theme.cursor.blink_interval_ms),
@@ -398,6 +467,97 @@ impl GuiApp {
 
     fn should_attempt_gpu_renderer(&self) -> bool {
         !self.launch_options.safe_mode && self.launch_options.renderer_backend == RenderBackend::Gpu
+    }
+
+    fn animation_duration(&self) -> Option<Duration> {
+        if self.theme.animation.enabled {
+            Some(Duration::from_millis(self.theme.animation.duration_ms))
+        } else {
+            None
+        }
+    }
+
+    fn transition_snapshot(&self) -> TransitionSnapshot {
+        let mut panes = self
+            .app
+            .pane_layouts()
+            .into_iter()
+            .map(|layout| (layout.pane_id, layout.rect))
+            .collect::<Vec<_>>();
+        if self.app.scratch_visible()
+            && let Some(scratch_id) = self.app.scratch_pane_id()
+        {
+            panes.push((scratch_id, self.app.frame().pane_surface));
+        }
+        panes.sort_by_key(|(pane_id, _)| pane_id.0);
+
+        TransitionSnapshot {
+            workspace_id: Some(self.app.active_workspace_id()),
+            scratch_visible: self.app.scratch_visible(),
+            panes,
+        }
+    }
+
+    fn apply_palette_command(&mut self, command: PaletteCommand) -> Result<(), Box<dyn Error>> {
+        let before = self.transition_snapshot();
+        command.execute(&mut self.app)?;
+        self.start_transition(command.transition_kind(), before);
+        Ok(())
+    }
+
+    fn start_transition(&mut self, kind: Option<TransitionKind>, before: TransitionSnapshot) {
+        let Some(kind) = kind else {
+            return;
+        };
+        let Some(duration) = self.animation_duration() else {
+            self.transition = None;
+            return;
+        };
+
+        let after = self.transition_snapshot();
+        let mut pane_ids = before
+            .panes
+            .iter()
+            .map(|(pane_id, _)| *pane_id)
+            .collect::<Vec<_>>();
+        for (pane_id, _) in &after.panes {
+            if !pane_ids.contains(pane_id) {
+                pane_ids.push(*pane_id);
+            }
+        }
+        pane_ids.sort_by_key(|pane_id| pane_id.0);
+
+        let panes = pane_ids
+            .into_iter()
+            .filter_map(|pane_id| {
+                let from = before
+                    .panes
+                    .iter()
+                    .find_map(|(current, rect)| (*current == pane_id).then_some(*rect));
+                let to = after
+                    .panes
+                    .iter()
+                    .find_map(|(current, rect)| (*current == pane_id).then_some(*rect));
+                (from != to).then_some(TransitionRect { pane_id, from, to })
+            })
+            .collect::<Vec<_>>();
+
+        if panes.is_empty()
+            && before.workspace_id == after.workspace_id
+            && before.scratch_visible == after.scratch_visible
+        {
+            self.transition = None;
+            return;
+        }
+
+        let now = Instant::now();
+        self.transition = Some(ActiveTransition {
+            kind,
+            started_at: now,
+            next_frame_at: now,
+            duration,
+            panes,
+        });
     }
 
     fn visual_effects_policy(&self) -> VisualEffectsPolicy {
@@ -545,6 +705,12 @@ impl GuiApp {
                 title.push_str(" | blur-fallback ");
                 title.push_str(reason);
             }
+            if let Some(transition) = self.transition.as_ref() {
+                title.push_str(" | anim ");
+                title.push_str(transition.kind.label());
+                title.push(' ');
+                title.push_str(&format!("{:.2}", transition.progress(Instant::now())));
+            }
             if let Some(error) = self.gpu_fallback_error.as_deref() {
                 title.push_str(" | gpu-fallback ");
                 title.push_str(error);
@@ -578,6 +744,9 @@ impl GuiApp {
     fn apply_theme_visuals(&mut self) {
         self.frame_interval = Duration::from_millis(self.theme.cursor.blink_interval_ms);
         self.app.invalidate_visuals();
+        if !self.theme.animation.enabled {
+            self.transition = None;
+        }
         let effects = self.visual_effects_policy();
         if let Some(window) = self.window.as_ref() {
             window.set_transparent(effects.window_transparent);
@@ -614,11 +783,42 @@ impl GuiApp {
         true
     }
 
+    fn advance_transition(&mut self, now: Instant) -> bool {
+        let Some(transition) = self.transition.as_mut() else {
+            return false;
+        };
+        if now >= transition.deadline() {
+            self.transition = None;
+            return true;
+        }
+        if now < transition.next_frame_at {
+            return false;
+        }
+
+        transition.next_frame_at = now + ANIMATION_FRAME_INTERVAL;
+        true
+    }
+
     fn reschedule(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window_focused {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_cursor_blink_at));
-        } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
+        let transition_deadline = self
+            .transition
+            .as_ref()
+            .map(|transition| transition.next_frame_at.min(transition.deadline()));
+        match (self.window_focused, transition_deadline) {
+            (true, Some(deadline)) => {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    self.next_cursor_blink_at.min(deadline),
+                ));
+            }
+            (true, None) => {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_cursor_blink_at));
+            }
+            (false, Some(deadline)) => {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            }
+            (false, None) => {
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
         }
     }
 
@@ -911,7 +1111,7 @@ impl GuiApp {
                 let command = palette.selected_command();
                 self.command_palette = None;
                 if let Some(command) = command {
-                    command.execute(&mut self.app)?;
+                    self.apply_palette_command(command)?;
                 }
             }
             winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowDown)
@@ -1207,6 +1407,10 @@ impl ApplicationHandler for GuiApp {
 
         let _ = self.poll_config_reload();
         let _ = self.drain_output_events();
+        if self.advance_transition(Instant::now()) {
+            self.update_title();
+            self.request_redraw();
+        }
         if self.advance_cursor_blink(Instant::now()) {
             self.update_title();
             self.request_redraw();
@@ -1447,7 +1651,7 @@ mod tests {
         let path = temp_config_path("theme-reload");
         fs::write(
             &path,
-            "[font]\nfamily = \"JetBrainsMono Nerd Font\"\nsize = 14.0\n\n[theme]\nopacity = 1.0\n\n[theme.pane]\ngap = 8\npadding = 6\nradius = 8\n\n[theme.cursor]\nblink-interval-ms = 600\n",
+            "[font]\nfamily = \"JetBrainsMono Nerd Font\"\nsize = 14.0\n\n[theme]\nopacity = 1.0\n\n[theme.pane]\ngap = 8\npadding = 6\nradius = 8\n\n[theme.animation]\nenabled = true\nduration-ms = 120\n\n[theme.cursor]\nblink-interval-ms = 600\n",
         )
         .expect("write initial config");
 
@@ -1465,7 +1669,7 @@ mod tests {
 
         fs::write(
             &path,
-            "[font]\nfamily = \"Iosevka\"\nsize = 16.0\nfallback = [\"Noto Sans CJK SC\"]\n\n[theme]\nopacity = 0.75\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.cursor]\nblink-interval-ms = 250\n",
+            "[font]\nfamily = \"Iosevka\"\nsize = 16.0\nfallback = [\"Noto Sans CJK SC\"]\n\n[theme]\nopacity = 0.75\n\n[theme.pane]\ngap = 10\npadding = 4\nradius = 12\n\n[theme.animation]\nenabled = false\nduration-ms = 200\n\n[theme.cursor]\nblink-interval-ms = 250\n",
         )
         .expect("write changed config");
 
@@ -1478,6 +1682,8 @@ mod tests {
         assert_eq!(gui.app.pane_chrome().gap, 10);
         assert_eq!(gui.app.pane_chrome().padding, 4);
         assert_eq!(gui.app.pane_chrome().radius, 12);
+        assert!(!gui.theme.animation.enabled);
+        assert_eq!(gui.theme.animation.duration_ms, 200);
         assert!(gui.theme_reload_error.is_none());
         assert!(!gui.poll_config_reload());
 
@@ -1563,6 +1769,70 @@ mod tests {
             .expect("workspace pane should exist")
             .close_runtime()?;
         assert!(workspace_status.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn split_command_starts_pane_transition_when_animation_is_enabled() -> Result<(), Box<dyn Error>>
+    {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
+
+        gui.apply_palette_command(PaletteCommand::SplitHorizontal)?;
+
+        let transition = gui.transition.as_ref().expect("transition should start");
+        assert_eq!(transition.kind, TransitionKind::Pane);
+        assert_eq!(transition.duration, Duration::from_millis(120));
+        assert!(!transition.panes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_command_starts_workspace_transition() -> Result<(), Box<dyn Error>> {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
+
+        gui.apply_palette_command(PaletteCommand::Workspace(WorkspaceId::new(2)))?;
+
+        let transition = gui.transition.as_ref().expect("transition should start");
+        assert_eq!(transition.kind, TransitionKind::Workspace);
+        assert!(!transition.panes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn animation_off_switch_skips_transition() -> Result<(), Box<dyn Error>> {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
+        let mut theme = ThemeConfig::default();
+        theme.animation.enabled = false;
+        let mut gui = GuiApp::new(
+            app,
+            GuiLaunchOptions {
+                theme,
+                ..GuiLaunchOptions::default()
+            },
+        );
+
+        gui.apply_palette_command(PaletteCommand::SplitHorizontal)?;
+
+        assert!(gui.transition.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn advance_transition_clears_finished_animation() -> Result<(), Box<dyn Error>> {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
+
+        gui.apply_palette_command(PaletteCommand::SplitHorizontal)?;
+        let deadline = gui
+            .transition
+            .as_ref()
+            .expect("transition should start")
+            .deadline();
+
+        assert!(gui.advance_transition(deadline));
+        assert!(gui.transition.is_none());
         Ok(())
     }
 
