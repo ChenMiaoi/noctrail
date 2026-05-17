@@ -1,8 +1,10 @@
 use std::{
-    env,
+    env, fs,
     path::{Path, PathBuf},
-    process, thread,
-    time::Duration,
+    process,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(windows)]
@@ -15,7 +17,10 @@ use noctrail_render::{
 };
 use noctrail_runtime::{PaneId, PaneRuntimeRegistry, RuntimeCommand, RuntimeEvent};
 use noctrail_term::recording::replay_recording_file;
-use noctrail_term::{Cell, Color, Cursor, DamageSet, ScreenRowSnapshot, Style, TerminalSnapshot};
+use noctrail_term::{
+    Cell, Color, Cursor, DamageSet, MouseTrackingMode, ScreenRowSnapshot, Style, TerminalSnapshot,
+    TerminalState,
+};
 use serde::Deserialize;
 
 const HELP: &str = "\
@@ -30,6 +35,7 @@ Commands:
   doctor gpu  Print GPU backend diagnostics
   doctor font Print font fallback diagnostics
   replay      Replay one or more terminal recording fixtures
+  tui-matrix  Run the TUI compatibility smoke matrix
   render-fixtures  Run deterministic render fixtures
   render-smoke Run the render smoke check
   pty-smoke   Run the PTY smoke check
@@ -66,6 +72,13 @@ fn main() {
         }
         Some("render-smoke") => {
             if let Err(error) = run_render_smoke() {
+                eprintln!("{error}");
+                process::exit(1);
+            }
+        }
+        Some("tui-matrix") => {
+            let targets: Vec<String> = args.collect();
+            if let Err(error) = run_tui_matrix(&targets) {
                 eprintln!("{error}");
                 process::exit(1);
             }
@@ -107,6 +120,111 @@ fn print_doctor() {
     println!("target: {}", env::consts::OS);
     println!("arch: {}", env::consts::ARCH);
     println!("hint: run `noctrail doctor shell` for shell diagnostics");
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuiCapability {
+    AltScreen,
+    Mouse,
+    Resize,
+    Color,
+}
+
+impl TuiCapability {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::AltScreen => "alt-screen",
+            Self::Mouse => "mouse",
+            Self::Resize => "resize",
+            Self::Color => "color",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TuiTargetSpec {
+    name: &'static str,
+    aliases: &'static [&'static str],
+    override_env: &'static str,
+    program_candidates: &'static [&'static str],
+    required: &'static [TuiCapability],
+    actual_probe: Option<TuiActualProbe>,
+    skip_hint: &'static str,
+}
+
+type TuiActualProbe = fn(&Path) -> Result<TuiProbe, String>;
+
+#[derive(Debug, Clone)]
+struct TuiProbe {
+    target: &'static str,
+    source: String,
+    command: noctrail_pty::PtyCommand,
+    initial_size: PtySize,
+    steps: Vec<TuiProbeStep>,
+    required: &'static [TuiCapability],
+    timeout: Duration,
+    cleanup_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct TuiProbeStep {
+    at: Duration,
+    action: TuiProbeAction,
+}
+
+#[derive(Debug, Clone)]
+enum TuiProbeAction {
+    Write(Vec<u8>),
+    Resize(PtySize),
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ObservedCapabilities {
+    alt_screen: bool,
+    mouse: bool,
+    resize: bool,
+    color: bool,
+}
+
+impl ObservedCapabilities {
+    fn contains(self, capability: TuiCapability) -> bool {
+        match capability {
+            TuiCapability::AltScreen => self.alt_screen,
+            TuiCapability::Mouse => self.mouse,
+            TuiCapability::Resize => self.resize,
+            TuiCapability::Color => self.color,
+        }
+    }
+
+    fn labels(self) -> Vec<&'static str> {
+        let mut labels = Vec::new();
+        for capability in [
+            TuiCapability::AltScreen,
+            TuiCapability::Mouse,
+            TuiCapability::Resize,
+            TuiCapability::Color,
+        ] {
+            if self.contains(capability) {
+                labels.push(capability.label());
+            }
+        }
+        labels
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TuiProbeStatus {
+    Passed,
+    Skipped(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TuiProbeReport {
+    target: &'static str,
+    source: String,
+    observed: ObservedCapabilities,
+    required: Vec<&'static str>,
+    status: TuiProbeStatus,
 }
 
 fn print_doctor_shell() {
@@ -154,6 +272,540 @@ fn print_doctor_shell() {
                 value.to_string_lossy()
             );
         }
+    }
+}
+
+fn run_tui_matrix(filters: &[String]) -> Result<(), String> {
+    let specs = tui_target_specs();
+    let selected = select_tui_targets(specs, filters)?;
+    let mut ran_any = false;
+    let mut failures = Vec::new();
+
+    for spec in selected {
+        match run_tui_target(spec) {
+            Ok(report) => {
+                println!("{}", format_tui_report(&report));
+                if matches!(report.status, TuiProbeStatus::Passed) {
+                    ran_any = true;
+                }
+            }
+            Err(error) => {
+                failures.push(format!("{}: {error}", spec.name));
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        return Err(failures.join("\n"));
+    }
+
+    if !ran_any {
+        println!("tui-matrix: all selected targets were skipped");
+    } else {
+        println!("tui matrix ok");
+    }
+    Ok(())
+}
+
+fn run_tui_target(spec: &'static TuiTargetSpec) -> Result<TuiProbeReport, String> {
+    let Some(probe) = resolve_tui_probe(spec)? else {
+        return Ok(TuiProbeReport {
+            target: spec.name,
+            source: "unavailable".to_string(),
+            observed: ObservedCapabilities::default(),
+            required: spec.required.iter().map(|cap| cap.label()).collect(),
+            status: TuiProbeStatus::Skipped(spec.skip_hint.to_string()),
+        });
+    };
+
+    let result = run_tui_probe(&probe);
+    cleanup_tui_probe(&probe);
+
+    let observed = result?;
+    let missing = probe
+        .required
+        .iter()
+        .filter(|capability| !observed.contains(**capability))
+        .map(|capability| capability.label())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "missing capabilities [{}] from {}",
+            missing.join(", "),
+            probe.source
+        ));
+    }
+
+    Ok(TuiProbeReport {
+        target: probe.target,
+        source: probe.source,
+        observed,
+        required: probe.required.iter().map(|cap| cap.label()).collect(),
+        status: TuiProbeStatus::Passed,
+    })
+}
+
+fn resolve_tui_probe(spec: &'static TuiTargetSpec) -> Result<Option<TuiProbe>, String> {
+    if let Some(override_path) = env::var_os(spec.override_env) {
+        return Ok(Some(override_tui_probe(
+            spec,
+            PathBuf::from(override_path),
+            spec.override_env,
+        )?));
+    }
+
+    let Some(actual_probe) = spec.actual_probe else {
+        return Ok(None);
+    };
+    let Some(program_path) = find_executable(spec.program_candidates) else {
+        return Ok(None);
+    };
+    actual_probe(&program_path).map(Some)
+}
+
+fn override_tui_probe(
+    spec: &'static TuiTargetSpec,
+    program_path: PathBuf,
+    source_label: &str,
+) -> Result<TuiProbe, String> {
+    let mut command = noctrail_pty::PtyCommand::new(program_path.as_os_str());
+    command.cwd_path(
+        env::current_dir()
+            .map_err(|error| format!("failed to resolve current working directory: {error}"))?,
+    );
+
+    Ok(TuiProbe {
+        target: spec.name,
+        source: format!("override:{source_label}"),
+        command,
+        initial_size: PtySize::new(80, 24),
+        steps: vec![
+            TuiProbeStep {
+                at: Duration::from_millis(150),
+                action: TuiProbeAction::Write(b"start\r".to_vec()),
+            },
+            TuiProbeStep {
+                at: Duration::from_millis(300),
+                action: TuiProbeAction::Resize(PtySize::new(100, 30)),
+            },
+            TuiProbeStep {
+                at: Duration::from_millis(450),
+                action: TuiProbeAction::Write(b"resize\r".to_vec()),
+            },
+            TuiProbeStep {
+                at: Duration::from_millis(600),
+                action: TuiProbeAction::Write(b"q\r".to_vec()),
+            },
+        ],
+        required: spec.required,
+        timeout: Duration::from_secs(4),
+        cleanup_paths: Vec::new(),
+    })
+}
+
+fn less_tui_probe(program_path: &Path) -> Result<TuiProbe, String> {
+    let fixture_path = temp_fixture_path("less", "ansi.txt");
+    let wrapper_path = temp_fixture_path("less-wrapper", "sh");
+    fs::write(
+        &fixture_path,
+        "\u{1b}[31mNOCTRAIL_LESS_RED\u{1b}[0m\nNOCTRAIL_LESS_BODY\n",
+    )
+    .map_err(|error| format!("failed to write less fixture: {error}"))?;
+    fs::write(
+        &wrapper_path,
+        "#!/bin/sh\nprintf '\\033[?1049h'\n\"$1\" -R \"$2\"\nstatus=$?\nprintf '\\033[?1049l'\nexit \"$status\"\n",
+    )
+    .map_err(|error| format!("failed to write less wrapper: {error}"))?;
+    make_executable_path(&wrapper_path)?;
+
+    let mut command = noctrail_pty::PtyCommand::new(wrapper_path.as_os_str());
+    command.arg(program_path.as_os_str()).arg(&fixture_path);
+    command.cwd_path(
+        env::current_dir()
+            .map_err(|error| format!("failed to resolve current working directory: {error}"))?,
+    );
+
+    Ok(TuiProbe {
+        target: "less",
+        source: format!("program:{}", program_path.display()),
+        command,
+        initial_size: PtySize::new(80, 24),
+        steps: vec![
+            TuiProbeStep {
+                at: Duration::from_millis(200),
+                action: TuiProbeAction::Resize(PtySize::new(100, 30)),
+            },
+            TuiProbeStep {
+                at: Duration::from_millis(350),
+                action: TuiProbeAction::Write(b"r".to_vec()),
+            },
+            TuiProbeStep {
+                at: Duration::from_millis(500),
+                action: TuiProbeAction::Write(b"q".to_vec()),
+            },
+        ],
+        required: &[
+            TuiCapability::AltScreen,
+            TuiCapability::Resize,
+            TuiCapability::Color,
+        ],
+        timeout: Duration::from_secs(4),
+        cleanup_paths: vec![fixture_path, wrapper_path],
+    })
+}
+
+fn run_tui_probe(probe: &TuiProbe) -> Result<ObservedCapabilities, String> {
+    let mut session = PtySession::spawn(probe.command.clone(), probe.initial_size)
+        .map_err(|error| format!("failed to spawn {} probe: {error}", probe.target))?;
+    let reader = session
+        .clone_output_reader()
+        .map_err(|error| format!("failed to clone {} probe reader: {error}", probe.target))?;
+    let (tx, rx) = mpsc::channel();
+    let reader_handle = thread::spawn(move || pump_tui_output(reader, tx));
+    let mut terminal = TerminalState::new(
+        usize::from(probe.initial_size.cols),
+        usize::from(probe.initial_size.rows),
+    );
+    let _ = terminal.grid_mut().take_dirty_rows();
+    let mut observed = ObservedCapabilities::default();
+    let started_at = Instant::now();
+    let mut next_step = 0;
+    let mut saw_resize = false;
+    let mut exit_seen = false;
+
+    while started_at.elapsed() <= probe.timeout {
+        while next_step < probe.steps.len() && started_at.elapsed() >= probe.steps[next_step].at {
+            match &probe.steps[next_step].action {
+                TuiProbeAction::Write(bytes) => {
+                    session.write(bytes).map_err(|error| {
+                        format!("failed to write {} probe input: {error}", probe.target)
+                    })?;
+                }
+                TuiProbeAction::Resize(size) => {
+                    session.resize(*size).map_err(|error| {
+                        format!("failed to resize {} probe: {error}", probe.target)
+                    })?;
+                    terminal.resize(usize::from(size.cols), usize::from(size.rows));
+                    saw_resize = true;
+                }
+            }
+            next_step += 1;
+        }
+
+        match rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(TuiProbeReaderEvent::Bytes(bytes)) => {
+                let result = terminal.advance_bytes(&bytes);
+                if result.alternate_screen_changed || terminal.snapshot().alternate_screen {
+                    observed.alt_screen = true;
+                }
+                if terminal.mouse_tracking_mode() != MouseTrackingMode::Disabled
+                    || terminal.sgr_mouse_mode()
+                {
+                    observed.mouse = true;
+                }
+                if terminal_snapshot_has_color(&terminal.snapshot()) {
+                    observed.color = true;
+                }
+                if saw_resize {
+                    observed.resize = true;
+                }
+            }
+            Ok(TuiProbeReaderEvent::Eof) => {
+                exit_seen = session.try_wait().ok().flatten().is_some();
+                break;
+            }
+            Ok(TuiProbeReaderEvent::Error(error)) => {
+                let _ = session.close();
+                let _ = reader_handle.join();
+                return Err(format!("{} probe reader error: {error}", probe.target));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if session.try_wait().ok().flatten().is_some() {
+                    exit_seen = true;
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                exit_seen = true;
+                break;
+            }
+        }
+    }
+
+    let status = session.close().ok().flatten();
+    let _ = reader_handle.join();
+    exit_seen |= status.is_some();
+
+    if !exit_seen {
+        return Err(format!(
+            "{} probe timed out after {:?}",
+            probe.target, probe.timeout
+        ));
+    }
+
+    Ok(observed)
+}
+
+#[derive(Debug)]
+enum TuiProbeReaderEvent {
+    Bytes(Vec<u8>),
+    Eof,
+    Error(String),
+}
+
+fn pump_tui_output(
+    mut reader: noctrail_pty::PtyOutputReader,
+    tx: mpsc::Sender<TuiProbeReaderEvent>,
+) {
+    let mut buf = [0_u8; 4096];
+
+    loop {
+        match std::io::Read::read(&mut reader, &mut buf) {
+            Ok(0) => {
+                let _ = tx.send(TuiProbeReaderEvent::Eof);
+                break;
+            }
+            Ok(count) => {
+                if tx
+                    .send(TuiProbeReaderEvent::Bytes(buf[..count].to_vec()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(error) => {
+                let _ = tx.send(TuiProbeReaderEvent::Error(error.to_string()));
+                break;
+            }
+        }
+    }
+}
+
+fn cleanup_tui_probe(probe: &TuiProbe) {
+    for path in &probe.cleanup_paths {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn terminal_snapshot_has_color(snapshot: &TerminalSnapshot) -> bool {
+    snapshot.rows.iter().any(row_has_color) || snapshot.scrollback.iter().any(row_has_color)
+}
+
+fn row_has_color(row: &ScreenRowSnapshot) -> bool {
+    row.cells.iter().any(|cell| {
+        cell.style.foreground != Color::Default || cell.style.background != Color::Default
+    })
+}
+
+fn format_tui_report(report: &TuiProbeReport) -> String {
+    let required = if report.required.is_empty() {
+        "none".to_string()
+    } else {
+        report.required.join(",")
+    };
+    let observed = {
+        let labels = report.observed.labels();
+        if labels.is_empty() {
+            "none".to_string()
+        } else {
+            labels.join(",")
+        }
+    };
+
+    match &report.status {
+        TuiProbeStatus::Passed => format!(
+            "pass {} source={} required={} observed={}",
+            report.target, report.source, required, observed
+        ),
+        TuiProbeStatus::Skipped(reason) => format!(
+            "skip {} source={} required={} reason={}",
+            report.target, report.source, required, reason
+        ),
+    }
+}
+
+fn select_tui_targets(
+    specs: &'static [TuiTargetSpec],
+    filters: &[String],
+) -> Result<Vec<&'static TuiTargetSpec>, String> {
+    if filters.is_empty() {
+        return Ok(specs.iter().collect());
+    }
+
+    let mut selected = Vec::new();
+    for filter in filters {
+        let Some(spec) = specs
+            .iter()
+            .find(|spec| spec.name == filter || spec.aliases.iter().any(|alias| alias == filter))
+        else {
+            return Err(format!("unknown TUI target: {filter}"));
+        };
+        if !selected
+            .iter()
+            .any(|existing: &&TuiTargetSpec| existing.name == spec.name)
+        {
+            selected.push(spec);
+        }
+    }
+
+    Ok(selected)
+}
+
+fn tui_target_specs() -> &'static [TuiTargetSpec] {
+    &[
+        TuiTargetSpec {
+            name: "nvim",
+            aliases: &[],
+            override_env: "NOCTRAIL_TUI_NVIM",
+            program_candidates: &[],
+            required: &[
+                TuiCapability::AltScreen,
+                TuiCapability::Mouse,
+                TuiCapability::Resize,
+                TuiCapability::Color,
+            ],
+            actual_probe: None,
+            skip_hint: "set NOCTRAIL_TUI_NVIM to a scripted probe",
+        },
+        TuiTargetSpec {
+            name: "tmux",
+            aliases: &[],
+            override_env: "NOCTRAIL_TUI_TMUX",
+            program_candidates: &[],
+            required: &[
+                TuiCapability::AltScreen,
+                TuiCapability::Mouse,
+                TuiCapability::Resize,
+                TuiCapability::Color,
+            ],
+            actual_probe: None,
+            skip_hint: "set NOCTRAIL_TUI_TMUX to a scripted probe",
+        },
+        TuiTargetSpec {
+            name: "fzf",
+            aliases: &[],
+            override_env: "NOCTRAIL_TUI_FZF",
+            program_candidates: &[],
+            required: &[
+                TuiCapability::AltScreen,
+                TuiCapability::Mouse,
+                TuiCapability::Resize,
+                TuiCapability::Color,
+            ],
+            actual_probe: None,
+            skip_hint: "set NOCTRAIL_TUI_FZF to a scripted probe",
+        },
+        TuiTargetSpec {
+            name: "less",
+            aliases: &[],
+            override_env: "NOCTRAIL_TUI_LESS",
+            program_candidates: &["less"],
+            required: &[
+                TuiCapability::AltScreen,
+                TuiCapability::Resize,
+                TuiCapability::Color,
+            ],
+            actual_probe: Some(less_tui_probe),
+            skip_hint: "install less or set NOCTRAIL_TUI_LESS to a scripted probe",
+        },
+        TuiTargetSpec {
+            name: "top/htop",
+            aliases: &["top", "htop"],
+            override_env: "NOCTRAIL_TUI_TOP_HTOP",
+            program_candidates: &[],
+            required: &[
+                TuiCapability::AltScreen,
+                TuiCapability::Resize,
+                TuiCapability::Color,
+            ],
+            actual_probe: None,
+            skip_hint: "set NOCTRAIL_TUI_TOP_HTOP to a scripted probe",
+        },
+        TuiTargetSpec {
+            name: "ssh",
+            aliases: &[],
+            override_env: "NOCTRAIL_TUI_SSH",
+            program_candidates: &[],
+            required: &[TuiCapability::Resize, TuiCapability::Color],
+            actual_probe: None,
+            skip_hint: "set NOCTRAIL_TUI_SSH to a scripted probe",
+        },
+    ]
+}
+
+fn find_executable(candidates: &[&str]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .find_map(|candidate| find_executable_in_path(candidate))
+}
+
+fn find_executable_in_path(program: &str) -> Option<PathBuf> {
+    let program_path = Path::new(program);
+    if program_path.components().count() > 1 && program_path.is_file() {
+        return Some(program_path.to_path_buf());
+    }
+
+    let path_value = env::var_os("PATH")?;
+
+    #[cfg(windows)]
+    let extensions = executable_extensions();
+    #[cfg(not(windows))]
+    let extensions = vec![String::new()];
+
+    for directory in env::split_paths(&path_value) {
+        for extension in &extensions {
+            let candidate = if extension.is_empty() || program.contains('.') {
+                directory.join(program)
+            } else {
+                directory.join(format!("{program}{extension}"))
+            };
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(windows)]
+fn executable_extensions() -> Vec<String> {
+    env::var_os("PATHEXT")
+        .map(|value| {
+            env::split_paths(&value)
+                .map(|path| path.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+        })
+        .filter(|extensions| !extensions.is_empty())
+        .unwrap_or_else(|| vec![".exe".to_string(), ".bat".to_string(), ".cmd".to_string()])
+}
+
+fn temp_fixture_path(label: &str, extension: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after epoch")
+        .as_nanos();
+    env::temp_dir().join(format!("noctrail-{label}-{unique}.{extension}"))
+}
+
+fn make_executable_path(path: &Path) -> Result<(), String> {
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let metadata = fs::metadata(path)
+            .map_err(|error| format!("failed to stat {}: {error}", path.display()))?;
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions)
+            .map_err(|error| format!("failed to chmod {}: {error}", path.display()))?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = path;
+        Ok(())
     }
 }
 
@@ -1191,6 +1843,7 @@ fn collect_runtime_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
 
     #[test]
     fn glob_detection_matches_shell_like_patterns() {
@@ -1214,5 +1867,56 @@ mod tests {
         let probe = pty_smoke_probe("NOCTRAIL_PTY_SMOKE").expect("pty smoke probe should build");
         let script = String::from_utf8(probe.input).expect("probe input should be utf-8");
         assert!(script.contains("NOCTRAIL_PTY_SMOKE"));
+    }
+
+    #[test]
+    fn tui_target_filter_accepts_aliases() {
+        let selected = select_tui_targets(
+            tui_target_specs(),
+            &[String::from("htop"), String::from("ssh")],
+        )
+        .expect("filters should resolve");
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].name, "top/htop");
+        assert_eq!(selected[1].name, "ssh");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn tui_matrix_accepts_override_probe() {
+        let _guard = env_test_lock()
+            .lock()
+            .expect("env test lock should be available");
+        let script_path = temp_fixture_path("tui-override-test", "sh");
+        fs::write(
+            &script_path,
+            "#!/bin/sh\ntrap 'printf \"\\033[38;2;255;0;0mRESIZED\\033[0m\\n\"' WINCH\nprintf '\\033[?1049h\\033[?1000h\\033[?1006h\\033[38;2;255;0;0mHELLO\\033[0m\\n'\nwhile IFS= read -r line; do\n  [ \"$line\" = q ] && break\n  printf '\\033[38;2;0;255;0m%s\\033[0m\\n' \"$line\"\ndone\nprintf '\\033[?1049l'\n",
+        )
+        .expect("script should write");
+        make_executable(&script_path);
+
+        unsafe {
+            env::set_var("NOCTRAIL_TUI_NVIM", &script_path);
+        }
+
+        let result = run_tui_matrix(&[String::from("nvim")]);
+
+        unsafe {
+            env::remove_var("NOCTRAIL_TUI_NVIM");
+        }
+        let _ = fs::remove_file(&script_path);
+
+        result.expect("override probe should pass");
+    }
+
+    fn env_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(not(windows))]
+    fn make_executable(path: &Path) {
+        make_executable_path(path).expect("script should be executable");
     }
 }
