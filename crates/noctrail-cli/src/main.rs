@@ -1,10 +1,10 @@
-use std::{env, path::PathBuf, process};
+use std::{env, path::PathBuf, process, thread, time::Duration};
 
 #[cfg(windows)]
 use noctrail_pty::ShellSource;
 use noctrail_pty::{PtySession, PtySize, ResolvedShell};
 use noctrail_render::{RenderBackend, RenderPlan, RenderRect};
-use noctrail_runtime::{PaneId, PaneRuntimeRegistry};
+use noctrail_runtime::{PaneId, PaneRuntimeRegistry, RuntimeCommand, RuntimeEvent};
 use noctrail_term::recording::replay_recording_file;
 use noctrail_term::{Cell, Color, Cursor, ScreenRowSnapshot, Style, TerminalSnapshot};
 
@@ -450,14 +450,22 @@ fn run_runtime_registry_pty_smoke() -> Result<(), String> {
             .spawn_shell(PtySize::new(80, 24))
             .map_err(|error| format!("failed to spawn runtime pane {marker}: {error}"))?;
         let probe = pty_smoke_probe(marker)?;
-        registry
-            .write_input(pane_id, &probe.input)
+        let write_result = registry
+            .apply_command(RuntimeCommand::Write {
+                pane_id,
+                bytes: probe.input.clone(),
+            })
             .map_err(|error| format!("failed to write runtime pane {pane_id:?}: {error}"))?;
+        if write_result.is_some() {
+            return Err(format!(
+                "runtime pane {pane_id:?} write command unexpectedly emitted an event"
+            ));
+        }
         panes.push((pane_id, probe));
     }
 
     for (pane_id, probe) in panes {
-        let output = read_all_runtime_output(&mut registry, pane_id)
+        let (output, exit_seen) = collect_runtime_events(&mut registry, pane_id)
             .map_err(|error| format!("failed to read runtime pane {pane_id:?}: {error}"))?;
         let haystack = String::from_utf8_lossy(&output);
 
@@ -479,7 +487,16 @@ fn run_runtime_registry_pty_smoke() -> Result<(), String> {
             }
         }
 
-        let _ = registry.close(pane_id);
+        if !exit_seen {
+            return Err(format!(
+                "runtime pane {pane_id:?} did not emit an exit event before EOF"
+            ));
+        }
+        if registry.contains(pane_id) {
+            return Err(format!(
+                "runtime pane {pane_id:?} should have been removed after its exit event"
+            ));
+        }
     }
 
     Ok(())
@@ -526,22 +543,41 @@ fn read_until_fragments(
     Ok(output)
 }
 
-fn read_all_runtime_output(
+fn collect_runtime_events(
     registry: &mut PaneRuntimeRegistry,
     pane_id: PaneId,
-) -> Result<Vec<u8>, noctrail_runtime::RuntimeError> {
+) -> Result<(Vec<u8>, bool), String> {
     let mut output = Vec::new();
     let mut chunk = [0_u8; 1024];
+    let mut exit_seen = false;
+    let mut idle_polls = 0_u32;
 
     loop {
-        let count = registry.read_output(pane_id, &mut chunk)?;
-        if count == 0 {
-            break;
+        match registry
+            .read_output_event(pane_id, &mut chunk)
+            .map_err(|error| error.to_string())?
+        {
+            Some(RuntimeEvent::Output { bytes, .. }) => output.extend_from_slice(&bytes),
+            Some(RuntimeEvent::Exited { .. }) => {
+                exit_seen = true;
+                break;
+            }
+            Some(RuntimeEvent::Error { error, .. }) => return Err(error.to_string()),
+            None => {
+                if !registry.contains(pane_id) {
+                    break;
+                }
+
+                idle_polls += 1;
+                if idle_polls >= 100 {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
         }
-        output.extend_from_slice(&chunk[..count]);
     }
 
-    Ok(output)
+    Ok((output, exit_seen))
 }
 
 #[cfg(test)]
