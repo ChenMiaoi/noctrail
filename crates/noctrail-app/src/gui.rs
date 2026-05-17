@@ -26,7 +26,7 @@ const DEFAULT_WINDOW_WIDTH: u32 = 1280;
 const DEFAULT_WINDOW_HEIGHT: u32 = 800;
 const DEFAULT_CELL_WIDTH: u32 = 8;
 const DEFAULT_CELL_HEIGHT: u32 = 16;
-const FRAME_INTERVAL: Duration = Duration::from_millis(250);
+const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(600);
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new()?;
@@ -105,9 +105,10 @@ struct GuiApp {
     mouse_button: Option<input::MouseButton>,
     output_rx: Option<Receiver<OutputPumpEvent>>,
     output_thread: Option<JoinHandle<()>>,
-    next_frame_at: Instant,
+    next_cursor_blink_at: Instant,
     cursor_visible: bool,
     frame_interval: Duration,
+    window_focused: bool,
     modifiers: ModifiersState,
     clipboard: ClipboardBridge,
 }
@@ -126,9 +127,10 @@ impl GuiApp {
             mouse_button: None,
             output_rx: None,
             output_thread: None,
-            next_frame_at: now,
+            next_cursor_blink_at: now + CURSOR_BLINK_INTERVAL,
             cursor_visible: true,
-            frame_interval: FRAME_INTERVAL,
+            frame_interval: CURSOR_BLINK_INTERVAL,
+            window_focused: true,
             modifiers: ModifiersState::empty(),
             clipboard: ClipboardBridge::new(),
         }
@@ -214,13 +216,27 @@ impl GuiApp {
         }
     }
 
-    fn reschedule(&mut self, event_loop: &ActiveEventLoop) {
-        let now = Instant::now();
-        if now >= self.next_frame_at {
-            self.request_redraw();
-            self.next_frame_at = now + self.frame_interval;
+    fn touch_cursor_blink(&mut self) {
+        self.cursor_visible = true;
+        self.next_cursor_blink_at = Instant::now() + self.frame_interval;
+    }
+
+    fn advance_cursor_blink(&mut self, now: Instant) -> bool {
+        if !self.window_focused || now < self.next_cursor_blink_at {
+            return false;
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame_at));
+
+        self.cursor_visible = !self.cursor_visible;
+        self.next_cursor_blink_at = now + self.frame_interval;
+        true
+    }
+
+    fn reschedule(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window_focused {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_cursor_blink_at));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
     }
 
     fn record_gpu_fallback(&mut self, error: String) {
@@ -253,6 +269,7 @@ impl GuiApp {
         }
 
         if received_output {
+            self.touch_cursor_blink();
             self.update_title();
             self.request_redraw();
         }
@@ -265,6 +282,7 @@ impl GuiApp {
             Ime::Enabled | Ime::Disabled => Ok(()),
             Ime::Preedit(text, _cursor) => {
                 self.ime_preedit = if text.is_empty() { None } else { Some(text) };
+                self.touch_cursor_blink();
                 self.update_title();
                 self.request_redraw();
                 Ok(())
@@ -273,6 +291,7 @@ impl GuiApp {
                 self.ime_preedit = None;
                 if !text.is_empty() {
                     self.app.write_input(text.as_bytes())?;
+                    self.touch_cursor_blink();
                     self.request_redraw();
                 }
                 self.update_title();
@@ -332,6 +351,7 @@ impl GuiApp {
                 selection.cursor,
                 SelectionMode::Normal,
             );
+            self.touch_cursor_blink();
             self.request_redraw();
             self.update_title();
         }
@@ -370,6 +390,7 @@ impl GuiApp {
                     }
                 }
             }
+            self.touch_cursor_blink();
             self.request_redraw();
             self.update_title();
             return Ok(());
@@ -388,6 +409,7 @@ impl GuiApp {
                     });
                     self.app
                         .select_viewport_range(cell, cell, SelectionMode::Normal);
+                    self.touch_cursor_blink();
                     self.request_redraw();
                     self.update_title();
                 }
@@ -420,8 +442,10 @@ impl GuiApp {
                     self.write_mouse_report(kind, cell)?;
                 }
             }
+            self.touch_cursor_blink();
         } else {
             self.app.scroll_scrollback(lines);
+            self.touch_cursor_blink();
             self.request_redraw();
             self.update_title();
         }
@@ -504,7 +528,7 @@ impl ApplicationHandler for GuiApp {
             return;
         }
 
-        self.next_frame_at = Instant::now() + self.frame_interval;
+        self.touch_cursor_blink();
         self.reschedule(event_loop);
     }
 
@@ -567,6 +591,7 @@ impl ApplicationHandler for GuiApp {
                                     event_loop.exit();
                                     return;
                                 }
+                                self.touch_cursor_blink();
                                 self.request_redraw();
                                 self.update_title();
                             }
@@ -584,6 +609,7 @@ impl ApplicationHandler for GuiApp {
                         event_loop.exit();
                         return;
                     }
+                    self.touch_cursor_blink();
                     self.request_redraw();
                     self.update_title();
                 }
@@ -593,6 +619,7 @@ impl ApplicationHandler for GuiApp {
                     event_loop.exit();
                     return;
                 }
+                self.touch_cursor_blink();
                 self.update_title();
                 self.request_redraw();
             }
@@ -603,11 +630,16 @@ impl ApplicationHandler for GuiApp {
                     self.record_gpu_fallback(error.to_string());
                     self.update_title();
                 }
-                self.cursor_visible = !self.cursor_visible;
                 self.update_title();
-                self.next_frame_at = Instant::now() + self.frame_interval;
             }
             WindowEvent::Focused(true) => {
+                self.window_focused = true;
+                self.touch_cursor_blink();
+                self.request_redraw();
+            }
+            WindowEvent::Focused(false) => {
+                self.window_focused = false;
+                self.cursor_visible = true;
                 self.request_redraw();
             }
             _ => {}
@@ -621,6 +653,10 @@ impl ApplicationHandler for GuiApp {
         }
 
         let _ = self.drain_output_events();
+        if self.advance_cursor_blink(Instant::now()) {
+            self.update_title();
+            self.request_redraw();
+        }
         self.reschedule(event_loop);
     }
 
@@ -694,6 +730,33 @@ mod tests {
         assert_eq!(gui.app.backend(), RenderBackend::Software);
         assert!(gui.renderer.is_none());
         assert_eq!(gui.gpu_fallback_error.as_deref(), Some("adapter missing"));
+    }
+
+    #[test]
+    fn cursor_blink_only_flips_after_deadline() {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
+        let mut gui = GuiApp::new(app);
+        let now = Instant::now();
+        gui.next_cursor_blink_at = now + Duration::from_millis(50);
+
+        assert!(!gui.advance_cursor_blink(now + Duration::from_millis(20)));
+        assert!(gui.cursor_visible);
+
+        assert!(gui.advance_cursor_blink(now + Duration::from_millis(50)));
+        assert!(!gui.cursor_visible);
+        assert!(gui.next_cursor_blink_at > now + Duration::from_millis(50));
+    }
+
+    #[test]
+    fn cursor_blink_stops_when_window_is_unfocused() {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
+        let mut gui = GuiApp::new(app);
+        let now = Instant::now();
+        gui.window_focused = false;
+        gui.next_cursor_blink_at = now;
+
+        assert!(!gui.advance_cursor_blink(now + Duration::from_secs(1)));
+        assert!(gui.cursor_visible);
     }
 
     #[test]
