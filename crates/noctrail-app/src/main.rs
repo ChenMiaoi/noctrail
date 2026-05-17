@@ -18,6 +18,7 @@ use noctrail_config::{
 use noctrail_layout::{FocusDirection, LayoutRect, SplitAxis};
 use noctrail_pty::{PtyCommand, PtySize};
 use noctrail_render::{PaneBorderStyle, RenderBackend, Rgba};
+use noctrail_term::{Position, SelectionMode};
 use winit::keyboard::{Key, ModifiersState};
 
 const HELP: &str = "\
@@ -27,6 +28,7 @@ Usage:
   noctrail-app [command] [options]
 
 Commands:
+  agent-context-smoke Run the read-only agent context preview probe
   agent-default-smoke Run the default-off agent policy probe
   block-smoke Run the block browser/history probe
   crash-smoke Run the panic-hook recovery probe
@@ -53,6 +55,7 @@ struct StartupOptions {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartupCommand {
+    AgentContextSmoke,
     AgentDefaultSmoke,
     BlockSmoke,
     CrashSmoke,
@@ -114,6 +117,12 @@ fn main() {
 
     match options.command {
         StartupCommand::Help => print!("{HELP}"),
+        StartupCommand::AgentContextSmoke => {
+            if let Err(error) = run_agent_context_smoke() {
+                eprintln!("{error}");
+                process::exit(1);
+            }
+        }
         StartupCommand::AgentDefaultSmoke => {
             if let Err(error) = run_agent_default_smoke() {
                 eprintln!("{error}");
@@ -180,6 +189,10 @@ fn parse_startup_options(args: &[String]) -> Result<StartupOptions, StartupError
 
     while index < args.len() {
         match args[index].as_str() {
+            "agent-context-smoke" if !command_set => {
+                command = StartupCommand::AgentContextSmoke;
+                command_set = true;
+            }
             "agent-default-smoke" if !command_set => {
                 command = StartupCommand::AgentDefaultSmoke;
                 command_set = true;
@@ -590,6 +603,74 @@ fn run_agent_default_smoke() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
     println!("agent default smoke ok");
+    Ok(())
+}
+
+fn run_agent_context_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24));
+    app.set_block_observer_enabled(true);
+    app.advance_output(&block_probe_bytes(
+        "cargo test -p noctrail-app",
+        "/tmp/noctrail-agent",
+        0,
+        21,
+        "alpha beta\ngamma delta\n",
+    ));
+    let _ = app.select_newest_command_block();
+    app.select_viewport_range(
+        Position { row: 0, col: 0 },
+        Position { row: 0, col: 4 },
+        SelectionMode::Normal,
+    );
+    app.set_agent_explicit_files(vec![
+        PathBuf::from("/tmp/noctrail/Cargo.toml"),
+        PathBuf::from("/tmp/noctrail/crates/noctrail-app/src/lib.rs"),
+    ]);
+
+    let preview = app.agent_context_preview();
+    if preview
+        .current_block
+        .as_ref()
+        .and_then(|block| block.command.as_deref())
+        != Some("cargo test -p noctrail-app")
+    {
+        return Err("agent context preview lost the current block command".into());
+    }
+    if preview.selection.as_deref() != Some("alpha") {
+        return Err("agent context preview lost the active selection".into());
+    }
+    if preview.cwd.as_deref() != Some(std::path::Path::new("/tmp/noctrail-agent")) {
+        return Err("agent context preview lost the cwd".into());
+    }
+    if preview.explicit_files.len() != 2 {
+        return Err(format!(
+            "expected exactly two explicit files, got {}",
+            preview.explicit_files.len()
+        )
+        .into());
+    }
+
+    println!(
+        "block={} selection={} cwd={} files={}",
+        preview
+            .current_block
+            .as_ref()
+            .and_then(|block| block.command.as_deref())
+            .unwrap_or("none"),
+        preview.selection.as_deref().unwrap_or("none"),
+        preview
+            .cwd
+            .as_deref()
+            .map(|cwd| cwd.display().to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        preview
+            .explicit_files
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    println!("agent context smoke ok");
     Ok(())
 }
 
@@ -1315,6 +1396,16 @@ mod tests {
             Some(PathBuf::from("/tmp/noctrail.toml"))
         );
         assert!(options.safe_mode);
+    }
+
+    #[test]
+    fn parses_agent_context_smoke_command() {
+        let options = parse_startup_options(&["agent-context-smoke".to_string()])
+            .expect("options should parse");
+
+        assert_eq!(options.command, StartupCommand::AgentContextSmoke);
+        assert_eq!(options.config_path, None);
+        assert!(!options.safe_mode);
     }
 
     #[test]

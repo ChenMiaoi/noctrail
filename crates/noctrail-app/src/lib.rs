@@ -84,6 +84,31 @@ impl CommandBlock {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentContextBlock {
+    pub command: Option<String>,
+    pub output: String,
+    pub exit_code: Option<i32>,
+}
+
+impl From<&CommandBlock> for AgentContextBlock {
+    fn from(block: &CommandBlock) -> Self {
+        Self {
+            command: block.command.clone(),
+            output: block.output.clone(),
+            exit_code: block.exit_code,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AgentContextPreview {
+    pub current_block: Option<AgentContextBlock>,
+    pub selection: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub explicit_files: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StructuredOutputKind {
     Json,
@@ -459,6 +484,12 @@ impl TerminalPane {
         self.block_observer.current()
     }
 
+    fn context_command_block(&self) -> Option<&CommandBlock> {
+        self.selected_command_block()
+            .or_else(|| self.current_command_block())
+            .or_else(|| self.command_blocks().last())
+    }
+
     pub fn command_blocks(&self) -> &[CommandBlock] {
         self.block_observer.completed()
     }
@@ -513,6 +544,21 @@ impl TerminalPane {
 
     pub fn paste_bytes(&self, text: &str) -> Vec<u8> {
         input::paste_bytes(text, self.bracketed_paste_enabled())
+    }
+
+    pub fn agent_context_preview(&self, explicit_files: &[PathBuf]) -> AgentContextPreview {
+        let current_block = self.context_command_block().map(AgentContextBlock::from);
+        let cwd = self.status_line.cwd.clone().or_else(|| {
+            self.context_command_block()
+                .and_then(|block| block.cwd.clone())
+        });
+
+        AgentContextPreview {
+            current_block,
+            selection: self.copy_selection_text(),
+            cwd,
+            explicit_files: explicit_files.to_vec(),
+        }
     }
 
     pub fn advance_output(&mut self, bytes: &[u8]) {
@@ -741,6 +787,7 @@ pub struct DesktopApp {
     workspaces: WorkspaceSet,
     scratch_pane_id: Option<PaneId>,
     scratch_visible: bool,
+    explicit_agent_files: Vec<PathBuf>,
     panes: HashMap<PaneId, TerminalPane>,
     next_pane_id: u64,
 }
@@ -992,6 +1039,19 @@ impl DesktopApp {
         self.active_pane_ref().copy_selection_text()
     }
 
+    pub fn agent_context_preview(&self) -> AgentContextPreview {
+        self.active_pane_ref()
+            .agent_context_preview(&self.explicit_agent_files)
+    }
+
+    pub fn set_agent_explicit_files(&mut self, files: Vec<PathBuf>) {
+        self.explicit_agent_files = files;
+    }
+
+    pub fn agent_explicit_files(&self) -> &[PathBuf] {
+        &self.explicit_agent_files
+    }
+
     pub fn mouse_tracking_mode(&self) -> MouseTrackingMode {
         self.active_pane_ref().mouse_tracking_mode()
     }
@@ -1196,6 +1256,7 @@ impl DesktopApp {
             workspaces: WorkspaceSet::new(ROOT_PANE_ID),
             scratch_pane_id: None,
             scratch_visible: false,
+            explicit_agent_files: Vec::new(),
             panes,
             next_pane_id: ROOT_PANE_ID.0 + 1,
         }
@@ -2285,6 +2346,57 @@ mod tests {
         assert!(
             app.copy_selected_command_block_structured_output()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn agent_context_preview_only_contains_block_selection_cwd_and_explicit_files() {
+        let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(20, 4));
+        app.set_block_observer_enabled(true);
+        app.advance_output(&shell_integration_probe_bytes(
+            "cargo test -p noctrail-app",
+            "/tmp/noctrail-agent",
+            0,
+            7,
+            b"alpha beta\r\ngamma delta\r\n",
+        ));
+        let _ = app.select_newest_command_block();
+        app.select_viewport_range(
+            Position { row: 0, col: 0 },
+            Position { row: 0, col: 4 },
+            SelectionMode::Normal,
+        );
+        app.set_agent_explicit_files(vec![
+            PathBuf::from("/tmp/noctrail/Cargo.toml"),
+            PathBuf::from("/tmp/noctrail/crates/noctrail-app/src/lib.rs"),
+        ]);
+
+        let preview = app.agent_context_preview();
+        assert_eq!(
+            preview
+                .current_block
+                .as_ref()
+                .and_then(|block| block.command.as_deref()),
+            Some("cargo test -p noctrail-app")
+        );
+        assert_eq!(
+            preview
+                .current_block
+                .as_ref()
+                .map(|block| block.output.as_str()),
+            Some("alpha beta\ngamma delta\n")
+        );
+        assert_eq!(preview.selection.as_deref(), Some("alpha"));
+        assert_eq!(
+            preview.cwd.as_deref(),
+            Some(Path::new("/tmp/noctrail-agent"))
+        );
+        assert_eq!(
+            preview.explicit_files,
+            vec![
+                PathBuf::from("/tmp/noctrail/Cargo.toml"),
+                PathBuf::from("/tmp/noctrail/crates/noctrail-app/src/lib.rs"),
+            ]
         );
     }
 

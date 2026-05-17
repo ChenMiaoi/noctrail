@@ -433,6 +433,9 @@ impl CommandPalette {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct BlockBrowser;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct AgentContextBrowser;
+
 struct GuiApp {
     app: DesktopApp,
     launch_options: GuiLaunchOptions,
@@ -445,6 +448,7 @@ struct GuiApp {
     font: FontConfig,
     font_preferences: FontPreferences,
     ime_preedit: Option<String>,
+    agent_context_browser: Option<AgentContextBrowser>,
     block_browser: Option<BlockBrowser>,
     command_palette: Option<CommandPalette>,
     mouse_position: Option<PhysicalPosition<f64>>,
@@ -484,6 +488,7 @@ impl GuiApp {
             font: font.clone(),
             font_preferences: font_preferences_from_config(&font),
             ime_preedit: None,
+            agent_context_browser: None,
             block_browser: None,
             command_palette: None,
             mouse_position: None,
@@ -873,6 +878,34 @@ impl GuiApp {
                 }
             }
         }
+        if self.agent_context_browser.is_some() {
+            let preview = self.app.agent_context_preview();
+            title.push_str(" | agent-context");
+            if let Some(block) = preview.current_block.as_ref() {
+                if let Some(command) = block.command.as_deref() {
+                    title.push_str(" | block ");
+                    title.push_str(&preview_text(command, 32));
+                }
+                if !block.output.is_empty() {
+                    title.push_str(" | output ");
+                    title.push_str(&preview_text(&block.output, 32));
+                }
+            }
+            if let Some(selection) = preview.selection.as_deref() {
+                title.push_str(" | selection ");
+                title.push_str(&preview_text(selection, 32));
+            }
+            if let Some(cwd) = preview.cwd.as_deref() {
+                title.push_str(" | cwd ");
+                title.push_str(&display_status_path(cwd));
+            }
+            if !preview.explicit_files.is_empty() {
+                title.push_str(" | files ");
+                title.push_str(&preview.explicit_files.len().to_string());
+                title.push(' ');
+                title.push_str(&preview_paths(&preview.explicit_files, 48));
+            }
+        }
         if let Some(palette) = self.command_palette.as_ref() {
             title.push_str(" | palette ");
             if palette.query.is_empty() {
@@ -1238,6 +1271,17 @@ impl GuiApp {
         self.request_redraw();
     }
 
+    fn toggle_agent_context_preview(&mut self) {
+        if self.agent_context_browser.is_some() {
+            self.agent_context_browser = None;
+        } else {
+            self.agent_context_browser = Some(AgentContextBrowser);
+        }
+        self.touch_cursor_blink();
+        self.update_title();
+        self.request_redraw();
+    }
+
     fn toggle_block_browser(&mut self) {
         if self.block_browser.is_some() {
             self.block_browser = None;
@@ -1420,6 +1464,15 @@ fn preview_text(text: &str, max_chars: usize) -> String {
     preview
 }
 
+fn preview_paths(paths: &[PathBuf], max_chars: usize) -> String {
+    let joined = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    preview_text(&joined, max_chars)
+}
+
 fn pane_chrome_from_theme(theme: &ThemeConfig) -> PaneChromeConfig {
     PaneChromeConfig {
         border: PaneBorderStyle {
@@ -1558,6 +1611,13 @@ impl ApplicationHandler for GuiApp {
                 }
                 if matches!(
                     input::shortcut_action(&event.logical_key, self.modifiers),
+                    Some(input::ShortcutAction::ToggleAgentContextPreview)
+                ) {
+                    self.toggle_agent_context_preview();
+                    return;
+                }
+                if matches!(
+                    input::shortcut_action(&event.logical_key, self.modifiers),
                     Some(input::ShortcutAction::ToggleBlockBrowser)
                 ) {
                     self.toggle_block_browser();
@@ -1588,6 +1648,7 @@ impl ApplicationHandler for GuiApp {
                 }
                 if let Some(action) = input::shortcut_action(&event.logical_key, self.modifiers) {
                     match action {
+                        input::ShortcutAction::ToggleAgentContextPreview => unreachable!(),
                         input::ShortcutAction::ToggleBlockBrowser => unreachable!(),
                         input::ShortcutAction::ToggleCommandPalette => unreachable!(),
                         input::ShortcutAction::Copy => {
@@ -2043,6 +2104,46 @@ mod tests {
                 .and_then(|block| block.command.as_deref()),
             Some("echo second")
         );
+    }
+
+    #[test]
+    fn agent_context_preview_title_shows_block_selection_cwd_and_files() {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
+        gui.app.set_block_observer_enabled(true);
+        gui.app.advance_output(&block_probe_bytes(
+            "cargo test -p noctrail-app",
+            "/tmp/noctrail-agent",
+            0,
+            17,
+            "alpha beta\r\ngamma delta\r\n",
+        ));
+        let _ = gui.app.select_newest_command_block();
+        gui.app.select_viewport_range(
+            Position { row: 0, col: 0 },
+            Position { row: 0, col: 4 },
+            SelectionMode::Normal,
+        );
+        gui.app.set_agent_explicit_files(vec![
+            PathBuf::from("/tmp/noctrail/Cargo.toml"),
+            PathBuf::from("/tmp/noctrail/crates/noctrail-app/src/lib.rs"),
+        ]);
+
+        gui.toggle_agent_context_preview();
+
+        let title = gui.title_text();
+        assert!(gui.agent_context_browser.is_some());
+        assert!(title.contains("agent-context"));
+        assert!(title.contains("block cargo test -p noctrail-app"));
+        assert!(title.contains("output alpha beta gamma delta"));
+        assert!(
+            gui.app.agent_context_preview().selection.is_some(),
+            "agent context preview should expose a selection"
+        );
+        assert!(title.contains(" | selection "), "{title}");
+        assert!(title.contains("cwd /tmp/noctrail-agent"));
+        assert!(title.contains("files 2"));
+        assert!(title.contains("/tmp/noctrail/Cargo.toml"));
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub enum ShortcutAction {
     Copy,
     Paste,
     Focus(FocusDirection),
+    ToggleAgentContextPreview,
     ToggleBlockBrowser,
     ToggleCommandPalette,
 }
@@ -55,6 +56,7 @@ pub fn shortcut_action(logical_key: &Key, modifiers: ModifiersState) -> Option<S
     match logical_key.as_ref() {
         Key::Character(text) if modifiers.control_key() && modifiers.shift_key() => {
             match text.to_ascii_lowercase().as_str() {
+                "a" => Some(ShortcutAction::ToggleAgentContextPreview),
                 "b" => Some(ShortcutAction::ToggleBlockBrowser),
                 "c" => Some(ShortcutAction::Copy),
                 "p" => Some(ShortcutAction::ToggleCommandPalette),
@@ -405,6 +407,16 @@ mod tests {
                 ModifiersState::CONTROL | ModifiersState::SHIFT,
             ),
             Some(ShortcutAction::ToggleCommandPalette)
+        );
+    }
+
+    #[test]
+    fn shortcut_actions_cover_agent_context_preview() {
+        let modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+
+        assert_eq!(
+            shortcut_action(&Key::Character("a".into()), modifiers),
+            Some(ShortcutAction::ToggleAgentContextPreview)
         );
     }
 
