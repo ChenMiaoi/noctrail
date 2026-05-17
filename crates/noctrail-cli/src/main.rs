@@ -1792,11 +1792,12 @@ fn select_prompt_targets<'a>(
     Ok(selected)
 }
 
+#[cfg(not(windows))]
 fn prompt_target_specs() -> Vec<PromptTargetSpec> {
     vec![
         PromptTargetSpec {
             name: "starship",
-            build_probe: prompt_probe_builder(starship_prompt_probe),
+            build_probe: Some(starship_prompt_probe),
             required: &[
                 PromptCapability::Layout,
                 PromptCapability::Escape,
@@ -1806,7 +1807,7 @@ fn prompt_target_specs() -> Vec<PromptTargetSpec> {
         },
         PromptTargetSpec {
             name: "oh-my-zsh",
-            build_probe: prompt_probe_builder(oh_my_zsh_prompt_probe),
+            build_probe: Some(oh_my_zsh_prompt_probe),
             required: &[
                 PromptCapability::Layout,
                 PromptCapability::Escape,
@@ -1816,7 +1817,7 @@ fn prompt_target_specs() -> Vec<PromptTargetSpec> {
         },
         PromptTargetSpec {
             name: "powerlevel10k",
-            build_probe: prompt_probe_builder(powerlevel10k_prompt_probe),
+            build_probe: Some(powerlevel10k_prompt_probe),
             required: &[
                 PromptCapability::Layout,
                 PromptCapability::Escape,
@@ -1827,14 +1828,9 @@ fn prompt_target_specs() -> Vec<PromptTargetSpec> {
     ]
 }
 
-#[cfg(not(windows))]
-fn prompt_probe_builder(builder: PromptProbeBuilder) -> Option<PromptProbeBuilder> {
-    Some(builder)
-}
-
 #[cfg(windows)]
-fn prompt_probe_builder(_builder: PromptProbeBuilder) -> Option<PromptProbeBuilder> {
-    None
+fn prompt_target_specs() -> Vec<PromptTargetSpec> {
+    Vec::new()
 }
 
 #[cfg(not(windows))]
@@ -4062,6 +4058,7 @@ fn collect_runtime_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(windows))]
     use std::sync::{Mutex, OnceLock};
 
     #[test]
@@ -4248,6 +4245,7 @@ mod tests {
         run_unicode_matrix(&[]).expect("builtin unicode probes should pass");
     }
 
+    #[cfg(not(windows))]
     fn env_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
