@@ -13,7 +13,7 @@ use noctrail_render::GpuRenderer;
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalSize},
-    event::WindowEvent,
+    event::{Ime, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::ModifiersState,
     window::{Window, WindowId},
@@ -92,6 +92,7 @@ struct GuiApp {
     window: Option<Arc<Window>>,
     renderer: Option<GpuRenderer>,
     gpu_fallback_error: Option<String>,
+    ime_preedit: Option<String>,
     output_rx: Option<Receiver<OutputPumpEvent>>,
     output_thread: Option<JoinHandle<()>>,
     next_frame_at: Instant,
@@ -109,6 +110,7 @@ impl GuiApp {
             window: None,
             renderer: None,
             gpu_fallback_error: None,
+            ime_preedit: None,
             output_rx: None,
             output_thread: None,
             next_frame_at: now,
@@ -183,6 +185,12 @@ impl GuiApp {
                 title.push_str(" | gpu-fallback ");
                 title.push_str(error);
             }
+            if let Some(preedit) = self.ime_preedit.as_deref()
+                && !preedit.is_empty()
+            {
+                title.push_str(" | ime ");
+                title.push_str(preedit);
+            }
             window.set_title(&title);
         }
     }
@@ -237,6 +245,27 @@ impl GuiApp {
         }
 
         received_output
+    }
+
+    fn handle_ime_event(&mut self, ime: Ime) -> Result<(), Box<dyn Error>> {
+        match ime {
+            Ime::Enabled | Ime::Disabled => Ok(()),
+            Ime::Preedit(text, _cursor) => {
+                self.ime_preedit = if text.is_empty() { None } else { Some(text) };
+                self.update_title();
+                self.request_redraw();
+                Ok(())
+            }
+            Ime::Commit(text) => {
+                self.ime_preedit = None;
+                if !text.is_empty() {
+                    self.app.write_input(text.as_bytes())?;
+                    self.request_redraw();
+                }
+                self.update_title();
+                Ok(())
+            }
+        }
     }
 }
 
@@ -302,6 +331,11 @@ impl ApplicationHandler for GuiApp {
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
+            }
+            WindowEvent::Ime(ime) => {
+                if self.handle_ime_event(ime).is_err() {
+                    event_loop.exit();
+                }
             }
             WindowEvent::KeyboardInput {
                 event,
@@ -454,6 +488,19 @@ mod tests {
     }
 
     #[test]
+    fn ime_preedit_updates_gui_state() -> Result<(), Box<dyn Error>> {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
+        let mut gui = GuiApp::new(app);
+
+        gui.handle_ime_event(Ime::Preedit("zhong".to_string(), None))?;
+        assert_eq!(gui.ime_preedit.as_deref(), Some("zhong"));
+
+        gui.handle_ime_event(Ime::Preedit(String::new(), None))?;
+        assert!(gui.ime_preedit.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn output_pump_feeds_shell_output_into_render_plan() -> Result<(), Box<dyn Error>> {
         let app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24))?;
         let mut gui = GuiApp::new(app);
@@ -498,6 +545,51 @@ mod tests {
             observed,
             "output pump did not feed shell output into render plan"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn ime_commit_writes_text_to_shell() -> Result<(), Box<dyn Error>> {
+        let app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24))?;
+        let mut gui = GuiApp::new(app);
+        gui.attach_output_pump()?;
+
+        gui.handle_ime_event(Ime::Commit("NOCTRAIL_IME".to_string()))?;
+        gui.app.write_input(b"\r")?;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut observed = false;
+        while Instant::now() < deadline {
+            if gui.drain_output_events() {
+                let frame = gui.app.frame();
+                let text = frame
+                    .render_plan
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        row.glyphs
+                            .iter()
+                            .map(|glyph| glyph.text.as_str())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if text.contains("NOCTRAIL_IME") {
+                    observed = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        gui.app.write_input(shell_exit_bytes().as_slice())?;
+        let _ = gui.app.close_runtime()?;
+        gui.output_rx.take();
+        if let Some(handle) = gui.output_thread.take() {
+            let _ = handle.join();
+        }
+
+        assert!(observed, "ime commit did not reach the shell");
         Ok(())
     }
 
