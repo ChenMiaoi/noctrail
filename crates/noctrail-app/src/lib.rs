@@ -63,6 +63,8 @@ pub struct CommandBlock {
     pub cwd: Option<PathBuf>,
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u64>,
+    pub output: String,
+    pub folded: bool,
 }
 
 impl CommandBlock {
@@ -71,6 +73,7 @@ impl CommandBlock {
             && self.cwd.is_none()
             && self.exit_code.is_none()
             && self.duration_ms.is_none()
+            && self.output.is_empty()
     }
 }
 
@@ -79,6 +82,13 @@ struct CommandBlockObserver {
     enabled: bool,
     current: Option<CommandBlock>,
     completed: Vec<CommandBlock>,
+    selected: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlockChunkPart {
+    Output(String),
+    Event(ShellIntegrationEvent),
 }
 
 impl CommandBlockObserver {
@@ -89,39 +99,19 @@ impl CommandBlockObserver {
         }
     }
 
-    fn observe(&mut self, events: Vec<ShellIntegrationEvent>) {
+    fn observe_chunk(&mut self, bytes: &[u8]) {
         if !self.enabled {
             return;
         }
 
-        for event in events {
-            match event {
-                ShellIntegrationEvent::Prompt => {}
-                ShellIntegrationEvent::CommandStart => {
-                    self.finish_current();
-                    self.current = Some(CommandBlock::default());
-                }
-                ShellIntegrationEvent::CommandText(command) => {
+        for part in parse_block_chunk(bytes) {
+            match part {
+                BlockChunkPart::Output(output) => {
                     if let Some(current) = self.current.as_mut() {
-                        current.command = Some(command);
+                        current.output.push_str(&output);
                     }
                 }
-                ShellIntegrationEvent::CommandEnd => self.finish_current(),
-                ShellIntegrationEvent::Cwd(cwd) => {
-                    if let Some(current) = self.current.as_mut() {
-                        current.cwd = Some(PathBuf::from(cwd));
-                    }
-                }
-                ShellIntegrationEvent::ExitCode(exit_code) => {
-                    if let Some(current) = self.current.as_mut() {
-                        current.exit_code = Some(exit_code);
-                    }
-                }
-                ShellIntegrationEvent::DurationMs(duration_ms) => {
-                    if let Some(current) = self.current.as_mut() {
-                        current.duration_ms = Some(duration_ms);
-                    }
-                }
+                BlockChunkPart::Event(event) => self.observe_event(event),
             }
         }
     }
@@ -132,6 +122,113 @@ impl CommandBlockObserver {
 
     fn completed(&self) -> &[CommandBlock] {
         &self.completed
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        self.selected
+    }
+
+    fn selected(&self) -> Option<&CommandBlock> {
+        self.selected.and_then(|index| self.completed.get(index))
+    }
+
+    fn select_oldest(&mut self) -> Option<usize> {
+        if self.completed.is_empty() {
+            self.selected = None;
+        } else {
+            self.selected = Some(0);
+        }
+        self.selected
+    }
+
+    fn select_newest(&mut self) -> Option<usize> {
+        if self.completed.is_empty() {
+            self.selected = None;
+        } else {
+            self.selected = Some(self.completed.len() - 1);
+        }
+        self.selected
+    }
+
+    fn select_previous(&mut self) -> Option<usize> {
+        let len = self.completed.len();
+        if len == 0 {
+            self.selected = None;
+            return None;
+        }
+
+        let next = match self.selected {
+            Some(0) | None => len - 1,
+            Some(index) => index - 1,
+        };
+        self.selected = Some(next);
+        self.selected
+    }
+
+    fn select_next(&mut self) -> Option<usize> {
+        let len = self.completed.len();
+        if len == 0 {
+            self.selected = None;
+            return None;
+        }
+
+        let next = match self.selected {
+            Some(index) => (index + 1) % len,
+            None => 0,
+        };
+        self.selected = Some(next);
+        self.selected
+    }
+
+    fn toggle_selected_fold(&mut self) -> Option<bool> {
+        let index = self.selected?;
+        let block = self.completed.get_mut(index)?;
+        block.folded = !block.folded;
+        Some(block.folded)
+    }
+
+    fn copy_selected_command(&self) -> Option<String> {
+        self.selected()?.command.clone()
+    }
+
+    fn copy_selected_output(&self) -> Option<String> {
+        let output = self.selected()?.output.clone();
+        if output.is_empty() {
+            None
+        } else {
+            Some(output)
+        }
+    }
+
+    fn observe_event(&mut self, event: ShellIntegrationEvent) {
+        match event {
+            ShellIntegrationEvent::Prompt => {}
+            ShellIntegrationEvent::CommandStart => {
+                self.finish_current();
+                self.current = Some(CommandBlock::default());
+            }
+            ShellIntegrationEvent::CommandText(command) => {
+                if let Some(current) = self.current.as_mut() {
+                    current.command = Some(command);
+                }
+            }
+            ShellIntegrationEvent::CommandEnd => self.finish_current(),
+            ShellIntegrationEvent::Cwd(cwd) => {
+                if let Some(current) = self.current.as_mut() {
+                    current.cwd = Some(PathBuf::from(cwd));
+                }
+            }
+            ShellIntegrationEvent::ExitCode(exit_code) => {
+                if let Some(current) = self.current.as_mut() {
+                    current.exit_code = Some(exit_code);
+                }
+            }
+            ShellIntegrationEvent::DurationMs(duration_ms) => {
+                if let Some(current) = self.current.as_mut() {
+                    current.duration_ms = Some(duration_ms);
+                }
+            }
+        }
     }
 
     fn finish_current(&mut self) {
@@ -146,7 +243,11 @@ impl CommandBlockObserver {
         if self.completed.len() > MAX_COMMAND_BLOCKS {
             let overflow = self.completed.len() - MAX_COMMAND_BLOCKS;
             self.completed.drain(0..overflow);
+            self.selected = self
+                .selected
+                .map(|selected| selected.saturating_sub(overflow));
         }
+        self.selected = Some(self.completed.len() - 1);
     }
 }
 
@@ -311,14 +412,53 @@ impl TerminalPane {
         self.block_observer.completed()
     }
 
+    pub fn selected_command_block_index(&self) -> Option<usize> {
+        self.block_observer.selected_index()
+    }
+
+    pub fn selected_command_block(&self) -> Option<&CommandBlock> {
+        self.block_observer.selected()
+    }
+
+    pub fn select_oldest_command_block(&mut self) -> Option<usize> {
+        self.block_observer.select_oldest()
+    }
+
+    pub fn select_newest_command_block(&mut self) -> Option<usize> {
+        self.block_observer.select_newest()
+    }
+
+    pub fn select_previous_command_block(&mut self) -> Option<usize> {
+        self.block_observer.select_previous()
+    }
+
+    pub fn select_next_command_block(&mut self) -> Option<usize> {
+        self.block_observer.select_next()
+    }
+
+    pub fn toggle_selected_command_block_fold(&mut self) -> Option<bool> {
+        self.block_observer.toggle_selected_fold()
+    }
+
+    pub fn copy_selected_command_block_command(&self) -> Option<String> {
+        self.block_observer.copy_selected_command()
+    }
+
+    pub fn copy_selected_command_block_output(&self) -> Option<String> {
+        self.block_observer.copy_selected_output()
+    }
+
     pub fn paste_bytes(&self, text: &str) -> Vec<u8> {
         input::paste_bytes(text, self.bracketed_paste_enabled())
     }
 
     pub fn advance_output(&mut self, bytes: &[u8]) {
         self.last_damage = self.terminal.advance_bytes(bytes).damage;
-        let shell_events = self.terminal.drain_shell_integration_events();
-        self.block_observer.observe(shell_events);
+        // Keep the terminal core authoritative for rendering while the block
+        // observer reparses the shell-integration chunk to preserve output and
+        // marker ordering for command block history.
+        let _ = self.terminal.drain_shell_integration_events();
+        self.block_observer.observe_chunk(bytes);
         self.clamp_scrollback_offset();
     }
 
@@ -640,6 +780,50 @@ impl DesktopApp {
 
     pub fn set_block_observer_enabled(&mut self, enabled: bool) {
         self.active_pane_mut().set_block_observer_enabled(enabled);
+    }
+
+    pub fn block_observer_enabled(&self) -> bool {
+        self.active_pane_ref().block_observer_enabled()
+    }
+
+    pub fn command_blocks(&self) -> &[CommandBlock] {
+        self.active_pane_ref().command_blocks()
+    }
+
+    pub fn selected_command_block_index(&self) -> Option<usize> {
+        self.active_pane_ref().selected_command_block_index()
+    }
+
+    pub fn selected_command_block(&self) -> Option<&CommandBlock> {
+        self.active_pane_ref().selected_command_block()
+    }
+
+    pub fn select_oldest_command_block(&mut self) -> Option<usize> {
+        self.active_pane_mut().select_oldest_command_block()
+    }
+
+    pub fn select_newest_command_block(&mut self) -> Option<usize> {
+        self.active_pane_mut().select_newest_command_block()
+    }
+
+    pub fn select_previous_command_block(&mut self) -> Option<usize> {
+        self.active_pane_mut().select_previous_command_block()
+    }
+
+    pub fn select_next_command_block(&mut self) -> Option<usize> {
+        self.active_pane_mut().select_next_command_block()
+    }
+
+    pub fn toggle_selected_command_block_fold(&mut self) -> Option<bool> {
+        self.active_pane_mut().toggle_selected_command_block_fold()
+    }
+
+    pub fn copy_selected_command_block_command(&self) -> Option<String> {
+        self.active_pane_ref().copy_selected_command_block_command()
+    }
+
+    pub fn copy_selected_command_block_output(&self) -> Option<String> {
+        self.active_pane_ref().copy_selected_command_block_output()
     }
 
     pub fn pane_by_id(&self, pane_id: PaneId) -> Option<&TerminalPane> {
@@ -1000,6 +1184,143 @@ impl DesktopApp {
             .active_layout()
             .active_pane()
             .ok_or(AppError::MissingActivePane)
+    }
+}
+
+fn parse_block_chunk(bytes: &[u8]) -> Vec<BlockChunkPart> {
+    let mut parts = Vec::new();
+    let mut text = Vec::new();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == 0x1b {
+            if let Some((event, consumed)) = parse_noctrail_osc(&bytes[index..]) {
+                flush_block_output(&mut text, &mut parts);
+                parts.push(BlockChunkPart::Event(event));
+                index += consumed;
+                continue;
+            }
+
+            if let Some(consumed) = skip_escape_sequence(&bytes[index..]) {
+                flush_block_output(&mut text, &mut parts);
+                index += consumed;
+                continue;
+            }
+        }
+
+        match bytes[index] {
+            b'\r' => {
+                if bytes.get(index + 1) == Some(&b'\n') {
+                    index += 1;
+                }
+                text.push(b'\n');
+            }
+            b'\n' | b'\t' => text.push(bytes[index]),
+            0x20..=0x7e => text.push(bytes[index]),
+            byte if byte >= 0x80 => text.push(byte),
+            _ => {}
+        }
+        index += 1;
+    }
+
+    flush_block_output(&mut text, &mut parts);
+    parts
+}
+
+fn flush_block_output(text: &mut Vec<u8>, parts: &mut Vec<BlockChunkPart>) {
+    if text.is_empty() {
+        return;
+    }
+
+    let output = String::from_utf8_lossy(text).into_owned();
+    if !output.is_empty() {
+        parts.push(BlockChunkPart::Output(output));
+    }
+    text.clear();
+}
+
+fn parse_noctrail_osc(bytes: &[u8]) -> Option<(ShellIntegrationEvent, usize)> {
+    if bytes.len() < 2 || bytes[0] != 0x1b || bytes[1] != b']' {
+        return None;
+    }
+
+    let mut index = 2;
+    let mut payload_end = None;
+    let mut consumed = None;
+    while index < bytes.len() {
+        match bytes[index] {
+            0x07 => {
+                payload_end = Some(index);
+                consumed = Some(index + 1);
+                break;
+            }
+            0x1b if bytes.get(index + 1) == Some(&b'\\') => {
+                payload_end = Some(index);
+                consumed = Some(index + 2);
+                break;
+            }
+            _ => index += 1,
+        }
+    }
+
+    let consumed = consumed?;
+    let payload_end = payload_end?;
+    let payload = String::from_utf8_lossy(&bytes[2..payload_end]).into_owned();
+    let event = parse_noctrail_osc_payload(payload)?;
+    Some((event, consumed))
+}
+
+fn parse_noctrail_osc_payload(payload: impl AsRef<str>) -> Option<ShellIntegrationEvent> {
+    let prefix = "1337;Noctrail;";
+    let rest = payload.as_ref().strip_prefix(prefix)?;
+    match rest {
+        "Prompt" => Some(ShellIntegrationEvent::Prompt),
+        "CommandStart" => Some(ShellIntegrationEvent::CommandStart),
+        "CommandEnd" => Some(ShellIntegrationEvent::CommandEnd),
+        _ => {
+            if let Some(value) = rest.strip_prefix("CommandText;") {
+                return Some(ShellIntegrationEvent::CommandText(value.to_string()));
+            }
+            if let Some(value) = rest.strip_prefix("Cwd;") {
+                return Some(ShellIntegrationEvent::Cwd(value.to_string()));
+            }
+            if let Some(value) = rest.strip_prefix("ExitCode;") {
+                return value
+                    .trim()
+                    .parse::<i32>()
+                    .ok()
+                    .map(ShellIntegrationEvent::ExitCode);
+            }
+            if let Some(value) = rest.strip_prefix("DurationMs;") {
+                return value
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .map(ShellIntegrationEvent::DurationMs);
+            }
+            None
+        }
+    }
+}
+
+fn skip_escape_sequence(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < 2 || bytes[0] != 0x1b {
+        return None;
+    }
+
+    match bytes[1] {
+        b'[' => {
+            let mut index = 2;
+            while index < bytes.len() {
+                if (0x40..=0x7e).contains(&bytes[index]) {
+                    return Some(index + 1);
+                }
+                index += 1;
+            }
+            Some(bytes.len())
+        }
+        b']' => None,
+        _ => Some(bytes.len().min(2)),
     }
 }
 
@@ -1491,6 +1812,8 @@ mod tests {
                 cwd: Some(PathBuf::from("/tmp/noctrail-enabled")),
                 exit_code: Some(0),
                 duration_ms: Some(33),
+                output: "visible enabled".to_string(),
+                folded: false,
             }
         );
     }
@@ -1513,6 +1836,8 @@ mod tests {
                 cwd: Some(PathBuf::from("/tmp/noctrail-running")),
                 exit_code: None,
                 duration_ms: None,
+                output: "running output".to_string(),
+                folded: false,
             })
         );
         assert!(app.pane().command_blocks().is_empty());
@@ -1531,6 +1856,8 @@ mod tests {
                 cwd: Some(PathBuf::from("/tmp/noctrail-running")),
                 exit_code: Some(0),
                 duration_ms: Some(58),
+                output: "running output".to_string(),
+                folded: false,
             }]
         );
     }
@@ -1554,6 +1881,56 @@ mod tests {
         assert_eq!(
             render_row_text(&app.frame().render_plan.rows[0]),
             "plain text"
+        );
+    }
+
+    #[test]
+    fn block_observer_keeps_recent_hundred_and_supports_copy_jump_fold() {
+        let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(20, 4));
+        app.set_block_observer_enabled(true);
+
+        for index in 0..=100 {
+            let command = format!("cmd-{index:03}");
+            let cwd = format!("/tmp/block-{index:03}");
+            let output = format!("output-{index:03}");
+            app.advance_output(&shell_integration_probe_bytes(
+                command.as_str(),
+                cwd.as_str(),
+                index,
+                index as u64,
+                output.as_bytes(),
+            ));
+        }
+
+        assert_eq!(app.command_blocks().len(), 100);
+        assert_eq!(app.command_blocks()[0].command.as_deref(), Some("cmd-001"));
+        assert_eq!(app.command_blocks()[99].command.as_deref(), Some("cmd-100"));
+        assert_eq!(app.selected_command_block_index(), Some(99));
+        assert_eq!(
+            app.copy_selected_command_block_output().as_deref(),
+            Some("output-100")
+        );
+
+        assert_eq!(app.select_oldest_command_block(), Some(0));
+        assert_eq!(
+            app.copy_selected_command_block_command().as_deref(),
+            Some("cmd-001")
+        );
+        assert_eq!(app.select_previous_command_block(), Some(99));
+        assert_eq!(
+            app.copy_selected_command_block_command().as_deref(),
+            Some("cmd-100")
+        );
+        assert_eq!(app.select_next_command_block(), Some(0));
+        assert_eq!(app.toggle_selected_command_block_fold(), Some(true));
+        assert!(
+            app.selected_command_block()
+                .expect("selected block should exist")
+                .folded
+        );
+        assert_eq!(
+            app.copy_selected_command_block_output().as_deref(),
+            Some("output-001")
         );
     }
 

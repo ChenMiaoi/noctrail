@@ -24,6 +24,7 @@ Usage:
   noctrail-app [command] [options]
 
 Commands:
+  block-smoke Run the block browser/history probe
   crash-smoke Run the panic-hook recovery probe
   gui       Open the GUI shell window (default)
   perf-smoke Run the performance smoke probe
@@ -46,6 +47,7 @@ struct StartupOptions {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartupCommand {
+    BlockSmoke,
     CrashSmoke,
     Gui,
     PerfSmoke,
@@ -95,6 +97,12 @@ fn main() {
 
     match options.command {
         StartupCommand::Help => print!("{HELP}"),
+        StartupCommand::BlockSmoke => {
+            if let Err(error) = run_block_smoke() {
+                eprintln!("{error}");
+                process::exit(1);
+            }
+        }
         StartupCommand::CrashSmoke => {
             if let Err(error) = run_crash_smoke() {
                 eprintln!("{error}");
@@ -137,6 +145,10 @@ fn parse_startup_options(args: &[String]) -> Result<StartupOptions, StartupError
 
     while index < args.len() {
         match args[index].as_str() {
+            "block-smoke" if !command_set => {
+                command = StartupCommand::BlockSmoke;
+                command_set = true;
+            }
             "crash-smoke" if !command_set => {
                 command = StartupCommand::CrashSmoke;
                 command_set = true;
@@ -251,6 +263,86 @@ fn run_crash_smoke() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("crash_diagnostic={}", diagnostic_path.display());
     println!("crash smoke ok");
+    Ok(())
+}
+
+fn run_block_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24));
+    app.set_block_observer_enabled(true);
+
+    for index in 0..=100 {
+        let command = format!("cmd-{index:03}");
+        let cwd = format!("/tmp/noctrail-block-{index:03}");
+        let output = format!("output-{index:03}");
+        app.advance_output(&block_probe_bytes(
+            command.as_str(),
+            cwd.as_str(),
+            index,
+            index as u64,
+            output.as_str(),
+        ));
+    }
+
+    if app.command_blocks().len() != 100 {
+        return Err(format!(
+            "block history should retain 100 entries, got {}",
+            app.command_blocks().len()
+        )
+        .into());
+    }
+    if app.command_blocks()[0].command.as_deref() != Some("cmd-001") {
+        return Err("oldest retained block did not roll forward to cmd-001".into());
+    }
+    if app.command_blocks()[99].command.as_deref() != Some("cmd-100") {
+        return Err("newest retained block is not cmd-100".into());
+    }
+
+    if app.select_oldest_command_block() != Some(0) {
+        return Err("failed to jump to the oldest block".into());
+    }
+    if app.copy_selected_command_block_command().as_deref() != Some("cmd-001") {
+        return Err("copy command did not return the oldest selected block".into());
+    }
+    if app.select_previous_command_block() != Some(99) {
+        return Err("previous block jump did not wrap to the newest block".into());
+    }
+    if app.copy_selected_command_block_output().as_deref() != Some("output-100") {
+        return Err("copy output did not return the newest selected block".into());
+    }
+    if app.toggle_selected_command_block_fold() != Some(true) {
+        return Err("failed to fold the selected block".into());
+    }
+    if !app
+        .selected_command_block()
+        .ok_or("selected block is missing after fold")?
+        .folded
+    {
+        return Err("selected block was not marked folded".into());
+    }
+    if app.select_next_command_block() != Some(0) {
+        return Err("next block jump did not wrap back to the oldest block".into());
+    }
+
+    println!(
+        "blocks={} selected={} oldest={} newest={} copied_command={} copied_output={} folded_newest={}",
+        app.command_blocks().len(),
+        app.selected_command_block_index()
+            .map(|index| index + 1)
+            .unwrap_or(0),
+        app.command_blocks()[0].command.as_deref().unwrap_or("none"),
+        app.command_blocks()[99]
+            .command
+            .as_deref()
+            .unwrap_or("none"),
+        app.copy_selected_command_block_command()
+            .as_deref()
+            .unwrap_or("none"),
+        app.copy_selected_command_block_output()
+            .as_deref()
+            .unwrap_or("none"),
+        app.command_blocks()[99].folded,
+    );
+    println!("block smoke ok");
     Ok(())
 }
 
@@ -726,6 +818,34 @@ fn shell_exit_command() -> &'static str {
     "exit\r\n"
 }
 
+fn block_probe_bytes(
+    command: &str,
+    cwd: &str,
+    exit_code: i32,
+    duration_ms: u64,
+    output: &str,
+) -> Vec<u8> {
+    [
+        osc_marker_bytes("Prompt").as_slice(),
+        osc_marker_bytes("CommandStart").as_slice(),
+        osc_marker_pair_bytes("CommandText", command).as_slice(),
+        osc_marker_pair_bytes("Cwd", cwd).as_slice(),
+        output.as_bytes(),
+        osc_marker_pair_bytes("ExitCode", exit_code.to_string().as_str()).as_slice(),
+        osc_marker_pair_bytes("DurationMs", duration_ms.to_string().as_str()).as_slice(),
+        osc_marker_bytes("CommandEnd").as_slice(),
+    ]
+    .concat()
+}
+
+fn osc_marker_bytes(marker: &str) -> Vec<u8> {
+    format!("\x1b]1337;Noctrail;{marker}\x07").into_bytes()
+}
+
+fn osc_marker_pair_bytes(marker: &str, value: &str) -> Vec<u8> {
+    format!("\x1b]1337;Noctrail;{marker};{value}\x07").into_bytes()
+}
+
 fn measure_high_output_p95_ms() -> f64 {
     let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(120, 40));
     let mut samples = Vec::with_capacity(512);
@@ -939,6 +1059,16 @@ mod tests {
             Some(PathBuf::from("/tmp/noctrail.toml"))
         );
         assert!(options.safe_mode);
+    }
+
+    #[test]
+    fn parses_block_smoke_command() {
+        let options =
+            parse_startup_options(&["block-smoke".to_string()]).expect("options should parse");
+
+        assert_eq!(options.command, StartupCommand::BlockSmoke);
+        assert_eq!(options.config_path, None);
+        assert!(!options.safe_mode);
     }
 
     #[test]

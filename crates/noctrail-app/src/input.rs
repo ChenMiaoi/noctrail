@@ -9,6 +9,7 @@ pub enum ShortcutAction {
     Copy,
     Paste,
     Focus(FocusDirection),
+    ToggleBlockBrowser,
     ToggleCommandPalette,
 }
 
@@ -54,6 +55,7 @@ pub fn shortcut_action(logical_key: &Key, modifiers: ModifiersState) -> Option<S
     match logical_key.as_ref() {
         Key::Character(text) if modifiers.control_key() && modifiers.shift_key() => {
             match text.to_ascii_lowercase().as_str() {
+                "b" => Some(ShortcutAction::ToggleBlockBrowser),
                 "c" => Some(ShortcutAction::Copy),
                 "p" => Some(ShortcutAction::ToggleCommandPalette),
                 "v" => Some(ShortcutAction::Paste),
@@ -372,6 +374,13 @@ mod tests {
 
     #[test]
     fn shortcut_actions_cover_copy_and_paste() {
+        assert_eq!(
+            shortcut_action(
+                &Key::Character("b".into()),
+                ModifiersState::CONTROL | ModifiersState::SHIFT,
+            ),
+            Some(ShortcutAction::ToggleBlockBrowser)
+        );
         assert_eq!(
             shortcut_action(
                 &Key::Character("c".into()),

@@ -428,6 +428,9 @@ impl CommandPalette {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct BlockBrowser;
+
 struct GuiApp {
     app: DesktopApp,
     launch_options: GuiLaunchOptions,
@@ -440,6 +443,7 @@ struct GuiApp {
     font: FontConfig,
     font_preferences: FontPreferences,
     ime_preedit: Option<String>,
+    block_browser: Option<BlockBrowser>,
     command_palette: Option<CommandPalette>,
     mouse_position: Option<PhysicalPosition<f64>>,
     mouse_selection: Option<MouseSelectionDrag>,
@@ -478,6 +482,7 @@ impl GuiApp {
             font: font.clone(),
             font_preferences: font_preferences_from_config(&font),
             ime_preedit: None,
+            block_browser: None,
             command_palette: None,
             mouse_position: None,
             mouse_selection: None,
@@ -765,66 +770,108 @@ impl GuiApp {
 
     fn update_title(&self) {
         if let Some(window) = self.window.as_ref() {
-            let mut title = frame_title(&self.app.frame(), self.cursor_visible);
-            let effects = self.visual_effects_policy();
-            title.push_str(" | font ");
-            title.push_str(&self.font.family);
-            title.push(' ');
-            title.push_str(&format!("{:.1}", self.font.size));
-            title.push_str(" | power ");
-            title.push_str(if effects.low_power_enabled {
-                "low"
-            } else {
-                "normal"
-            });
-            title.push_str(" | opacity ");
-            title.push_str(&format!("{:.2}", effects.effective_opacity));
-            match effects.blur_mode {
-                BlurMode::Disabled => title.push_str(" | blur off"),
-                BlurMode::TintedSolid => title.push_str(" | blur tinted-solid"),
-            }
-            if let Some(reason) = effects.transparency_fallback_reason {
-                title.push_str(" | transparency-fallback ");
-                title.push_str(reason);
-            }
-            if let Some(reason) = effects.blur_fallback_reason {
-                title.push_str(" | blur-fallback ");
-                title.push_str(reason);
-            }
-            if let Some(transition) = self.transition.as_ref() {
-                title.push_str(" | anim ");
-                title.push_str(transition.kind.label());
-                title.push(' ');
-                title.push_str(&format!("{:.2}", transition.progress(Instant::now())));
-            }
-            if let Some(error) = self.gpu_fallback_error.as_deref() {
-                title.push_str(" | gpu-fallback ");
-                title.push_str(error);
-            }
-            if let Some(error) = self.theme_reload_error.as_deref() {
-                title.push_str(" | theme-reload ");
-                title.push_str(error);
-            }
-            if let Some(preedit) = self.ime_preedit.as_deref()
-                && !preedit.is_empty()
-            {
-                title.push_str(" | ime ");
-                title.push_str(preedit);
-            }
-            if let Some(palette) = self.command_palette.as_ref() {
-                title.push_str(" | palette ");
-                if palette.query.is_empty() {
-                    title.push_str("(all)");
-                } else {
-                    title.push_str(&palette.query);
-                }
-                if let Some(command) = palette.selected_command() {
-                    title.push_str(" -> ");
-                    title.push_str(&command.label());
-                }
-            }
-            window.set_title(&title);
+            window.set_title(&self.title_text());
         }
+    }
+
+    fn title_text(&self) -> String {
+        let mut title = frame_title(&self.app.frame(), self.cursor_visible);
+        let effects = self.visual_effects_policy();
+        title.push_str(" | font ");
+        title.push_str(&self.font.family);
+        title.push(' ');
+        title.push_str(&format!("{:.1}", self.font.size));
+        title.push_str(" | power ");
+        title.push_str(if effects.low_power_enabled {
+            "low"
+        } else {
+            "normal"
+        });
+        title.push_str(" | opacity ");
+        title.push_str(&format!("{:.2}", effects.effective_opacity));
+        match effects.blur_mode {
+            BlurMode::Disabled => title.push_str(" | blur off"),
+            BlurMode::TintedSolid => title.push_str(" | blur tinted-solid"),
+        }
+        if let Some(reason) = effects.transparency_fallback_reason {
+            title.push_str(" | transparency-fallback ");
+            title.push_str(reason);
+        }
+        if let Some(reason) = effects.blur_fallback_reason {
+            title.push_str(" | blur-fallback ");
+            title.push_str(reason);
+        }
+        if let Some(transition) = self.transition.as_ref() {
+            title.push_str(" | anim ");
+            title.push_str(transition.kind.label());
+            title.push(' ');
+            title.push_str(&format!("{:.2}", transition.progress(Instant::now())));
+        }
+        if let Some(error) = self.gpu_fallback_error.as_deref() {
+            title.push_str(" | gpu-fallback ");
+            title.push_str(error);
+        }
+        if let Some(error) = self.theme_reload_error.as_deref() {
+            title.push_str(" | theme-reload ");
+            title.push_str(error);
+        }
+        if let Some(preedit) = self.ime_preedit.as_deref()
+            && !preedit.is_empty()
+        {
+            title.push_str(" | ime ");
+            title.push_str(preedit);
+        }
+        if self.block_browser.is_some() {
+            title.push_str(" | blocks ");
+            title.push_str(if self.app.block_observer_enabled() {
+                "on"
+            } else {
+                "off"
+            });
+            title.push(' ');
+            title.push_str(&self.app.command_blocks().len().to_string());
+            title.push('/');
+            title.push_str("100");
+            if let Some(index) = self.app.selected_command_block_index() {
+                title.push_str(" sel ");
+                title.push_str(&(index + 1).to_string());
+            }
+            if let Some(block) = self.app.selected_command_block() {
+                if block.folded {
+                    title.push_str(" | folded");
+                }
+                if let Some(command) = block.command.as_deref() {
+                    title.push_str(" | cmd ");
+                    title.push_str(&preview_text(command, 32));
+                }
+                if let Some(exit_code) = block.exit_code {
+                    title.push_str(" | code ");
+                    title.push_str(&exit_code.to_string());
+                }
+                if let Some(duration_ms) = block.duration_ms {
+                    title.push_str(" | dur ");
+                    title.push_str(&duration_ms.to_string());
+                    title.push_str("ms");
+                }
+                if !block.folded && !block.output.is_empty() {
+                    title.push_str(" | out ");
+                    title.push_str(&preview_text(&block.output, 32));
+                }
+            }
+        }
+        if let Some(palette) = self.command_palette.as_ref() {
+            title.push_str(" | palette ");
+            if palette.query.is_empty() {
+                title.push_str("(all)");
+            } else {
+                title.push_str(&palette.query);
+            }
+            if let Some(command) = palette.selected_command() {
+                title.push_str(" -> ");
+                title.push_str(&command.label());
+            }
+        }
+        title
     }
 
     fn apply_theme_visuals(&mut self) {
@@ -1177,6 +1224,19 @@ impl GuiApp {
         self.request_redraw();
     }
 
+    fn toggle_block_browser(&mut self) {
+        if self.block_browser.is_some() {
+            self.block_browser = None;
+        } else {
+            self.app.set_block_observer_enabled(true);
+            let _ = self.app.select_newest_command_block();
+            self.block_browser = Some(BlockBrowser);
+        }
+        self.touch_cursor_blink();
+        self.update_title();
+        self.request_redraw();
+    }
+
     fn handle_command_palette_key(
         &mut self,
         event: &winit::event::KeyEvent,
@@ -1233,6 +1293,77 @@ impl GuiApp {
         self.request_redraw();
         Ok(true)
     }
+
+    fn handle_block_browser_key(
+        &mut self,
+        event: &winit::event::KeyEvent,
+    ) -> Result<bool, Box<dyn Error>> {
+        if self.block_browser.is_none() {
+            return Ok(false);
+        }
+        if !event.state.is_pressed() {
+            return Ok(true);
+        }
+
+        match event.logical_key.as_ref() {
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape) => {
+                self.block_browser = None;
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp) => {
+                let _ = self.app.select_previous_command_block();
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowDown)
+            | winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab) => {
+                let _ = self.app.select_next_command_block();
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Home) => {
+                let _ = self.app.select_oldest_command_block();
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::End)
+            | winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter) => {
+                let _ = self.app.select_newest_command_block();
+            }
+            _ if !self.modifiers.control_key()
+                && !self.modifiers.alt_key()
+                && !self.modifiers.super_key() =>
+            {
+                let Some(text) = event.text.as_deref() else {
+                    self.touch_cursor_blink();
+                    self.update_title();
+                    self.request_redraw();
+                    return Ok(true);
+                };
+                match text.to_ascii_lowercase().as_str() {
+                    "c" => {
+                        if let Some(command) = self.app.copy_selected_command_block_command() {
+                            self.clipboard.set_text(command);
+                        }
+                    }
+                    "f" => {
+                        let _ = self.app.toggle_selected_command_block_fold();
+                    }
+                    "j" => {
+                        let _ = self.app.select_next_command_block();
+                    }
+                    "k" => {
+                        let _ = self.app.select_previous_command_block();
+                    }
+                    "o" => {
+                        if let Some(output) = self.app.copy_selected_command_block_output() {
+                            self.clipboard.set_text(output);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+
+        self.touch_cursor_blink();
+        self.update_title();
+        self.request_redraw();
+        Ok(true)
+    }
 }
 
 fn direction_name(direction: FocusDirection) -> &'static str {
@@ -1254,6 +1385,15 @@ fn font_preferences_from_config(config: &FontConfig) -> FontPreferences {
 
 fn srgb_component(value: u8) -> f64 {
     f64::from(value) / f64::from(u8::MAX)
+}
+
+fn preview_text(text: &str, max_chars: usize) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview = normalized.chars().take(max_chars).collect::<String>();
+    if normalized.chars().count() > max_chars {
+        preview.push_str("...");
+    }
+    preview
 }
 
 fn pane_chrome_from_theme(theme: &ThemeConfig) -> PaneChromeConfig {
@@ -1394,10 +1534,25 @@ impl ApplicationHandler for GuiApp {
                 }
                 if matches!(
                     input::shortcut_action(&event.logical_key, self.modifiers),
+                    Some(input::ShortcutAction::ToggleBlockBrowser)
+                ) {
+                    self.toggle_block_browser();
+                    return;
+                }
+                if matches!(
+                    input::shortcut_action(&event.logical_key, self.modifiers),
                     Some(input::ShortcutAction::ToggleCommandPalette)
                 ) {
                     self.toggle_command_palette();
                     return;
+                }
+                match self.handle_block_browser_key(&event) {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(_) => {
+                        event_loop.exit();
+                        return;
+                    }
                 }
                 match self.handle_command_palette_key(&event) {
                     Ok(true) => return,
@@ -1409,6 +1564,7 @@ impl ApplicationHandler for GuiApp {
                 }
                 if let Some(action) = input::shortcut_action(&event.logical_key, self.modifiers) {
                     match action {
+                        input::ShortcutAction::ToggleBlockBrowser => unreachable!(),
                         input::ShortcutAction::ToggleCommandPalette => unreachable!(),
                         input::ShortcutAction::Copy => {
                             if let Some(text) = self.app.copy_selection_text() {
@@ -1837,6 +1993,68 @@ mod tests {
     }
 
     #[test]
+    fn block_browser_opens_and_selects_the_newest_block() {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
+        gui.app.set_block_observer_enabled(true);
+        gui.app.advance_output(&block_probe_bytes(
+            "echo first",
+            "/tmp/noctrail-first",
+            0,
+            10,
+            "first output",
+        ));
+        gui.app.advance_output(&block_probe_bytes(
+            "echo second",
+            "/tmp/noctrail-second",
+            0,
+            11,
+            "second output",
+        ));
+        gui.app.set_block_observer_enabled(false);
+
+        gui.toggle_block_browser();
+
+        assert!(gui.block_browser.is_some());
+        assert!(gui.app.block_observer_enabled());
+        assert_eq!(gui.app.selected_command_block_index(), Some(1));
+        assert_eq!(
+            gui.app
+                .selected_command_block()
+                .and_then(|block| block.command.as_deref()),
+            Some("echo second")
+        );
+    }
+
+    #[test]
+    fn block_browser_title_reflects_preview_and_fold_state() {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
+        gui.app.set_block_observer_enabled(true);
+        gui.app.advance_output(&block_probe_bytes(
+            "cargo test -p noctrail-app",
+            "/tmp/noctrail-blocks",
+            7,
+            1200,
+            "line one\nline two",
+        ));
+        gui.block_browser = Some(BlockBrowser);
+        let _ = gui.app.select_newest_command_block();
+
+        let unfolded = gui.title_text();
+        assert!(unfolded.contains("blocks on 1/100 sel 1"));
+        assert!(unfolded.contains("cmd cargo test -p noctrail-app"));
+        assert!(unfolded.contains("code 7"));
+        assert!(unfolded.contains("dur 1200ms"));
+        assert!(unfolded.contains("out line one line two"));
+
+        let _ = gui.app.toggle_selected_command_block_fold();
+        let folded = gui.title_text();
+        assert!(folded.contains("| folded"));
+        assert!(!folded.contains("out line one line two"));
+    }
+
+    #[test]
     fn command_palette_executes_split_horizontal() -> Result<(), Box<dyn Error>> {
         let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
         let mut theme = ThemeConfig::default();
@@ -2223,6 +2441,34 @@ mod tests {
 
     fn shell_exit_bytes() -> Vec<u8> {
         b"exit\r\n".to_vec()
+    }
+
+    fn block_probe_bytes(
+        command: &str,
+        cwd: &str,
+        exit_code: i32,
+        duration_ms: u64,
+        output: &str,
+    ) -> Vec<u8> {
+        [
+            osc_marker_bytes("Prompt").as_slice(),
+            osc_marker_bytes("CommandStart").as_slice(),
+            osc_marker_pair_bytes("CommandText", command).as_slice(),
+            osc_marker_pair_bytes("Cwd", cwd).as_slice(),
+            output.as_bytes(),
+            osc_marker_pair_bytes("ExitCode", exit_code.to_string().as_str()).as_slice(),
+            osc_marker_pair_bytes("DurationMs", duration_ms.to_string().as_str()).as_slice(),
+            osc_marker_bytes("CommandEnd").as_slice(),
+        ]
+        .concat()
+    }
+
+    fn osc_marker_bytes(marker: &str) -> Vec<u8> {
+        format!("\x1b]1337;Noctrail;{marker}\x07").into_bytes()
+    }
+
+    fn osc_marker_pair_bytes(marker: &str, value: &str) -> Vec<u8> {
+        format!("\x1b]1337;Noctrail;{marker};{value}\x07").into_bytes()
     }
 
     #[cfg(not(windows))]
