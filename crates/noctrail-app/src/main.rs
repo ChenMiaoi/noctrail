@@ -1671,10 +1671,9 @@ fn current_rss_bytes() -> Result<u64, Box<dyn std::error::Error>> {
             return Err("failed to query RSS with PowerShell".into());
         }
         let text = String::from_utf8(output.stdout)?;
-        return text
-            .trim()
+        text.trim()
             .parse::<u64>()
-            .map_err(|error| format!("failed to parse RSS bytes: {error}").into());
+            .map_err(|error| format!("failed to parse RSS bytes: {error}").into())
     }
 
     #[cfg(not(windows))]
@@ -1699,6 +1698,7 @@ fn rss_growth_percent(start_bytes: u64, end_bytes: u64) -> f64 {
     ((end_bytes - start_bytes) as f64 / start_bytes as f64) * 100.0
 }
 
+#[cfg(not(windows))]
 fn parse_rss_kb(text: &str) -> Option<u64> {
     text.split_whitespace()
         .find_map(|token| token.parse::<u64>().ok())
@@ -2255,6 +2255,7 @@ mod tests {
         assert_eq!(p95_millis(&mut samples), 40.0);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn parse_rss_kb_extracts_the_numeric_column() {
         assert_eq!(parse_rss_kb("  12345\n"), Some(12_345));
