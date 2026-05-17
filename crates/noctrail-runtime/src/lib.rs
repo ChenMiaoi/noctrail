@@ -323,6 +323,23 @@ impl PaneRuntimeRegistry {
         pane.read_output(buf).map_err(Into::into)
     }
 
+    pub fn restart(
+        &mut self,
+        pane_id: PaneId,
+        command: PtyCommand,
+        size: PtySize,
+    ) -> Result<Option<PtyExitStatus>, RuntimeError> {
+        if !self.contains(pane_id) {
+            return Err(RuntimeError::PaneNotFound(pane_id));
+        }
+
+        let replacement = PaneRuntime::spawn(command, size)?;
+        let previous = self
+            .insert_with_id(pane_id, replacement)
+            .expect("pane presence checked above");
+        previous.close().map_err(Into::into)
+    }
+
     pub fn close(&mut self, pane_id: PaneId) -> Result<Option<PtyExitStatus>, RuntimeError> {
         let pane = self
             .remove(pane_id)
@@ -428,6 +445,40 @@ mod tests {
             );
             assert!(registry.close(pane_id)?.is_some());
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn registry_restart_replaces_runtime_under_same_pane_id() -> Result<(), Box<dyn StdError>> {
+        let mut registry = PaneRuntimeRegistry::new();
+        let pane_id = registry.spawn(smoke_command("before-restart"), PtySize::new(80, 24))?;
+
+        let before = read_all_output(&mut registry, pane_id)?;
+        let before_text = String::from_utf8_lossy(&before);
+        assert!(before_text.contains("before-restart"));
+
+        let restart_status = registry.restart(
+            pane_id,
+            smoke_command("after-restart"),
+            PtySize::new(100, 30),
+        )?;
+        assert!(
+            restart_status.is_some(),
+            "restart should close the previous runtime"
+        );
+        assert_eq!(
+            registry
+                .get(pane_id)
+                .expect("pane should remain present after restart")
+                .size(),
+            PtySize::new(100, 30)
+        );
+
+        let after = read_all_output(&mut registry, pane_id)?;
+        let after_text = String::from_utf8_lossy(&after);
+        assert!(after_text.contains("after-restart"));
+        assert!(registry.close(pane_id)?.is_some());
 
         Ok(())
     }
