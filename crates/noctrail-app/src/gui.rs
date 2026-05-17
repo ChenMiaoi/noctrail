@@ -1,10 +1,12 @@
 use std::{
     error::Error,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use noctrail_layout::LayoutRect;
 use noctrail_pty::PtySize;
+use noctrail_render::GpuRenderer;
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalSize},
@@ -84,7 +86,8 @@ fn saturating_u32_to_u16(value: u32) -> u16 {
 
 struct GuiApp {
     app: DesktopApp,
-    window: Option<Window>,
+    window: Option<Arc<Window>>,
+    renderer: Option<GpuRenderer>,
     next_frame_at: Instant,
     cursor_visible: bool,
     frame_interval: Duration,
@@ -98,6 +101,7 @@ impl GuiApp {
         Self {
             app,
             window: None,
+            renderer: None,
             next_frame_at: now,
             cursor_visible: true,
             frame_interval: FRAME_INTERVAL,
@@ -107,7 +111,7 @@ impl GuiApp {
     }
 
     fn window_id(&self) -> Option<WindowId> {
-        self.window.as_ref().map(Window::id)
+        self.window.as_ref().map(|window| window.id())
     }
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), Box<dyn Error>> {
@@ -118,9 +122,11 @@ impl GuiApp {
                 f64::from(DEFAULT_WINDOW_HEIGHT),
             ))
             .with_resizable(true);
-        let window = event_loop.create_window(attributes)?;
+        let window = Arc::new(event_loop.create_window(attributes)?);
         let size = window.inner_size();
         self.sync_surface(size)?;
+        self.renderer = Some(GpuRenderer::new(window.clone(), size)?);
+        self.app.set_backend(noctrail_render::RenderBackend::Gpu);
         self.window = Some(window);
         self.update_title();
         self.request_redraw();
@@ -131,6 +137,9 @@ impl GuiApp {
         let surface = layout_rect_from_surface(size);
         let terminal_size = terminal_size_from_surface(size);
         self.app.resize(surface, terminal_size)?;
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.resize(size);
+        }
         Ok(())
     }
 
@@ -236,6 +245,12 @@ impl ApplicationHandler for GuiApp {
                 self.request_redraw();
             }
             WindowEvent::RedrawRequested => {
+                if let Some(renderer) = self.renderer.as_mut()
+                    && renderer.render_clear().is_err()
+                {
+                    event_loop.exit();
+                    return;
+                }
                 self.cursor_visible = !self.cursor_visible;
                 self.update_title();
                 self.next_frame_at = Instant::now() + self.frame_interval;

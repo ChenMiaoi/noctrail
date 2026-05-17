@@ -1,8 +1,13 @@
 //! Render plan and backend boundary for Noctrail.
 
+use std::sync::Arc;
+
 use noctrail_term::{
     Cell, Cursor, DamageSet, ScreenRowSnapshot, Selection, Style, TerminalSnapshot,
 };
+use thiserror::Error;
+use wgpu::CurrentSurfaceTexture;
+use winit::{dpi::PhysicalSize, window::Window};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RenderBackend {
@@ -157,6 +162,203 @@ impl RenderPlan {
 #[derive(Debug, Default)]
 pub struct RenderSurface;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuDiagnostics {
+    pub adapter_name: String,
+    pub backend: wgpu::Backend,
+    pub device_type: wgpu::DeviceType,
+    pub surface_format: wgpu::TextureFormat,
+    pub present_mode: wgpu::PresentMode,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderOutcome {
+    Presented,
+    Skipped,
+}
+
+#[derive(Debug, Error)]
+pub enum GpuRendererError {
+    #[error("failed to create GPU surface: {0}")]
+    CreateSurface(#[source] wgpu::CreateSurfaceError),
+    #[error("failed to request GPU adapter: {0}")]
+    RequestAdapter(#[source] wgpu::RequestAdapterError),
+    #[error("surface does not expose a default configuration")]
+    MissingSurfaceConfiguration,
+    #[error("failed to request GPU device: {0}")]
+    RequestDevice(#[source] wgpu::RequestDeviceError),
+    #[error("surface validation failed while acquiring the next frame")]
+    SurfaceValidation,
+}
+
+pub struct GpuRenderer {
+    instance: wgpu::Instance,
+    window: Arc<Window>,
+    surface: wgpu::Surface<'static>,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    surface_config: wgpu::SurfaceConfiguration,
+    clear_color: wgpu::Color,
+    diagnostics: GpuDiagnostics,
+}
+
+impl std::fmt::Debug for GpuRenderer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuRenderer")
+            .field("surface_config", &self.surface_config)
+            .field("diagnostics", &self.diagnostics)
+            .finish()
+    }
+}
+
+impl GpuRenderer {
+    pub fn new(window: Arc<Window>, size: PhysicalSize<u32>) -> Result<Self, GpuRendererError> {
+        pollster::block_on(Self::new_async(window, size))
+    }
+
+    async fn new_async(
+        window: Arc<Window>,
+        size: PhysicalSize<u32>,
+    ) -> Result<Self, GpuRendererError> {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let surface = instance
+            .create_surface(window.clone())
+            .map_err(GpuRendererError::CreateSurface)?;
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .map_err(GpuRendererError::RequestAdapter)?;
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await
+            .map_err(GpuRendererError::RequestDevice)?;
+        let mut surface_config = surface
+            .get_default_config(&adapter, size.width.max(1), size.height.max(1))
+            .ok_or(GpuRendererError::MissingSurfaceConfiguration)?;
+        surface_config.width = size.width.max(1);
+        surface_config.height = size.height.max(1);
+        surface.configure(&device, &surface_config);
+
+        let adapter_info = adapter.get_info();
+        let diagnostics = GpuDiagnostics {
+            adapter_name: adapter_info.name,
+            backend: adapter_info.backend,
+            device_type: adapter_info.device_type,
+            surface_format: surface_config.format,
+            present_mode: surface_config.present_mode,
+            width: surface_config.width,
+            height: surface_config.height,
+        };
+
+        Ok(Self {
+            instance,
+            window,
+            surface,
+            adapter,
+            device,
+            queue,
+            surface_config,
+            clear_color: wgpu::Color {
+                r: 0.02,
+                g: 0.04,
+                b: 0.06,
+                a: 1.0,
+            },
+            diagnostics,
+        })
+    }
+
+    pub fn diagnostics(&self) -> &GpuDiagnostics {
+        &self.diagnostics
+    }
+
+    pub fn resize(&mut self, size: PhysicalSize<u32>) {
+        self.surface_config.width = size.width.max(1);
+        self.surface_config.height = size.height.max(1);
+        self.surface.configure(&self.device, &self.surface_config);
+        self.diagnostics.width = self.surface_config.width;
+        self.diagnostics.height = self.surface_config.height;
+    }
+
+    pub fn render_clear(&mut self) -> Result<RenderOutcome, GpuRendererError> {
+        let (frame, reconfigure_after_present) = match self.surface.get_current_texture() {
+            CurrentSurfaceTexture::Success(frame) => (frame, false),
+            CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
+            CurrentSurfaceTexture::Timeout | CurrentSurfaceTexture::Occluded => {
+                return Ok(RenderOutcome::Skipped);
+            }
+            CurrentSurfaceTexture::Outdated => {
+                self.surface.configure(&self.device, &self.surface_config);
+                return Ok(RenderOutcome::Skipped);
+            }
+            CurrentSurfaceTexture::Lost => {
+                self.recreate_surface()?;
+                return Ok(RenderOutcome::Skipped);
+            }
+            CurrentSurfaceTexture::Validation => return Err(GpuRendererError::SurfaceValidation),
+        };
+
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("noctrail-clear-frame"),
+            });
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("noctrail-clear-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(self.clear_color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        self.queue.submit([encoder.finish()]);
+        frame.present();
+
+        if reconfigure_after_present {
+            self.surface.configure(&self.device, &self.surface_config);
+        }
+
+        Ok(RenderOutcome::Presented)
+    }
+
+    fn recreate_surface(&mut self) -> Result<(), GpuRendererError> {
+        self.surface = self
+            .instance
+            .create_surface(self.window.clone())
+            .map_err(GpuRendererError::CreateSurface)?;
+        self.surface.configure(&self.device, &self.surface_config);
+        self.adapter =
+            pollster::block_on(self.instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&self.surface),
+                force_fallback_adapter: false,
+            }))
+            .map_err(GpuRendererError::RequestAdapter)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,5 +504,24 @@ mod tests {
         assert_eq!(plan.damage, damage);
         assert!(!plan.active);
         assert_eq!(plan.rows[0].glyphs.len(), 3);
+    }
+
+    #[test]
+    fn gpu_diagnostics_track_surface_size() {
+        let mut diagnostics = GpuDiagnostics {
+            adapter_name: "adapter".to_string(),
+            backend: wgpu::Backend::Metal,
+            device_type: wgpu::DeviceType::IntegratedGpu,
+            surface_format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            width: 80,
+            height: 24,
+        };
+
+        diagnostics.width = 100;
+        diagnostics.height = 30;
+
+        assert_eq!(diagnostics.width, 100);
+        assert_eq!(diagnostics.height, 30);
     }
 }

@@ -10,3 +10,7 @@ publish = false
 
 [dependencies]
 noctrail-term = { path = "../noctrail-term" }
+pollster = "0.4"
+thiserror = "2"
+wgpu = "29"
+winit = "0.30.13"
