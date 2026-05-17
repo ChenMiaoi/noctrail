@@ -7,8 +7,8 @@ while any item below remains `OPEN`.
 
 ## Summary
 
-- `OPEN`: 3
-- `CLOSED`: 9
+- `OPEN`: 2
+- `CLOSED`: 10
 - Beta status: `BLOCKED`
 
 ## Blockers
@@ -26,7 +26,7 @@ while any item below remains `OPEN`.
 | BETA-009 | P0 | Safe-mode startup | CLOSED | `cargo run -p noctrail-app -- smoke --safe-mode --config <bad.toml>`; config tests in `noctrail-app` and `noctrail-config` |
 | BETA-010 | P0 | Agent review boundary | CLOSED | `cargo run -p noctrail-app -- agent-review-smoke`; `cargo run -p noctrail-app -- agent-patch-preview-smoke` |
 | BETA-011 | P1 | Diagnostics surface | CLOSED | `cargo run -p noctrail-cli -- doctor`; `cargo run -p noctrail-cli -- doctor pty`; `cargo run -p noctrail-cli -- doctor config examples/noctrail.example.toml`; `cargo run -p noctrail-cli -- doctor permissions` |
-| BETA-012 | P1 | Privacy/security docs | OPEN | Roadmap item `10.6` is still incomplete. Agent/storage/telemetry/logging defaults exist in code, but the user-facing privacy/security document set has not been published yet. |
+| BETA-012 | P1 | Privacy/security docs | CLOSED | [docs/privacy-security.md](privacy-security.md); `cargo run -p noctrail-app -- agent-default-smoke`; `cargo run -p noctrail-app -- redaction-smoke`; `cargo run -p noctrail-app -- agent-review-smoke` |
 
 ## Exit Rule
 

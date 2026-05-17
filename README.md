@@ -59,6 +59,8 @@ The schema reference lives in [docs/config-reference.md](docs/config-reference.m
 and a runnable example lives at
 [examples/noctrail.example.toml](examples/noctrail.example.toml).
 The current beta gate lives in [docs/release-blockers.md](docs/release-blockers.md).
+The privacy and security model lives in
+[docs/privacy-security.md](docs/privacy-security.md).
 
 ## License
 
