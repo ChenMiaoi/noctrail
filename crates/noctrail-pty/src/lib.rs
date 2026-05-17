@@ -518,6 +518,7 @@ mod tests {
         assert!(shell.env_overrides().is_empty());
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn unix_shell_prefers_shell_env() {
         let env_vars = vec![(OsString::from("SHELL"), OsString::from("/bin/fish"))];
@@ -526,6 +527,7 @@ mod tests {
         assert_eq!(source, ShellSource::EnvShell);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn unix_shell_falls_back_to_bin_sh() {
         let (program, source) = detect_unix_shell_program(Vec::<(OsString, OsString)>::new());
