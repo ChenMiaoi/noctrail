@@ -20,12 +20,13 @@ use noctrail_render::{PaneBorderStyle, RenderBackend, RenderInput, RenderPlan, R
 use noctrail_runtime::{PaneId, PaneRuntime};
 use noctrail_term::{
     Cursor, DamageSet, LineEnding, MouseTrackingMode, Position, Selection, SelectionMode,
-    TerminalSnapshot, TerminalState,
+    ShellIntegrationEvent, TerminalSnapshot, TerminalState,
 };
 use thiserror::Error;
 
 const ROOT_PANE_ID: PaneId = PaneId::new(1);
 const SCRATCH_HEIGHT_DIVISOR: u16 = 3;
+const MAX_COMMAND_BLOCKS: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PaneChromeConfig {
@@ -56,6 +57,99 @@ impl PaneStatusLine {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CommandBlock {
+    pub command: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub exit_code: Option<i32>,
+    pub duration_ms: Option<u64>,
+}
+
+impl CommandBlock {
+    fn is_empty(&self) -> bool {
+        self.command.is_none()
+            && self.cwd.is_none()
+            && self.exit_code.is_none()
+            && self.duration_ms.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct CommandBlockObserver {
+    enabled: bool,
+    current: Option<CommandBlock>,
+    completed: Vec<CommandBlock>,
+}
+
+impl CommandBlockObserver {
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        if !enabled {
+            self.current = None;
+        }
+    }
+
+    fn observe(&mut self, events: Vec<ShellIntegrationEvent>) {
+        if !self.enabled {
+            return;
+        }
+
+        for event in events {
+            match event {
+                ShellIntegrationEvent::Prompt => {}
+                ShellIntegrationEvent::CommandStart => {
+                    self.finish_current();
+                    self.current = Some(CommandBlock::default());
+                }
+                ShellIntegrationEvent::CommandText(command) => {
+                    if let Some(current) = self.current.as_mut() {
+                        current.command = Some(command);
+                    }
+                }
+                ShellIntegrationEvent::CommandEnd => self.finish_current(),
+                ShellIntegrationEvent::Cwd(cwd) => {
+                    if let Some(current) = self.current.as_mut() {
+                        current.cwd = Some(PathBuf::from(cwd));
+                    }
+                }
+                ShellIntegrationEvent::ExitCode(exit_code) => {
+                    if let Some(current) = self.current.as_mut() {
+                        current.exit_code = Some(exit_code);
+                    }
+                }
+                ShellIntegrationEvent::DurationMs(duration_ms) => {
+                    if let Some(current) = self.current.as_mut() {
+                        current.duration_ms = Some(duration_ms);
+                    }
+                }
+            }
+        }
+    }
+
+    fn current(&self) -> Option<&CommandBlock> {
+        self.current.as_ref()
+    }
+
+    fn completed(&self) -> &[CommandBlock] {
+        &self.completed
+    }
+
+    fn finish_current(&mut self) {
+        let Some(current) = self.current.take() else {
+            return;
+        };
+        if current.is_empty() {
+            return;
+        }
+
+        self.completed.push(current);
+        if self.completed.len() > MAX_COMMAND_BLOCKS {
+            let overflow = self.completed.len() - MAX_COMMAND_BLOCKS;
+            self.completed.drain(0..overflow);
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("the active pane does not have a runtime")]
@@ -82,6 +176,7 @@ pub struct TerminalPane {
     scrollback_offset: usize,
     last_damage: DamageSet,
     status_line: PaneStatusLine,
+    block_observer: CommandBlockObserver,
 }
 
 impl fmt::Debug for TerminalPane {
@@ -111,6 +206,7 @@ impl TerminalPane {
             scrollback_offset: 0,
             last_damage: full_frame_damage(terminal_size),
             status_line: PaneStatusLine::default(),
+            block_observer: CommandBlockObserver::default(),
         }
     }
 
@@ -135,6 +231,7 @@ impl TerminalPane {
             scrollback_offset: 0,
             last_damage: full_frame_damage(terminal_size),
             status_line,
+            block_observer: CommandBlockObserver::default(),
         })
     }
 
@@ -198,12 +295,30 @@ impl TerminalPane {
         &self.status_line
     }
 
+    pub fn set_block_observer_enabled(&mut self, enabled: bool) {
+        self.block_observer.set_enabled(enabled);
+    }
+
+    pub fn block_observer_enabled(&self) -> bool {
+        self.block_observer.enabled
+    }
+
+    pub fn current_command_block(&self) -> Option<&CommandBlock> {
+        self.block_observer.current()
+    }
+
+    pub fn command_blocks(&self) -> &[CommandBlock] {
+        self.block_observer.completed()
+    }
+
     pub fn paste_bytes(&self, text: &str) -> Vec<u8> {
         input::paste_bytes(text, self.bracketed_paste_enabled())
     }
 
     pub fn advance_output(&mut self, bytes: &[u8]) {
         self.last_damage = self.terminal.advance_bytes(bytes).damage;
+        let shell_events = self.terminal.drain_shell_integration_events();
+        self.block_observer.observe(shell_events);
         self.clamp_scrollback_offset();
     }
 
@@ -521,6 +636,10 @@ impl DesktopApp {
 
     pub fn pane_mut(&mut self) -> &mut TerminalPane {
         self.active_pane_mut()
+    }
+
+    pub fn set_block_observer_enabled(&mut self, enabled: bool) {
+        self.active_pane_mut().set_block_observer_enabled(enabled);
     }
 
     pub fn pane_by_id(&self, pane_id: PaneId) -> Option<&TerminalPane> {
@@ -1335,6 +1454,110 @@ mod tests {
     }
 
     #[test]
+    fn block_observer_is_disabled_by_default_and_does_not_buffer_old_events() {
+        let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(20, 4));
+        let disabled_bytes = shell_integration_probe_bytes(
+            "printf disabled",
+            "/tmp/noctrail-disabled",
+            9,
+            1200,
+            b"visible disabled",
+        );
+
+        app.advance_output(&disabled_bytes);
+
+        assert!(!app.pane().block_observer_enabled());
+        assert!(app.pane().current_command_block().is_none());
+        assert!(app.pane().command_blocks().is_empty());
+        assert_eq!(
+            render_row_text(&app.frame().render_plan.rows[0]),
+            "visible disabled"
+        );
+
+        app.set_block_observer_enabled(true);
+        app.advance_output(&shell_integration_probe_bytes(
+            "printf enabled",
+            "/tmp/noctrail-enabled",
+            0,
+            33,
+            b"visible enabled",
+        ));
+
+        assert_eq!(app.pane().command_blocks().len(), 1);
+        assert_eq!(
+            app.pane().command_blocks()[0],
+            CommandBlock {
+                command: Some("printf enabled".to_string()),
+                cwd: Some(PathBuf::from("/tmp/noctrail-enabled")),
+                exit_code: Some(0),
+                duration_ms: Some(33),
+            }
+        );
+    }
+
+    #[test]
+    fn block_observer_tracks_running_and_completed_command_metadata() {
+        let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(20, 4));
+        app.set_block_observer_enabled(true);
+
+        app.advance_output(&shell_integration_start_bytes(
+            "cargo test -p noctrail-app",
+            "/tmp/noctrail-running",
+            b"running output",
+        ));
+
+        assert_eq!(
+            app.pane().current_command_block(),
+            Some(&CommandBlock {
+                command: Some("cargo test -p noctrail-app".to_string()),
+                cwd: Some(PathBuf::from("/tmp/noctrail-running")),
+                exit_code: None,
+                duration_ms: None,
+            })
+        );
+        assert!(app.pane().command_blocks().is_empty());
+        assert_eq!(
+            render_row_text(&app.frame().render_plan.rows[0]),
+            "running output"
+        );
+
+        app.advance_output(&shell_integration_end_bytes(0, 58));
+
+        assert!(app.pane().current_command_block().is_none());
+        assert_eq!(
+            app.pane().command_blocks(),
+            &[CommandBlock {
+                command: Some("cargo test -p noctrail-app".to_string()),
+                cwd: Some(PathBuf::from("/tmp/noctrail-running")),
+                exit_code: Some(0),
+                duration_ms: Some(58),
+            }]
+        );
+    }
+
+    #[test]
+    fn stray_shell_integration_events_do_not_break_terminal_output() {
+        let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(20, 4));
+        app.set_block_observer_enabled(true);
+
+        app.advance_output(
+            &[
+                osc_marker_pair_bytes("CommandText", "echo stray").as_slice(),
+                osc_marker_pair_bytes("ExitCode", "7").as_slice(),
+                b"plain text".as_slice(),
+            ]
+            .concat(),
+        );
+
+        assert!(app.pane().current_command_block().is_none());
+        assert!(app.pane().command_blocks().is_empty());
+        assert_eq!(
+            render_row_text(&app.frame().render_plan.rows[0]),
+            "plain text"
+        );
+    }
+
+    #[test]
     fn resize_updates_terminal_size_without_runtime() -> Result<(), Box<dyn std::error::Error>> {
         let mut app = DesktopApp::new(LayoutRect::new(0, 0, 80, 24), PtySize::new(5, 2));
 
@@ -1813,6 +2036,48 @@ mod tests {
 
     fn shell_exit_bytes() -> Vec<u8> {
         b"exit\r\n".to_vec()
+    }
+
+    fn shell_integration_probe_bytes(
+        command: &str,
+        cwd: &str,
+        exit_code: i32,
+        duration_ms: u64,
+        visible: &[u8],
+    ) -> Vec<u8> {
+        [
+            shell_integration_start_bytes(command, cwd, visible).as_slice(),
+            shell_integration_end_bytes(exit_code, duration_ms).as_slice(),
+        ]
+        .concat()
+    }
+
+    fn shell_integration_start_bytes(command: &str, cwd: &str, visible: &[u8]) -> Vec<u8> {
+        [
+            osc_marker_bytes("Prompt").as_slice(),
+            osc_marker_bytes("CommandStart").as_slice(),
+            osc_marker_pair_bytes("CommandText", command).as_slice(),
+            osc_marker_pair_bytes("Cwd", cwd).as_slice(),
+            visible,
+        ]
+        .concat()
+    }
+
+    fn shell_integration_end_bytes(exit_code: i32, duration_ms: u64) -> Vec<u8> {
+        [
+            osc_marker_pair_bytes("ExitCode", exit_code.to_string().as_str()).as_slice(),
+            osc_marker_pair_bytes("DurationMs", duration_ms.to_string().as_str()).as_slice(),
+            osc_marker_bytes("CommandEnd").as_slice(),
+        ]
+        .concat()
+    }
+
+    fn osc_marker_bytes(marker: &str) -> Vec<u8> {
+        format!("\x1b]1337;Noctrail;{marker}\x07").into_bytes()
+    }
+
+    fn osc_marker_pair_bytes(marker: &str, value: &str) -> Vec<u8> {
+        format!("\x1b]1337;Noctrail;{marker};{value}\x07").into_bytes()
     }
 
     fn exit_status_probe_command(code: u32) -> PtyCommand {
