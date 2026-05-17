@@ -36,3 +36,21 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --all-targets --all-features
+
+      - name: CLI doctor smoke
+        run: cargo run -p noctrail-cli -- doctor
+
+      - name: CLI shell doctor smoke
+        run: cargo run -p noctrail-cli -- doctor shell
+
+      - name: Render smoke
+        run: cargo run -p noctrail-cli -- render-smoke
+
+      - name: PTY smoke
+        run: cargo run -p noctrail-cli -- pty-smoke
+
+      - name: Replay smoke
+        run: cargo run -p noctrail-cli -- replay "tests/fixtures/terminal/*.ntrec"
+
+      - name: App smoke
+        run: cargo run -p noctrail-app -- smoke
