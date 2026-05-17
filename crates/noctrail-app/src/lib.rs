@@ -25,6 +25,8 @@ pub enum AppError {
     MissingRuntime,
     #[error("the desktop app does not have an active pane")]
     MissingActivePane,
+    #[error("cannot close the last remaining pane")]
+    CannotCloseLastPane,
     #[error("pane {0:?} was not found")]
     PaneNotFound(PaneId),
     #[error("pane id space exhausted")]
@@ -323,6 +325,7 @@ pub struct DesktopFrame {
 #[derive(Debug)]
 pub struct DesktopApp {
     surface: LayoutRect,
+    terminal_size: PtySize,
     backend: RenderBackend,
     layout: LayoutTree,
     panes: HashMap<PaneId, TerminalPane>,
@@ -331,12 +334,17 @@ pub struct DesktopApp {
 
 impl DesktopApp {
     pub fn new(surface: LayoutRect, terminal_size: PtySize) -> Self {
-        Self::from_root_pane(surface, TerminalPane::new(ROOT_PANE_ID, terminal_size))
+        Self::from_root_pane(
+            surface,
+            terminal_size,
+            TerminalPane::new(ROOT_PANE_ID, terminal_size),
+        )
     }
 
     pub fn spawn_shell(surface: LayoutRect, terminal_size: PtySize) -> Result<Self, AppError> {
         Ok(Self::from_root_pane(
             surface,
+            terminal_size,
             TerminalPane::spawn_shell(ROOT_PANE_ID, terminal_size)?,
         ))
     }
@@ -348,6 +356,7 @@ impl DesktopApp {
     ) -> Result<Self, AppError> {
         Ok(Self::from_root_pane(
             surface,
+            terminal_size,
             TerminalPane::spawn(ROOT_PANE_ID, command, terminal_size)?,
         ))
     }
@@ -396,6 +405,19 @@ impl DesktopApp {
         Ok(self.layout.focus_direction(direction, self.surface)?)
     }
 
+    pub fn swap_active_pane(&mut self, direction: FocusDirection) -> Result<PaneId, AppError> {
+        Ok(self.layout.swap_active(direction, self.surface)?)
+    }
+
+    pub fn resize_active_split(
+        &mut self,
+        direction: FocusDirection,
+        delta: u16,
+    ) -> Result<(), AppError> {
+        self.layout.resize_active(direction, delta, self.surface)?;
+        self.sync_pane_terminal_sizes()
+    }
+
     pub fn split_active_pane_shell(&mut self) -> Result<PaneId, AppError> {
         self.split_active_pane_with(PtyCommand::shell())
     }
@@ -407,6 +429,7 @@ impl DesktopApp {
 
         self.layout.split_active(new_pane_id, self.surface)?;
         self.panes.insert(new_pane_id, pane);
+        self.sync_pane_terminal_sizes()?;
         Ok(new_pane_id)
     }
 
@@ -440,10 +463,8 @@ impl DesktopApp {
 
     pub fn resize(&mut self, surface: LayoutRect, terminal_size: PtySize) -> Result<(), AppError> {
         self.surface = surface;
-        for pane in self.panes.values_mut() {
-            pane.resize(terminal_size)?;
-        }
-        Ok(())
+        self.terminal_size = terminal_size;
+        self.sync_pane_terminal_sizes()
     }
 
     pub fn scroll_scrollback(&mut self, delta_lines: i32) {
@@ -492,11 +513,39 @@ impl DesktopApp {
         self.active_pane_mut().close_runtime()
     }
 
-    fn from_root_pane(surface: LayoutRect, pane: TerminalPane) -> Self {
+    pub fn close_active_pane(&mut self) -> Result<(PaneId, Option<PtyExitStatus>), AppError> {
+        if self.pane_count() <= 1 {
+            return Err(AppError::CannotCloseLastPane);
+        }
+
+        let active = self.active_pane_id().ok_or(AppError::MissingActivePane)?;
+        let status = if self
+            .pane_by_id(active)
+            .ok_or(AppError::PaneNotFound(active))?
+            .runtime_present()
+        {
+            self.pane_mut_by_id(active)
+                .ok_or(AppError::PaneNotFound(active))?
+                .close_runtime()?
+        } else {
+            None
+        };
+
+        let next_active = self
+            .layout
+            .close(active)?
+            .ok_or(AppError::MissingActivePane)?;
+        self.panes.remove(&active);
+        self.sync_pane_terminal_sizes()?;
+        Ok((next_active, status))
+    }
+
+    fn from_root_pane(surface: LayoutRect, terminal_size: PtySize, pane: TerminalPane) -> Self {
         let mut panes = HashMap::new();
         panes.insert(ROOT_PANE_ID, pane);
         Self {
             surface,
+            terminal_size,
             backend: RenderBackend::default(),
             layout: LayoutTree::new(ROOT_PANE_ID),
             panes,
@@ -534,6 +583,17 @@ impl DesktopApp {
         self.panes
             .get_mut(&pane_id)
             .expect("layout active pane should exist in the pane registry")
+    }
+
+    fn sync_pane_terminal_sizes(&mut self) -> Result<(), AppError> {
+        let layouts = self.pane_layouts();
+        for layout in layouts {
+            let pane_size = pane_terminal_size(self.surface, self.terminal_size, layout.rect);
+            self.pane_mut_by_id(layout.pane_id)
+                .ok_or(AppError::PaneNotFound(layout.pane_id))?
+                .resize(pane_size)?;
+        }
+        Ok(())
     }
 }
 
@@ -639,6 +699,37 @@ fn remap_selection(
     })
 }
 
+fn pane_terminal_size(
+    surface: LayoutRect,
+    terminal_size: PtySize,
+    pane_rect: LayoutRect,
+) -> PtySize {
+    let cols = projected_cells(
+        pane_rect.x.saturating_sub(surface.x),
+        pane_rect.width,
+        surface.width,
+        terminal_size.cols,
+    );
+    let rows = projected_cells(
+        pane_rect.y.saturating_sub(surface.y),
+        pane_rect.height,
+        surface.height,
+        terminal_size.rows,
+    );
+    PtySize::new(cols, rows)
+}
+
+fn projected_cells(offset: u16, span: u16, total_span: u16, total_cells: u16) -> u16 {
+    if total_span == 0 || total_cells <= 1 {
+        return total_cells.max(1);
+    }
+
+    let start = (u32::from(offset) * u32::from(total_cells)) / u32::from(total_span);
+    let end =
+        (u32::from(offset.saturating_add(span)) * u32::from(total_cells)) / u32::from(total_span);
+    end.saturating_sub(start).max(1) as u16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,6 +776,22 @@ mod tests {
         assert!(!original_frame.render_plan.active);
         assert!(new_frame.render_plan.active);
         assert_eq!(app.frame().pane_id, new_pane);
+        Ok(())
+    }
+
+    #[test]
+    fn resizing_active_split_updates_pane_terminal_sizes() -> Result<(), Box<dyn StdError>> {
+        let mut app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4))?;
+        let root = app.active_pane_id().expect("root pane should exist");
+        let split = app.split_active_pane_shell()?;
+
+        assert_eq!(app.frame_for_pane(root)?.terminal_size, PtySize::new(6, 4));
+        assert_eq!(app.frame_for_pane(split)?.terminal_size, PtySize::new(6, 4));
+
+        app.resize_active_split(FocusDirection::Left, 10)?;
+
+        assert_eq!(app.frame_for_pane(root)?.terminal_size, PtySize::new(4, 4));
+        assert_eq!(app.frame_for_pane(split)?.terminal_size, PtySize::new(8, 4));
         Ok(())
     }
 
@@ -861,6 +968,41 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn swapping_active_pane_preserves_focus_and_moves_its_rect() -> Result<(), Box<dyn StdError>> {
+        let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
+        let split = app.split_active_pane_shell()?;
+
+        assert_eq!(app.active_pane_id(), Some(split));
+        app.swap_active_pane(FocusDirection::Left)?;
+
+        assert_eq!(app.active_pane_id(), Some(split));
+        assert_eq!(
+            app.frame_for_pane(split)?.surface,
+            LayoutRect::new(0, 0, 60, 40)
+        );
+        assert_eq!(
+            app.frame_for_pane(PaneId::new(1))?.surface,
+            LayoutRect::new(60, 0, 60, 40)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn closing_active_pane_focuses_the_survivor() -> Result<(), Box<dyn StdError>> {
+        let mut app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4))?;
+        let split = app.split_active_pane_shell()?;
+
+        let (survivor, status) = app.close_active_pane()?;
+
+        assert_eq!(survivor, PaneId::new(1));
+        assert_eq!(app.active_pane_id(), Some(PaneId::new(1)));
+        assert_eq!(app.pane_count(), 1);
+        assert!(app.pane_by_id(split).is_none());
+        assert!(status.is_some());
+        Ok(())
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn ctrl_d_writes_eot_byte_to_foreground_process() -> Result<(), Box<dyn StdError>> {
@@ -883,6 +1025,49 @@ mod tests {
             status.is_some(),
             "foreground process should exit after one byte"
         );
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn pane_resize_reaches_each_shell_session() -> Result<(), Box<dyn StdError>> {
+        let mut app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4))?;
+        let root = app.active_pane_id().expect("root pane should exist");
+        let split = app.split_active_pane_shell()?;
+        app.resize_active_split(FocusDirection::Left, 10)?;
+
+        app.pane_mut_by_id(root)
+            .ok_or(AppError::PaneNotFound(root))?
+            .write_input(b"printf 'ROOT\\n'; stty size; exit\r")?;
+        app.pane_mut_by_id(split)
+            .ok_or(AppError::PaneNotFound(split))?
+            .write_input(b"printf 'SPLIT\\n'; stty size; exit\r")?;
+
+        let root_output = read_all_runtime_output_for_pane(&mut app, root)?;
+        let split_output = read_all_runtime_output_for_pane(&mut app, split)?;
+        let root_text = String::from_utf8_lossy(&root_output);
+        let split_text = String::from_utf8_lossy(&split_output);
+
+        assert!(root_text.contains("ROOT"));
+        assert!(
+            root_text.contains("4 4"),
+            "unexpected root size output: {root_text:?}"
+        );
+        assert!(split_text.contains("SPLIT"));
+        assert!(
+            split_text.contains("4 8"),
+            "unexpected split size output: {split_text:?}"
+        );
+        let root_status = app
+            .pane_mut_by_id(root)
+            .ok_or(AppError::PaneNotFound(root))?
+            .close_runtime()?;
+        let split_status = app
+            .pane_mut_by_id(split)
+            .ok_or(AppError::PaneNotFound(split))?
+            .close_runtime()?;
+        assert!(root_status.is_some());
+        assert!(split_status.is_some());
         Ok(())
     }
 

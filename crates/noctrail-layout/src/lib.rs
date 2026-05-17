@@ -309,6 +309,84 @@ impl LayoutNode {
             }
         }
     }
+
+    fn swap_leaves(&mut self, left: PaneId, right: PaneId) -> usize {
+        match self {
+            Self::Leaf { pane_id } if *pane_id == left => {
+                *pane_id = right;
+                1
+            }
+            Self::Leaf { pane_id } if *pane_id == right => {
+                *pane_id = left;
+                1
+            }
+            Self::Leaf { .. } => 0,
+            Self::Split { first, second, .. } => {
+                first.swap_leaves(left, right) + second.swap_leaves(left, right)
+            }
+        }
+    }
+
+    fn resize_for_pane(
+        &mut self,
+        target: PaneId,
+        direction: FocusDirection,
+        delta: u16,
+        rect: LayoutRect,
+    ) -> bool {
+        match self {
+            Self::Leaf { .. } => false,
+            Self::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => {
+                let (first_rect, second_rect) = match axis {
+                    SplitAxis::Vertical => {
+                        let split = split_dimension(rect.width, *ratio);
+                        rect.split_vertical(split)
+                    }
+                    SplitAxis::Horizontal => {
+                        let split = split_dimension(rect.height, *ratio);
+                        rect.split_horizontal(split)
+                    }
+                };
+
+                let first_contains = first.contains(target);
+                let second_contains = second.contains(target);
+                let ratio_delta = delta.min(98);
+
+                let adjusted = match (*axis, direction, first_contains, second_contains) {
+                    (SplitAxis::Vertical, FocusDirection::Left, true, false)
+                    | (SplitAxis::Vertical, FocusDirection::Right, false, true)
+                    | (SplitAxis::Horizontal, FocusDirection::Up, true, false)
+                    | (SplitAxis::Horizontal, FocusDirection::Down, false, true) => {
+                        *ratio = ratio.saturating_add(ratio_delta).min(99);
+                        true
+                    }
+                    (SplitAxis::Vertical, FocusDirection::Right, true, false)
+                    | (SplitAxis::Vertical, FocusDirection::Left, false, true)
+                    | (SplitAxis::Horizontal, FocusDirection::Down, true, false)
+                    | (SplitAxis::Horizontal, FocusDirection::Up, false, true) => {
+                        *ratio = ratio.saturating_sub(ratio_delta).max(1);
+                        true
+                    }
+                    _ => false,
+                };
+
+                if adjusted {
+                    return true;
+                }
+
+                if first.resize_for_pane(target, direction, delta, first_rect) {
+                    return true;
+                }
+
+                second.resize_for_pane(target, direction, delta, second_rect)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -387,25 +465,46 @@ impl LayoutTree {
         surface: LayoutRect,
     ) -> Result<PaneId, LayoutError> {
         let active = self.active.ok_or(LayoutError::Empty)?;
-        let layouts = self.arrange(surface);
-        let current = layouts
-            .iter()
-            .find(|layout| layout.pane_id == active)
-            .ok_or(LayoutError::PaneNotFound(active))?;
-
-        let next = layouts
-            .iter()
-            .filter(|layout| layout.pane_id != active)
-            .filter_map(|candidate| {
-                focus_candidate_score(current.rect, candidate.rect, direction)
-                    .map(|score| (score, candidate.pane_id))
-            })
-            .min_by_key(|(score, _)| *score)
-            .map(|(_, pane_id)| pane_id)
-            .unwrap_or(active);
+        let next = self.neighbor_in_direction(active, direction, surface)?;
 
         self.active = Some(next);
         Ok(next)
+    }
+
+    pub fn swap_active(
+        &mut self,
+        direction: FocusDirection,
+        surface: LayoutRect,
+    ) -> Result<PaneId, LayoutError> {
+        let active = self.active.ok_or(LayoutError::Empty)?;
+        let neighbor = self.neighbor_in_direction(active, direction, surface)?;
+        if neighbor == active {
+            return Ok(active);
+        }
+
+        let root = self.root.as_mut().ok_or(LayoutError::Empty)?;
+        let swapped = root.swap_leaves(active, neighbor);
+        if swapped != 2 {
+            return Err(LayoutError::PaneNotFound(neighbor));
+        }
+
+        self.active = Some(active);
+        Ok(active)
+    }
+
+    pub fn resize_active(
+        &mut self,
+        direction: FocusDirection,
+        delta: u16,
+        surface: LayoutRect,
+    ) -> Result<(), LayoutError> {
+        let active = self.active.ok_or(LayoutError::Empty)?;
+        let root = self.root.as_mut().ok_or(LayoutError::Empty)?;
+        if root.resize_for_pane(active, direction, delta, surface) {
+            Ok(())
+        } else {
+            Err(LayoutError::PaneNotFound(active))
+        }
     }
 
     pub fn arrange(&self, surface: LayoutRect) -> Vec<PaneLayout> {
@@ -479,6 +578,30 @@ impl LayoutTree {
         }
 
         Ok(self.active)
+    }
+
+    fn neighbor_in_direction(
+        &self,
+        active: PaneId,
+        direction: FocusDirection,
+        surface: LayoutRect,
+    ) -> Result<PaneId, LayoutError> {
+        let layouts = self.arrange(surface);
+        let current = layouts
+            .iter()
+            .find(|layout| layout.pane_id == active)
+            .ok_or(LayoutError::PaneNotFound(active))?;
+
+        Ok(layouts
+            .iter()
+            .filter(|layout| layout.pane_id != active)
+            .filter_map(|candidate| {
+                focus_candidate_score(current.rect, candidate.rect, direction)
+                    .map(|score| (score, candidate.pane_id))
+            })
+            .min_by_key(|(score, _)| *score)
+            .map(|(_, pane_id)| pane_id)
+            .unwrap_or(active))
     }
 }
 
@@ -732,6 +855,37 @@ mod tests {
             PaneId::new(1)
         );
         assert_eq!(tree.active_pane(), Some(PaneId::new(1)));
+    }
+
+    #[test]
+    fn resizing_active_split_changes_neighbor_rects() {
+        let mut tree = LayoutTree::new(PaneId::new(1));
+        let surface = LayoutRect::new(0, 0, 120, 40);
+        tree.split_active(PaneId::new(2), surface)
+            .expect("split should succeed");
+
+        tree.resize_active(FocusDirection::Left, 10, surface)
+            .expect("resize should succeed");
+
+        let layouts = map_layouts(tree.arrange(surface));
+        assert_eq!(layouts[&PaneId::new(1)], LayoutRect::new(0, 0, 48, 40));
+        assert_eq!(layouts[&PaneId::new(2)], LayoutRect::new(48, 0, 72, 40));
+    }
+
+    #[test]
+    fn swapping_active_pane_changes_leaf_positions() {
+        let mut tree = LayoutTree::new(PaneId::new(1));
+        let surface = LayoutRect::new(0, 0, 120, 40);
+        tree.split_active(PaneId::new(2), surface)
+            .expect("split should succeed");
+
+        tree.swap_active(FocusDirection::Left, surface)
+            .expect("swap should succeed");
+
+        let layouts = map_layouts(tree.arrange(surface));
+        assert_eq!(tree.active_pane(), Some(PaneId::new(2)));
+        assert_eq!(layouts[&PaneId::new(2)], LayoutRect::new(0, 0, 60, 40));
+        assert_eq!(layouts[&PaneId::new(1)], LayoutRect::new(60, 0, 60, 40));
     }
 
     #[test]
