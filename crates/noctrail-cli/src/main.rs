@@ -4,6 +4,7 @@ use std::{env, path::PathBuf, process};
 use noctrail_pty::ShellSource;
 use noctrail_pty::{PtySession, PtySize, ResolvedShell};
 use noctrail_render::{RenderBackend, RenderPlan, RenderRect};
+use noctrail_runtime::{PaneId, PaneRuntimeRegistry};
 use noctrail_term::recording::replay_recording_file;
 use noctrail_term::{Cell, Color, Cursor, ScreenRowSnapshot, Style, TerminalSnapshot};
 
@@ -229,7 +230,14 @@ fn run_render_smoke() -> Result<(), String> {
 }
 
 fn run_pty_smoke() -> Result<(), String> {
-    let probe = pty_smoke_probe()?;
+    run_single_shell_pty_smoke()?;
+    run_runtime_registry_pty_smoke()?;
+    println!("pty smoke ok");
+    Ok(())
+}
+
+fn run_single_shell_pty_smoke() -> Result<(), String> {
+    let probe = pty_smoke_probe("NOCTRAIL_PTY_SMOKE")?;
     let mut session = PtySession::spawn_shell(PtySize::new(80, 24))
         .map_err(|error| format!("failed to spawn PTY shell: {error}"))?;
     session
@@ -250,16 +258,16 @@ fn run_pty_smoke() -> Result<(), String> {
         }
     }
 
-    println!("pty smoke ok");
     Ok(())
 }
 
 struct PtySmokeProbe {
+    marker: String,
     input: Vec<u8>,
     expected_fragments: Vec<String>,
 }
 
-fn pty_smoke_probe() -> Result<PtySmokeProbe, String> {
+fn pty_smoke_probe(marker: &str) -> Result<PtySmokeProbe, String> {
     let cwd = env::current_dir()
         .map_err(|error| format!("failed to resolve current working directory: {error}"))?;
 
@@ -270,25 +278,31 @@ fn pty_smoke_probe() -> Result<PtySmokeProbe, String> {
 
         match shell.source() {
             ShellSource::PathPwsh | ShellSource::PathPowerShell => Ok(PtySmokeProbe {
-                input: b"Write-Output 'NOCTRAIL_PTY_SMOKE'; (Get-Location).Path; Write-Output \"$($Host.UI.RawUI.WindowSize.Height) $($Host.UI.RawUI.WindowSize.Width)\"; exit\r".to_vec(),
+                marker: marker.to_string(),
+                input: format!(
+                    "Write-Output '{marker}'; (Get-Location).Path; Write-Output \"$($Host.UI.RawUI.WindowSize.Height) $($Host.UI.RawUI.WindowSize.Width)\"; exit\r"
+                )
+                .into_bytes(),
                 expected_fragments: vec![
-                    "NOCTRAIL_PTY_SMOKE".to_string(),
+                    marker.to_string(),
                     cwd,
                     "24 80".to_string(),
                 ],
             }),
             ShellSource::PathWsl => Ok(PtySmokeProbe {
-                input: b"printf 'NOCTRAIL_PTY_SMOKE\n'; pwd; stty size; exit\r".to_vec(),
+                marker: marker.to_string(),
+                input: format!("printf '{marker}\\n'; pwd; stty size; exit\r").into_bytes(),
                 expected_fragments: vec![
-                    "NOCTRAIL_PTY_SMOKE".to_string(),
+                    marker.to_string(),
                     cwd,
                     "24 80".to_string(),
                 ],
             }),
             ShellSource::EnvComSpec | ShellSource::FallbackCmd => Ok(PtySmokeProbe {
-                input: b"echo NOCTRAIL_PTY_SMOKE\r\ncd\r\nmode con\r\nexit\r\n".to_vec(),
+                marker: marker.to_string(),
+                input: format!("echo {marker}\r\ncd\r\nmode con\r\nexit\r\n").into_bytes(),
                 expected_fragments: vec![
-                    "NOCTRAIL_PTY_SMOKE".to_string(),
+                    marker.to_string(),
                     cwd,
                     "Columns:".to_string(),
                     "Lines:".to_string(),
@@ -303,14 +317,65 @@ fn pty_smoke_probe() -> Result<PtySmokeProbe, String> {
     #[cfg(not(windows))]
     {
         Ok(PtySmokeProbe {
-            input: b"printf 'NOCTRAIL_PTY_SMOKE\n'; pwd; stty size; exit\r".to_vec(),
+            marker: marker.to_string(),
+            input: format!("printf '{marker}\\n'; pwd; stty size; exit\r").into_bytes(),
             expected_fragments: vec![
-                "NOCTRAIL_PTY_SMOKE".to_string(),
+                marker.to_string(),
                 cwd.display().to_string(),
                 "24 80".to_string(),
             ],
         })
     }
+}
+
+fn run_runtime_registry_pty_smoke() -> Result<(), String> {
+    let markers = [
+        "NOCTRAIL_PTY_SMOKE_1",
+        "NOCTRAIL_PTY_SMOKE_2",
+        "NOCTRAIL_PTY_SMOKE_3",
+        "NOCTRAIL_PTY_SMOKE_4",
+    ];
+    let mut registry = PaneRuntimeRegistry::new();
+    let mut panes = Vec::new();
+
+    for marker in markers {
+        let pane_id = registry
+            .spawn_shell(PtySize::new(80, 24))
+            .map_err(|error| format!("failed to spawn runtime pane {marker}: {error}"))?;
+        let probe = pty_smoke_probe(marker)?;
+        registry
+            .write_input(pane_id, &probe.input)
+            .map_err(|error| format!("failed to write runtime pane {pane_id:?}: {error}"))?;
+        panes.push((pane_id, probe));
+    }
+
+    for (pane_id, probe) in panes {
+        let output = read_all_runtime_output(&mut registry, pane_id)
+            .map_err(|error| format!("failed to read runtime pane {pane_id:?}: {error}"))?;
+        let haystack = String::from_utf8_lossy(&output);
+
+        for expected in &probe.expected_fragments {
+            if !haystack.contains(expected) {
+                return Err(format!(
+                    "runtime pane {pane_id:?} output missing {:?}; output was {:?}",
+                    expected, haystack
+                ));
+            }
+        }
+
+        for marker in markers {
+            if marker != probe.marker && haystack.contains(marker) {
+                return Err(format!(
+                    "runtime pane {pane_id:?} leaked marker {:?}; output was {:?}",
+                    marker, haystack
+                ));
+            }
+        }
+
+        let _ = registry.close(pane_id);
+    }
+
+    Ok(())
 }
 
 fn read_all_output(session: &mut PtySession) -> Result<Vec<u8>, noctrail_pty::PtyError> {
@@ -319,6 +384,24 @@ fn read_all_output(session: &mut PtySession) -> Result<Vec<u8>, noctrail_pty::Pt
 
     loop {
         let count = session.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        output.extend_from_slice(&chunk[..count]);
+    }
+
+    Ok(output)
+}
+
+fn read_all_runtime_output(
+    registry: &mut PaneRuntimeRegistry,
+    pane_id: PaneId,
+) -> Result<Vec<u8>, noctrail_runtime::RuntimeError> {
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 1024];
+
+    loop {
+        let count = registry.read_output(pane_id, &mut chunk)?;
         if count == 0 {
             break;
         }
@@ -346,7 +429,7 @@ mod tests {
 
     #[test]
     fn pty_smoke_probe_contains_sentinel() {
-        let probe = pty_smoke_probe().expect("pty smoke probe should build");
+        let probe = pty_smoke_probe("NOCTRAIL_PTY_SMOKE").expect("pty smoke probe should build");
         let script = String::from_utf8(probe.input).expect("probe input should be utf-8");
         assert!(script.contains("NOCTRAIL_PTY_SMOKE"));
     }

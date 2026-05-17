@@ -786,6 +786,7 @@ dependencies = [
  "glob",
  "noctrail-pty",
  "noctrail-render",
+ "noctrail-runtime",
  "noctrail-term",
 ]
 

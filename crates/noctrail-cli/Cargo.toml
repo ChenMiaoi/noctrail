@@ -16,4 +16,5 @@ path = "src/main.rs"
 glob = "0.3"
 noctrail-pty = { path = "../noctrail-pty" }
 noctrail-render = { path = "../noctrail-render" }
+noctrail-runtime = { path = "../noctrail-runtime" }
 noctrail-term = { path = "../noctrail-term" }
