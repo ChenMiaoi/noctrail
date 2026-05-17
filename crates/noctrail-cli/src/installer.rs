@@ -353,12 +353,32 @@ fn run_packaged_smoke(binary: &Path) -> Result<(), String> {
     if !binary.exists() {
         return Err(format!("missing packaged binary {}", binary.display()));
     }
+    #[cfg(target_os = "linux")]
+    if binary.extension() == Some(OsStr::new("AppImage")) {
+        return run_command_with_env(
+            binary,
+            &[OsStr::new("smoke")],
+            &[("APPIMAGE_EXTRACT_AND_RUN", OsStr::new("1"))],
+        );
+    }
     run_command(binary, &[OsStr::new("smoke")])
 }
 
 fn run_command(program: impl AsRef<OsStr>, args: &[&OsStr]) -> Result<(), String> {
-    let status = Command::new(&program)
-        .args(args)
+    run_command_with_env(program, args, &[])
+}
+
+fn run_command_with_env(
+    program: impl AsRef<OsStr>,
+    args: &[&OsStr],
+    envs: &[(&str, &OsStr)],
+) -> Result<(), String> {
+    let mut command = Command::new(&program);
+    command.args(args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let status = command
         .status()
         .map_err(|error| format!("run {:?}: {error}", program.as_ref()))?;
     if status.success() {

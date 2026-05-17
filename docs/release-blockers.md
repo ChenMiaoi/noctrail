@@ -15,8 +15,8 @@ while any item below remains `OPEN`.
 
 | ID | Priority | Area | Status | Evidence / Gap |
 |---|---|---|---|---|
-| BETA-001 | P0 | Installer coverage | OPEN | macOS installer smoke was verified locally with `./scripts/package-installer.sh`, but Linux and Windows installer lifecycle smoke have not yet been re-run on native hosts after the current packaging changes. |
-| BETA-002 | P0 | CI matrix | OPEN | `.github/workflows/ci.yml` runs the intended Windows/macOS/Linux matrix, but this branch does not yet have a fresh all-green three-platform run recorded after the latest config and diagnostics work. |
+| BETA-001 | P0 | Installer coverage | OPEN | macOS installer smoke has been re-verified locally, and `.github/workflows/installer-smoke.yml` now defines native Windows/macOS/Linux packaging smoke. The blocker remains open until Linux and Windows native runs complete green on GitHub Actions. |
+| BETA-002 | P0 | CI matrix | OPEN | `.github/workflows/ci.yml` and `.github/workflows/installer-smoke.yml` now define the intended three-platform build/test/package matrix, but this branch does not yet have a fresh all-green remote run recorded after the latest Phase 10 changes. |
 | BETA-003 | P0 | Single-pane shell stability | CLOSED | `cargo run -p noctrail-app -- smoke`; `cargo run -p noctrail-cli -- pty-smoke` |
 | BETA-004 | P0 | High-output responsiveness | CLOSED | `cargo run -p noctrail-app -- perf-smoke` reported `high_output_p95_ms=2.860` and `idle_premature_redraw=false` during the last recorded run. |
 | BETA-005 | P0 | Resize correctness | CLOSED | `cargo run -p noctrail-cli -- pty-smoke`; `cargo run -p noctrail-cli -- tui-matrix` |

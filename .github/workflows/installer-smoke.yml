@@ -1,0 +1,49 @@
+name: Installer Smoke
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    name: Installer (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux packaging dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev cpio rpm2cpio libarchive-tools
+
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked
+
+      - name: Install cargo-generate-rpm
+        if: runner.os == 'Linux'
+        run: cargo install cargo-generate-rpm --locked
+
+      - name: Run Unix installer smoke
+        if: runner.os != 'Windows'
+        run: ./scripts/package-installer.sh
+
+      - name: Run Windows installer smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/package-installer.ps1
