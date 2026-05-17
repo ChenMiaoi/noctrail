@@ -12,6 +12,7 @@ pub enum ShortcutAction {
     ToggleAgentContextPreview,
     ToggleBlockBrowser,
     ToggleCommandPalette,
+    ToggleReviewPanel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +61,7 @@ pub fn shortcut_action(logical_key: &Key, modifiers: ModifiersState) -> Option<S
                 "b" => Some(ShortcutAction::ToggleBlockBrowser),
                 "c" => Some(ShortcutAction::Copy),
                 "p" => Some(ShortcutAction::ToggleCommandPalette),
+                "r" => Some(ShortcutAction::ToggleReviewPanel),
                 "v" => Some(ShortcutAction::Paste),
                 _ => None,
             }
@@ -407,6 +409,13 @@ mod tests {
                 ModifiersState::CONTROL | ModifiersState::SHIFT,
             ),
             Some(ShortcutAction::ToggleCommandPalette)
+        );
+        assert_eq!(
+            shortcut_action(
+                &Key::Character("r".into()),
+                ModifiersState::CONTROL | ModifiersState::SHIFT,
+            ),
+            Some(ShortcutAction::ToggleReviewPanel)
         );
     }
 

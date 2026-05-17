@@ -145,6 +145,71 @@ struct CommandBlockObserver {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct AgentProposalState {
     proposals: Vec<CommandProposal>,
+    selected: Option<usize>,
+}
+
+impl AgentProposalState {
+    fn proposals(&self) -> &[CommandProposal] {
+        &self.proposals
+    }
+
+    fn selected_index(&self) -> Option<usize> {
+        self.selected
+    }
+
+    fn selected(&self) -> Option<&CommandProposal> {
+        self.selected.and_then(|index| self.proposals.get(index))
+    }
+
+    fn set_proposals(&mut self, proposals: Vec<CommandProposal>) {
+        self.proposals = proposals;
+        self.selected = (!self.proposals.is_empty()).then_some(0);
+    }
+
+    fn clear(&mut self) {
+        self.proposals.clear();
+        self.selected = None;
+    }
+
+    fn select_oldest(&mut self) -> Option<usize> {
+        self.selected = (!self.proposals.is_empty()).then_some(0);
+        self.selected
+    }
+
+    fn select_newest(&mut self) -> Option<usize> {
+        self.selected = self.proposals.len().checked_sub(1);
+        self.selected
+    }
+
+    fn select_previous(&mut self) -> Option<usize> {
+        let len = self.proposals.len();
+        if len == 0 {
+            self.selected = None;
+            return None;
+        }
+
+        let next = match self.selected {
+            Some(0) | None => len - 1,
+            Some(index) => index - 1,
+        };
+        self.selected = Some(next);
+        self.selected
+    }
+
+    fn select_next(&mut self) -> Option<usize> {
+        let len = self.proposals.len();
+        if len == 0 {
+            self.selected = None;
+            return None;
+        }
+
+        let next = match self.selected {
+            Some(index) => (index + 1) % len,
+            None => 0,
+        };
+        self.selected = Some(next);
+        self.selected
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,6 +405,8 @@ pub enum AppError {
     MissingRuntime,
     #[error("the desktop app does not have an active pane")]
     MissingActivePane,
+    #[error("the active pane does not have a selected agent proposal")]
+    MissingAgentProposal,
     #[error("cannot close the last remaining pane")]
     CannotCloseLastPane,
     #[error("pane {0:?} was not found")]
@@ -572,15 +639,47 @@ impl TerminalPane {
     }
 
     pub fn agent_command_proposals(&self) -> &[CommandProposal] {
-        &self.agent_proposals.proposals
+        self.agent_proposals.proposals()
+    }
+
+    pub fn selected_agent_command_proposal_index(&self) -> Option<usize> {
+        self.agent_proposals.selected_index()
+    }
+
+    pub fn selected_agent_command_proposal(&self) -> Option<&CommandProposal> {
+        self.agent_proposals.selected()
     }
 
     pub fn set_agent_command_proposals(&mut self, proposals: Vec<CommandProposal>) {
-        self.agent_proposals.proposals = proposals;
+        self.agent_proposals.set_proposals(proposals);
     }
 
     pub fn clear_agent_command_proposals(&mut self) {
-        self.agent_proposals.proposals.clear();
+        self.agent_proposals.clear();
+    }
+
+    pub fn select_oldest_agent_command_proposal(&mut self) -> Option<usize> {
+        self.agent_proposals.select_oldest()
+    }
+
+    pub fn select_newest_agent_command_proposal(&mut self) -> Option<usize> {
+        self.agent_proposals.select_newest()
+    }
+
+    pub fn select_previous_agent_command_proposal(&mut self) -> Option<usize> {
+        self.agent_proposals.select_previous()
+    }
+
+    pub fn select_next_agent_command_proposal(&mut self) -> Option<usize> {
+        self.agent_proposals.select_next()
+    }
+
+    pub fn submit_selected_agent_command_proposal(&mut self) -> Result<usize, AppError> {
+        let command = self
+            .selected_agent_command_proposal()
+            .map(|proposal| proposal.command.clone())
+            .ok_or(AppError::MissingAgentProposal)?;
+        self.write_input(proposal_submission_bytes(&command).as_slice())
     }
 
     pub fn advance_output(&mut self, bytes: &[u8]) {
@@ -1078,6 +1177,15 @@ impl DesktopApp {
         self.active_pane_ref().agent_command_proposals()
     }
 
+    pub fn selected_agent_command_proposal_index(&self) -> Option<usize> {
+        self.active_pane_ref()
+            .selected_agent_command_proposal_index()
+    }
+
+    pub fn selected_agent_command_proposal(&self) -> Option<&CommandProposal> {
+        self.active_pane_ref().selected_agent_command_proposal()
+    }
+
     pub fn set_agent_command_proposals(&mut self, proposals: Vec<CommandProposal>) {
         self.active_pane_mut()
             .set_agent_command_proposals(proposals);
@@ -1085,6 +1193,30 @@ impl DesktopApp {
 
     pub fn clear_agent_command_proposals(&mut self) {
         self.active_pane_mut().clear_agent_command_proposals();
+    }
+
+    pub fn select_oldest_agent_command_proposal(&mut self) -> Option<usize> {
+        self.active_pane_mut()
+            .select_oldest_agent_command_proposal()
+    }
+
+    pub fn select_newest_agent_command_proposal(&mut self) -> Option<usize> {
+        self.active_pane_mut()
+            .select_newest_agent_command_proposal()
+    }
+
+    pub fn select_previous_agent_command_proposal(&mut self) -> Option<usize> {
+        self.active_pane_mut()
+            .select_previous_agent_command_proposal()
+    }
+
+    pub fn select_next_agent_command_proposal(&mut self) -> Option<usize> {
+        self.active_pane_mut().select_next_agent_command_proposal()
+    }
+
+    pub fn submit_selected_agent_command_proposal(&mut self) -> Result<usize, AppError> {
+        self.active_pane_mut()
+            .submit_selected_agent_command_proposal()
     }
 
     pub fn mouse_tracking_mode(&self) -> MouseTrackingMode {
@@ -1847,6 +1979,12 @@ fn inset_layout_rect(rect: LayoutRect, insets: EdgeInsets) -> LayoutRect {
         width,
         height,
     )
+}
+
+fn proposal_submission_bytes(command: &str) -> Vec<u8> {
+    let mut bytes = command.as_bytes().to_vec();
+    bytes.push(b'\r');
+    bytes
 }
 
 #[cfg(test)]

@@ -34,6 +34,7 @@ Commands:
   agent-context-smoke Run the read-only agent context preview probe
   agent-default-smoke Run the default-off agent policy probe
   agent-proposal-smoke Run the command proposal suggestion probe
+  agent-review-smoke Run the review panel confirmation probe
   agent-provider-smoke Run the provider failure isolation probe
   block-smoke Run the block browser/history probe
   crash-smoke Run the panic-hook recovery probe
@@ -64,6 +65,7 @@ enum StartupCommand {
     AgentContextSmoke,
     AgentDefaultSmoke,
     AgentProposalSmoke,
+    AgentReviewSmoke,
     AgentProviderSmoke,
     BlockSmoke,
     CrashSmoke,
@@ -140,6 +142,12 @@ fn main() {
         }
         StartupCommand::AgentProposalSmoke => {
             if let Err(error) = run_agent_proposal_smoke() {
+                eprintln!("{error}");
+                process::exit(1);
+            }
+        }
+        StartupCommand::AgentReviewSmoke => {
+            if let Err(error) = gui::review_panel_smoke() {
                 eprintln!("{error}");
                 process::exit(1);
             }
@@ -226,6 +234,10 @@ fn parse_startup_options(args: &[String]) -> Result<StartupOptions, StartupError
             }
             "agent-proposal-smoke" if !command_set => {
                 command = StartupCommand::AgentProposalSmoke;
+                command_set = true;
+            }
+            "agent-review-smoke" if !command_set => {
+                command = StartupCommand::AgentReviewSmoke;
                 command_set = true;
             }
             "agent-provider-smoke" if !command_set => {
@@ -1805,6 +1817,16 @@ mod tests {
             .expect("options should parse");
 
         assert_eq!(options.command, StartupCommand::AgentProposalSmoke);
+        assert_eq!(options.config_path, None);
+        assert!(!options.safe_mode);
+    }
+
+    #[test]
+    fn parses_agent_review_smoke_command() {
+        let options = parse_startup_options(&["agent-review-smoke".to_string()])
+            .expect("options should parse");
+
+        assert_eq!(options.command, StartupCommand::AgentReviewSmoke);
         assert_eq!(options.config_path, None);
         assert!(!options.safe_mode);
     }

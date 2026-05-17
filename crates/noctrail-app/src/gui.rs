@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use noctrail_agent::CommandRisk;
 use noctrail_config::{AgentConfig, ConfigReloader, FontConfig, ThemeConfig};
 use noctrail_layout::{FocusDirection, LayoutRect, SplitAxis, WorkspaceId};
 use noctrail_pty::{PtyOutputReader, PtySize};
@@ -99,6 +100,63 @@ pub fn idle_schedule_probe(theme: &ThemeConfig) -> IdleScheduleProbe {
         premature_redraw: gui.advance_cursor_blink(now + gui.frame_interval / 2),
         next_wakeup: gui.next_cursor_blink_at.saturating_duration_since(now),
     }
+}
+
+pub fn review_panel_smoke() -> Result<(), Box<dyn Error>> {
+    let app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24))?;
+    let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
+    let high_marker =
+        std::env::temp_dir().join(format!("noctrail-review-high-{}", std::process::id()));
+    let _ = std::fs::remove_file(&high_marker);
+
+    gui.app
+        .set_agent_command_proposals(vec![noctrail_agent::CommandProposal {
+            command: review_output_command("NOCTRAIL_REVIEW_LOW"),
+            reason: "Inspect the shell before changing files.".to_string(),
+            risk: CommandRisk::Low,
+            permission: noctrail_agent::CommandPermission::Review,
+        }]);
+    gui.toggle_review_panel();
+    let _ = gui.confirm_review_selection()?;
+
+    gui.app
+        .set_agent_command_proposals(vec![noctrail_agent::CommandProposal {
+            command: review_file_command(&high_marker),
+            reason: "Delete or rewrite shell-visible state.".to_string(),
+            risk: CommandRisk::High,
+            permission: noctrail_agent::CommandPermission::StrongReview,
+        }]);
+    gui.toggle_review_panel();
+    let _ = gui.confirm_review_selection()?;
+    if high_marker.exists() {
+        let _ = std::fs::remove_file(&high_marker);
+        return Err("high-risk proposal executed before strong confirmation".into());
+    }
+    let _ = gui.confirm_review_with_text("y")?;
+
+    gui.app.write_input(
+        shell_submission_bytes(&review_output_command("NOCTRAIL_REVIEW_DONE")).as_slice(),
+    )?;
+    gui.app.write_input(shell_exit_bytes().as_slice())?;
+    std::thread::sleep(Duration::from_millis(100));
+    let output = read_all_runtime_output_for_gui(&mut gui.app)?;
+    let _ = gui.app.close_runtime()?;
+
+    let text = String::from_utf8_lossy(&output);
+    if !text.contains("NOCTRAIL_REVIEW_LOW") {
+        return Err("low-risk review confirmation did not reach the shell".into());
+    }
+    if !text.contains("NOCTRAIL_REVIEW_DONE") {
+        return Err("review smoke did not preserve shell output after execution".into());
+    }
+    if !high_marker.exists() {
+        return Err("high-risk review confirmation did not execute after strong confirm".into());
+    }
+    let _ = std::fs::remove_file(&high_marker);
+
+    println!("low=review high=strong-review shell=ok");
+    println!("agent review smoke ok");
+    Ok(())
 }
 
 pub fn run_with_options(options: GuiLaunchOptions) -> Result<(), Box<dyn Error>> {
@@ -436,6 +494,11 @@ struct BlockBrowser;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct AgentContextBrowser;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ReviewPanel {
+    strong_confirm_index: Option<usize>,
+}
+
 struct GuiApp {
     app: DesktopApp,
     launch_options: GuiLaunchOptions,
@@ -449,6 +512,7 @@ struct GuiApp {
     font_preferences: FontPreferences,
     ime_preedit: Option<String>,
     agent_context_browser: Option<AgentContextBrowser>,
+    review_panel: Option<ReviewPanel>,
     block_browser: Option<BlockBrowser>,
     command_palette: Option<CommandPalette>,
     mouse_position: Option<PhysicalPosition<f64>>,
@@ -489,6 +553,7 @@ impl GuiApp {
             font_preferences: font_preferences_from_config(&font),
             ime_preedit: None,
             agent_context_browser: None,
+            review_panel: None,
             block_browser: None,
             command_palette: None,
             mouse_position: None,
@@ -918,6 +983,37 @@ impl GuiApp {
             title.push_str(" | reason ");
             title.push_str(&preview_text(&proposal.reason, 32));
         }
+        if let Some(review_panel) = self.review_panel.as_ref() {
+            title.push_str(" | review");
+            if let Some(index) = self.app.selected_agent_command_proposal_index() {
+                title.push_str(" sel ");
+                title.push_str(&(index + 1).to_string());
+            }
+            if let Some(proposal) = self.app.selected_agent_command_proposal() {
+                title.push_str(" | risk ");
+                title.push_str(proposal.risk.label());
+                title.push_str(" | permission ");
+                title.push_str(proposal.permission.label());
+                title.push_str(" | cmd ");
+                title.push_str(&preview_text(&proposal.command, 32));
+                title.push_str(" | reason ");
+                title.push_str(&preview_text(&proposal.reason, 32));
+                match proposal.risk {
+                    CommandRisk::High | CommandRisk::Critical => {
+                        if review_panel.strong_confirm_index
+                            == self.app.selected_agent_command_proposal_index()
+                        {
+                            title.push_str(" | confirm y");
+                        } else {
+                            title.push_str(" | press enter to arm");
+                        }
+                    }
+                    CommandRisk::Low | CommandRisk::Medium => {
+                        title.push_str(" | press enter to execute");
+                    }
+                }
+            }
+        }
         if let Some(palette) = self.command_palette.as_ref() {
             title.push_str(" | palette ");
             if palette.query.is_empty() {
@@ -1283,6 +1379,20 @@ impl GuiApp {
         self.request_redraw();
     }
 
+    fn toggle_review_panel(&mut self) {
+        if self.review_panel.is_some() {
+            self.review_panel = None;
+        } else if !self.app.agent_command_proposals().is_empty() {
+            if self.app.selected_agent_command_proposal_index().is_none() {
+                let _ = self.app.select_oldest_agent_command_proposal();
+            }
+            self.review_panel = Some(ReviewPanel::default());
+        }
+        self.touch_cursor_blink();
+        self.update_title();
+        self.request_redraw();
+    }
+
     fn toggle_agent_context_preview(&mut self) {
         if self.agent_context_browser.is_some() {
             self.agent_context_browser = None;
@@ -1305,6 +1415,60 @@ impl GuiApp {
         self.touch_cursor_blink();
         self.update_title();
         self.request_redraw();
+    }
+
+    fn confirm_review_selection(&mut self) -> Result<bool, Box<dyn Error>> {
+        let Some(review_panel) = self.review_panel.as_mut() else {
+            return Ok(false);
+        };
+        let Some(index) = self.app.selected_agent_command_proposal_index() else {
+            return Ok(true);
+        };
+        let Some(proposal) = self.app.selected_agent_command_proposal() else {
+            return Ok(true);
+        };
+
+        match proposal.risk {
+            CommandRisk::High | CommandRisk::Critical => {
+                if review_panel.strong_confirm_index == Some(index) {
+                    self.app.submit_selected_agent_command_proposal()?;
+                    self.review_panel = None;
+                } else {
+                    review_panel.strong_confirm_index = Some(index);
+                }
+            }
+            CommandRisk::Low | CommandRisk::Medium => {
+                self.app.submit_selected_agent_command_proposal()?;
+                self.review_panel = None;
+            }
+        }
+
+        self.touch_cursor_blink();
+        self.update_title();
+        self.request_redraw();
+        Ok(true)
+    }
+
+    fn confirm_review_with_text(&mut self, text: &str) -> Result<bool, Box<dyn Error>> {
+        let Some(review_panel) = self.review_panel.as_mut() else {
+            return Ok(false);
+        };
+        let Some(index) = self.app.selected_agent_command_proposal_index() else {
+            return Ok(true);
+        };
+        if review_panel.strong_confirm_index != Some(index) {
+            return Ok(true);
+        }
+
+        if text.eq_ignore_ascii_case("y") {
+            self.app.submit_selected_agent_command_proposal()?;
+            self.review_panel = None;
+        }
+
+        self.touch_cursor_blink();
+        self.update_title();
+        self.request_redraw();
+        Ok(true)
     }
 
     fn handle_command_palette_key(
@@ -1354,6 +1518,70 @@ impl GuiApp {
                 if let Some(text) = event.text.as_deref() {
                     palette.push_query_text(text);
                 }
+            }
+            _ => {}
+        }
+
+        self.touch_cursor_blink();
+        self.update_title();
+        self.request_redraw();
+        Ok(true)
+    }
+
+    fn handle_review_panel_key(
+        &mut self,
+        event: &winit::event::KeyEvent,
+    ) -> Result<bool, Box<dyn Error>> {
+        if self.review_panel.is_none() {
+            return Ok(false);
+        }
+        if !event.state.is_pressed() {
+            return Ok(true);
+        }
+
+        match event.logical_key.as_ref() {
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape) => {
+                self.review_panel = None;
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp) => {
+                let _ = self.app.select_previous_agent_command_proposal();
+                if let Some(review_panel) = self.review_panel.as_mut() {
+                    review_panel.strong_confirm_index = None;
+                }
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowDown)
+            | winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab) => {
+                let _ = self.app.select_next_agent_command_proposal();
+                if let Some(review_panel) = self.review_panel.as_mut() {
+                    review_panel.strong_confirm_index = None;
+                }
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Home) => {
+                let _ = self.app.select_oldest_agent_command_proposal();
+                if let Some(review_panel) = self.review_panel.as_mut() {
+                    review_panel.strong_confirm_index = None;
+                }
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::End) => {
+                let _ = self.app.select_newest_agent_command_proposal();
+                if let Some(review_panel) = self.review_panel.as_mut() {
+                    review_panel.strong_confirm_index = None;
+                }
+            }
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter) => {
+                return self.confirm_review_selection();
+            }
+            _ if !self.modifiers.control_key()
+                && !self.modifiers.alt_key()
+                && !self.modifiers.super_key() =>
+            {
+                let Some(text) = event.text.as_deref() else {
+                    self.touch_cursor_blink();
+                    self.update_title();
+                    self.request_redraw();
+                    return Ok(true);
+                };
+                return self.confirm_review_with_text(text);
             }
             _ => {}
         }
@@ -1483,6 +1711,59 @@ fn preview_paths(paths: &[PathBuf], max_chars: usize) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     preview_text(&joined, max_chars)
+}
+
+fn shell_submission_bytes(command: &str) -> Vec<u8> {
+    let mut bytes = command.as_bytes().to_vec();
+    bytes.push(b'\r');
+    bytes
+}
+
+fn shell_exit_bytes() -> Vec<u8> {
+    b"exit\r\n".to_vec()
+}
+
+fn review_output_command(marker: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("echo {marker}")
+    }
+
+    #[cfg(not(windows))]
+    {
+        format!("printf '{marker}\\n'")
+    }
+}
+
+fn review_file_command(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        format!("cmd /C echo review-high>\"{}\"", path.display())
+    }
+
+    #[cfg(not(windows))]
+    {
+        format!("sh -lc 'printf review-high > \"{}\"'", path.display())
+    }
+}
+
+fn read_all_runtime_output_for_gui(app: &mut DesktopApp) -> Result<Vec<u8>, Box<dyn Error>> {
+    let runtime = app
+        .pane_mut()
+        .runtime_mut()
+        .ok_or("active pane is missing a runtime")?;
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 1024];
+
+    loop {
+        let count = runtime.read_output(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        output.extend_from_slice(&chunk[..count]);
+    }
+
+    Ok(output)
 }
 
 fn pane_chrome_from_theme(theme: &ThemeConfig) -> PaneChromeConfig {
@@ -1637,10 +1918,25 @@ impl ApplicationHandler for GuiApp {
                 }
                 if matches!(
                     input::shortcut_action(&event.logical_key, self.modifiers),
+                    Some(input::ShortcutAction::ToggleReviewPanel)
+                ) {
+                    self.toggle_review_panel();
+                    return;
+                }
+                if matches!(
+                    input::shortcut_action(&event.logical_key, self.modifiers),
                     Some(input::ShortcutAction::ToggleCommandPalette)
                 ) {
                     self.toggle_command_palette();
                     return;
+                }
+                match self.handle_review_panel_key(&event) {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(_) => {
+                        event_loop.exit();
+                        return;
+                    }
                 }
                 match self.handle_block_browser_key(&event) {
                     Ok(true) => return,
@@ -1663,6 +1959,7 @@ impl ApplicationHandler for GuiApp {
                         input::ShortcutAction::ToggleAgentContextPreview => unreachable!(),
                         input::ShortcutAction::ToggleBlockBrowser => unreachable!(),
                         input::ShortcutAction::ToggleCommandPalette => unreachable!(),
+                        input::ShortcutAction::ToggleReviewPanel => unreachable!(),
                         input::ShortcutAction::Copy => {
                             if let Some(text) = self.app.copy_selection_text() {
                                 self.clipboard.set_text(text);
@@ -2180,6 +2477,35 @@ mod tests {
     }
 
     #[test]
+    fn review_panel_title_reflects_selected_proposal_and_arm_state() -> Result<(), Box<dyn Error>> {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
+        gui.app
+            .set_agent_command_proposals(vec![noctrail_agent::CommandProposal {
+                command: "rm -rf build".to_string(),
+                reason: "Remove an inconsistent build directory.".to_string(),
+                risk: noctrail_agent::CommandRisk::High,
+                permission: noctrail_agent::CommandPermission::StrongReview,
+            }]);
+
+        gui.toggle_review_panel();
+        let before = gui.title_text();
+        assert!(before.contains("review"));
+        assert!(before.contains("press enter to arm"));
+
+        let _ = gui.confirm_review_selection()?;
+        let armed = gui.title_text();
+        assert!(armed.contains("confirm y"));
+        assert_eq!(
+            gui.review_panel
+                .as_ref()
+                .and_then(|panel| panel.strong_confirm_index),
+            Some(0)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn block_browser_title_reflects_preview_and_fold_state() {
         let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
         let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
@@ -2546,6 +2872,55 @@ mod tests {
             observed,
             "output pump did not feed shell output into render plan"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn review_panel_requires_strong_confirmation_for_high_risk_commands()
+    -> Result<(), Box<dyn Error>> {
+        let app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24))?;
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
+        let high_marker =
+            std::env::temp_dir().join(format!("noctrail-review-panel-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&high_marker);
+
+        gui.app.set_agent_command_proposals(vec![
+            noctrail_agent::CommandProposal {
+                command: review_output_command("NOCTRAIL_REVIEW_LOW_TEST"),
+                reason: "Inspect the shell before changing files.".to_string(),
+                risk: noctrail_agent::CommandRisk::Low,
+                permission: noctrail_agent::CommandPermission::Review,
+            },
+            noctrail_agent::CommandProposal {
+                command: review_file_command(&high_marker),
+                reason: "Rewrite shell-visible state.".to_string(),
+                risk: noctrail_agent::CommandRisk::High,
+                permission: noctrail_agent::CommandPermission::StrongReview,
+            },
+        ]);
+
+        gui.toggle_review_panel();
+        let _ = gui.confirm_review_selection()?;
+        let _ = gui.app.select_next_agent_command_proposal();
+        gui.toggle_review_panel();
+        let _ = gui.confirm_review_selection()?;
+        assert!(gui.review_panel.is_some());
+        assert!(!high_marker.exists());
+
+        let _ = gui.confirm_review_with_text("y")?;
+        gui.app.write_input(
+            shell_submission_bytes(&review_output_command("NOCTRAIL_REVIEW_DONE_TEST")).as_slice(),
+        )?;
+        gui.app.write_input(shell_exit_bytes().as_slice())?;
+        std::thread::sleep(Duration::from_millis(100));
+        let output = read_all_runtime_output_for_gui(&mut gui.app)?;
+        let _ = gui.app.close_runtime()?;
+
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("NOCTRAIL_REVIEW_LOW_TEST"));
+        assert!(text.contains("NOCTRAIL_REVIEW_DONE_TEST"));
+        assert!(high_marker.exists());
+        let _ = std::fs::remove_file(high_marker);
         Ok(())
     }
 
