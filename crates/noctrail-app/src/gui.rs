@@ -30,6 +30,14 @@ const DEFAULT_CELL_WIDTH: u32 = 8;
 const DEFAULT_CELL_HEIGHT: u32 = 16;
 const PALETTE_RESIZE_DELTA: u16 = 5;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TransparencyPolicy {
+    requested_opacity: f32,
+    effective_opacity: f32,
+    window_transparent: bool,
+    fallback_reason: Option<&'static str>,
+}
+
 pub fn run() -> Result<(), Box<dyn Error>> {
     run_with_options(GuiLaunchOptions::default())
 }
@@ -384,7 +392,45 @@ impl GuiApp {
         !self.launch_options.safe_mode && self.launch_options.renderer_backend == RenderBackend::Gpu
     }
 
+    fn transparency_policy(&self) -> TransparencyPolicy {
+        let requested_opacity = self.theme.opacity;
+        if requested_opacity >= 1.0 {
+            return TransparencyPolicy {
+                requested_opacity,
+                effective_opacity: 1.0,
+                window_transparent: false,
+                fallback_reason: None,
+            };
+        }
+
+        if self.launch_options.safe_mode {
+            return TransparencyPolicy {
+                requested_opacity,
+                effective_opacity: 1.0,
+                window_transparent: false,
+                fallback_reason: Some("safe-mode"),
+            };
+        }
+
+        if self.app.backend() != RenderBackend::Gpu {
+            return TransparencyPolicy {
+                requested_opacity,
+                effective_opacity: 1.0,
+                window_transparent: false,
+                fallback_reason: Some("software-backend"),
+            };
+        }
+
+        TransparencyPolicy {
+            requested_opacity,
+            effective_opacity: requested_opacity,
+            window_transparent: true,
+            fallback_reason: None,
+        }
+    }
+
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), Box<dyn Error>> {
+        let requested_transparency = self.theme.opacity < 1.0 && !self.launch_options.safe_mode;
         let attributes = Window::default_attributes()
             .with_title("Noctrail")
             .with_inner_size(LogicalSize::new(
@@ -392,7 +438,7 @@ impl GuiApp {
                 f64::from(DEFAULT_WINDOW_HEIGHT),
             ))
             .with_resizable(true)
-            .with_transparent(self.theme.opacity < 1.0);
+            .with_transparent(requested_transparency);
         let window = Arc::new(event_loop.create_window(attributes)?);
         let size = window.inner_size();
         self.sync_surface(size)?;
@@ -437,12 +483,17 @@ impl GuiApp {
     fn update_title(&self) {
         if let Some(window) = self.window.as_ref() {
             let mut title = frame_title(&self.app.frame(), self.cursor_visible);
+            let transparency = self.transparency_policy();
             title.push_str(" | font ");
             title.push_str(&self.font.family);
             title.push(' ');
             title.push_str(&format!("{:.1}", self.font.size));
             title.push_str(" | opacity ");
-            title.push_str(&format!("{:.2}", self.theme.opacity));
+            title.push_str(&format!("{:.2}", transparency.effective_opacity));
+            if let Some(reason) = transparency.fallback_reason {
+                title.push_str(" | transparency-fallback ");
+                title.push_str(reason);
+            }
             if let Some(error) = self.gpu_fallback_error.as_deref() {
                 title.push_str(" | gpu-fallback ");
                 title.push_str(error);
@@ -476,8 +527,9 @@ impl GuiApp {
     fn apply_theme_visuals(&mut self) {
         self.frame_interval = Duration::from_millis(self.theme.cursor.blink_interval_ms);
         self.app.invalidate_visuals();
+        let transparency = self.transparency_policy();
         if let Some(window) = self.window.as_ref() {
-            window.set_transparent(self.theme.opacity < 1.0);
+            window.set_transparent(transparency.window_transparent);
         }
         if let Some(renderer) = self.renderer.as_mut() {
             let background = self.theme.color.background;
@@ -485,7 +537,7 @@ impl GuiApp {
                 srgb_component(background.red),
                 srgb_component(background.green),
                 srgb_component(background.blue),
-                f64::from(self.theme.opacity) * background.alpha_factor(),
+                f64::from(transparency.effective_opacity) * background.alpha_factor(),
             );
         }
     }
@@ -1192,6 +1244,78 @@ mod tests {
         assert_eq!(gui.app.backend(), RenderBackend::Software);
         assert!(gui.renderer.is_none());
         assert_eq!(gui.gpu_fallback_error.as_deref(), Some("adapter missing"));
+    }
+
+    #[test]
+    fn transparency_policy_uses_requested_opacity_on_gpu() {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
+        let theme = ThemeConfig {
+            opacity: 0.72,
+            ..ThemeConfig::default()
+        };
+        let mut gui = GuiApp::new(
+            app,
+            GuiLaunchOptions {
+                renderer_backend: RenderBackend::Gpu,
+                theme,
+                ..GuiLaunchOptions::default()
+            },
+        );
+        gui.app.set_backend(RenderBackend::Gpu);
+
+        let transparency = gui.transparency_policy();
+
+        assert_eq!(transparency.requested_opacity, 0.72);
+        assert_eq!(transparency.effective_opacity, 0.72);
+        assert!(transparency.window_transparent);
+        assert_eq!(transparency.fallback_reason, None);
+    }
+
+    #[test]
+    fn transparency_policy_falls_back_in_safe_mode() {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
+        let theme = ThemeConfig {
+            opacity: 0.72,
+            ..ThemeConfig::default()
+        };
+        let gui = GuiApp::new(
+            app,
+            GuiLaunchOptions {
+                safe_mode: true,
+                renderer_backend: RenderBackend::Gpu,
+                theme,
+                ..GuiLaunchOptions::default()
+            },
+        );
+
+        let transparency = gui.transparency_policy();
+
+        assert_eq!(transparency.effective_opacity, 1.0);
+        assert!(!transparency.window_transparent);
+        assert_eq!(transparency.fallback_reason, Some("safe-mode"));
+    }
+
+    #[test]
+    fn transparency_policy_falls_back_on_software_backend() {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
+        let theme = ThemeConfig {
+            opacity: 0.72,
+            ..ThemeConfig::default()
+        };
+        let gui = GuiApp::new(
+            app,
+            GuiLaunchOptions {
+                renderer_backend: RenderBackend::Software,
+                theme,
+                ..GuiLaunchOptions::default()
+            },
+        );
+
+        let transparency = gui.transparency_policy();
+
+        assert_eq!(transparency.effective_opacity, 1.0);
+        assert!(!transparency.window_transparent);
+        assert_eq!(transparency.fallback_reason, Some("software-backend"));
     }
 
     #[test]

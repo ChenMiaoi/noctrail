@@ -52,6 +52,13 @@ enum StartupError {
     Config(#[from] ConfigError),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TransparencyMode {
+    requested_opacity: f32,
+    effective_opacity: f32,
+    fallback_reason: Option<&'static str>,
+}
+
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
     let options = match parse_startup_options(&args) {
@@ -175,10 +182,11 @@ fn run_smoke(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>>
     let mut app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24))?;
     app.set_backend(launch_options.renderer_backend);
     app.set_pane_chrome(pane_chrome_from_theme(&launch_options.theme))?;
+    let transparency = transparency_mode(&launch_options);
 
     let frame = app.frame();
     println!(
-        "pane={:?} pid={:?} backend={:?} pane={}x{} content={}x{} terminal={}x{} rows={} font={} size={} opacity={}",
+        "pane={:?} pid={:?} backend={:?} pane={}x{} content={}x{} terminal={}x{} rows={} font={} size={} opacity={} requested_opacity={} transparency_fallback={}",
         frame.pane_id,
         frame.process_id,
         frame.render_plan.backend,
@@ -191,7 +199,9 @@ fn run_smoke(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>>
         frame.render_plan.rows.len(),
         launch_options.font.family,
         launch_options.font.size,
-        launch_options.theme.opacity,
+        transparency.effective_opacity,
+        transparency.requested_opacity,
+        transparency.fallback_reason.unwrap_or("none"),
     );
 
     app.write_input(shell_marker_command("NOCTRAIL_APP_SMOKE_WRITE").as_bytes())?;
@@ -250,6 +260,39 @@ fn rgba_from_config(color: noctrail_config::RgbaColor) -> Rgba {
         green: color.green,
         blue: color.blue,
         alpha: color.alpha,
+    }
+}
+
+fn transparency_mode(launch_options: &GuiLaunchOptions) -> TransparencyMode {
+    let requested_opacity = launch_options.theme.opacity;
+    if requested_opacity >= 1.0 {
+        return TransparencyMode {
+            requested_opacity,
+            effective_opacity: 1.0,
+            fallback_reason: None,
+        };
+    }
+
+    if launch_options.safe_mode {
+        return TransparencyMode {
+            requested_opacity,
+            effective_opacity: 1.0,
+            fallback_reason: Some("safe-mode"),
+        };
+    }
+
+    if launch_options.renderer_backend != RenderBackend::Gpu {
+        return TransparencyMode {
+            requested_opacity,
+            effective_opacity: 1.0,
+            fallback_reason: Some("software-backend"),
+        };
+    }
+
+    TransparencyMode {
+        requested_opacity,
+        effective_opacity: requested_opacity,
+        fallback_reason: None,
     }
 }
 
@@ -369,6 +412,59 @@ mod tests {
         assert_eq!(launch.config_path, Some(path.clone()));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn transparency_mode_stays_requested_on_gpu() {
+        let launch = GuiLaunchOptions {
+            renderer_backend: RenderBackend::Gpu,
+            theme: ThemeConfig {
+                opacity: 0.8,
+                ..ThemeConfig::default()
+            },
+            ..GuiLaunchOptions::default()
+        };
+
+        let mode = transparency_mode(&launch);
+
+        assert_eq!(mode.requested_opacity, 0.8);
+        assert_eq!(mode.effective_opacity, 0.8);
+        assert_eq!(mode.fallback_reason, None);
+    }
+
+    #[test]
+    fn transparency_mode_falls_back_on_software() {
+        let launch = GuiLaunchOptions {
+            renderer_backend: RenderBackend::Software,
+            theme: ThemeConfig {
+                opacity: 0.8,
+                ..ThemeConfig::default()
+            },
+            ..GuiLaunchOptions::default()
+        };
+
+        let mode = transparency_mode(&launch);
+
+        assert_eq!(mode.effective_opacity, 1.0);
+        assert_eq!(mode.fallback_reason, Some("software-backend"));
+    }
+
+    #[test]
+    fn transparency_mode_falls_back_in_safe_mode() {
+        let launch = GuiLaunchOptions {
+            safe_mode: true,
+            renderer_backend: RenderBackend::Gpu,
+            theme: ThemeConfig {
+                opacity: 0.8,
+                ..ThemeConfig::default()
+            },
+            ..GuiLaunchOptions::default()
+        };
+
+        let mode = transparency_mode(&launch);
+
+        assert_eq!(mode.effective_opacity, 1.0);
+        assert_eq!(mode.fallback_reason, Some("safe-mode"));
     }
 
     fn temp_config_path(label: &str) -> PathBuf {
