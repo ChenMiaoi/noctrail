@@ -25,6 +25,7 @@ Usage:
 Commands:
   gui       Open the GUI shell window (default)
   perf-smoke Run the performance smoke probe
+  soak-smoke Run the split/close/resize soak probe
   smoke     Spawn a shell, build the single-pane frame, and shut it down
   help      Print this help text
 
@@ -45,6 +46,7 @@ struct StartupOptions {
 enum StartupCommand {
     Gui,
     PerfSmoke,
+    SoakSmoke,
     Smoke,
     Help,
 }
@@ -101,6 +103,12 @@ fn main() {
                 process::exit(1);
             }
         }
+        StartupCommand::SoakSmoke => {
+            if let Err(error) = run_soak_smoke() {
+                eprintln!("{error}");
+                process::exit(1);
+            }
+        }
         StartupCommand::Smoke => {
             if let Err(error) = run_smoke(&options) {
                 eprintln!("{error}");
@@ -125,6 +133,10 @@ fn parse_startup_options(args: &[String]) -> Result<StartupOptions, StartupError
             }
             "perf-smoke" if !command_set => {
                 command = StartupCommand::PerfSmoke;
+                command_set = true;
+            }
+            "soak-smoke" if !command_set => {
+                command = StartupCommand::SoakSmoke;
                 command_set = true;
             }
             "smoke" if !command_set => {
@@ -339,6 +351,92 @@ fn run_perf_smoke(options: &StartupOptions) -> Result<(), Box<dyn std::error::Er
     }
 
     println!("perf smoke ok");
+    Ok(())
+}
+
+fn run_soak_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    const MAX_PANES: usize = 8;
+    const CYCLES: usize = 256;
+    const RSS_GROWTH_BUDGET_PERCENT: f64 = 20.0;
+
+    let rss_start = current_rss_bytes()?;
+    let mut app = DesktopApp::spawn(
+        LayoutRect::new(0, 0, 120, 80),
+        perf_pane_command(),
+        PtySize::new(120, 40),
+    )?;
+    run_soak_cycles(&mut app, CYCLES / 2, MAX_PANES)?;
+    while app.pane_count() > 1 {
+        let _ = app.close_active_pane()?;
+    }
+    let _ = app.frame();
+    let rss_baseline = current_rss_bytes()?;
+
+    run_soak_cycles(&mut app, CYCLES, MAX_PANES)?;
+    while app.pane_count() > 1 {
+        let _ = app.close_active_pane()?;
+    }
+    let _ = app.frame();
+
+    let rss_end = current_rss_bytes()?;
+    let growth_percent = rss_growth_percent(rss_baseline, rss_end);
+    println!(
+        "soak_cycles={} pane_count={} rss_start_kb={} rss_baseline_kb={} rss_end_kb={} rss_growth_pct={:.2}",
+        CYCLES,
+        app.pane_count(),
+        rss_start / 1024,
+        rss_baseline / 1024,
+        rss_end / 1024,
+        growth_percent,
+    );
+
+    if growth_percent > RSS_GROWTH_BUDGET_PERCENT {
+        return Err(format!(
+            "rss growth exceeded budget: {:.2}% > {:.2}%",
+            growth_percent, RSS_GROWTH_BUDGET_PERCENT
+        )
+        .into());
+    }
+
+    println!("soak smoke ok");
+    Ok(())
+}
+
+fn run_soak_cycles(
+    app: &mut DesktopApp,
+    cycles: usize,
+    max_panes: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directions = [
+        FocusDirection::Left,
+        FocusDirection::Up,
+        FocusDirection::Right,
+        FocusDirection::Down,
+    ];
+
+    for index in 0..cycles {
+        if app.pane_count() < max_panes {
+            let axis = if index % 2 == 0 {
+                SplitAxis::Horizontal
+            } else {
+                SplitAxis::Vertical
+            };
+            app.split_active_pane_with_axis(perf_pane_command(), axis)?;
+        } else if index % 3 == 0 {
+            let _ = app.close_active_pane()?;
+        }
+
+        if app.pane_count() > 1 {
+            let _ = focus_any_direction(app, &directions);
+            if index % 4 == 0 {
+                let _ = app.resize_active_split(FocusDirection::Right, 1);
+            }
+        }
+
+        let line = format!("soak-{index:04}\r\n");
+        app.advance_output(line.as_bytes());
+        let _ = app.frame();
+    }
     Ok(())
 }
 
@@ -614,6 +712,53 @@ fn perf_pane_command() -> PtyCommand {
     }
 }
 
+fn current_rss_bytes() -> Result<u64, Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    {
+        let output = process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("(Get-Process -Id {}).WorkingSet64", process::id()),
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err("failed to query RSS with PowerShell".into());
+        }
+        let text = String::from_utf8(output.stdout)?;
+        return text
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| format!("failed to parse RSS bytes: {error}").into());
+    }
+
+    #[cfg(not(windows))]
+    {
+        let output = process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &process::id().to_string()])
+            .output()?;
+        if !output.status.success() {
+            return Err("failed to query RSS with ps".into());
+        }
+        let text = String::from_utf8(output.stdout)?;
+        let rss_kb = parse_rss_kb(&text).ok_or("failed to parse RSS kilobytes from ps output")?;
+        Ok(rss_kb.saturating_mul(1024))
+    }
+}
+
+fn rss_growth_percent(start_bytes: u64, end_bytes: u64) -> f64 {
+    if end_bytes <= start_bytes || start_bytes == 0 {
+        return 0.0;
+    }
+
+    ((end_bytes - start_bytes) as f64 / start_bytes as f64) * 100.0
+}
+
+fn parse_rss_kb(text: &str) -> Option<u64> {
+    text.split_whitespace()
+        .find_map(|token| token.parse::<u64>().ok())
+}
+
 fn p95_millis(samples: &mut [Duration]) -> f64 {
     samples.sort_unstable();
     let index = ((samples.len().saturating_sub(1)) * 95) / 100;
@@ -664,6 +809,16 @@ mod tests {
             parse_startup_options(&["perf-smoke".to_string()]).expect("options should parse");
 
         assert_eq!(options.command, StartupCommand::PerfSmoke);
+        assert_eq!(options.config_path, None);
+        assert!(!options.safe_mode);
+    }
+
+    #[test]
+    fn parses_soak_smoke_command() {
+        let options =
+            parse_startup_options(&["soak-smoke".to_string()]).expect("options should parse");
+
+        assert_eq!(options.command, StartupCommand::SoakSmoke);
         assert_eq!(options.config_path, None);
         assert!(!options.safe_mode);
     }
@@ -877,6 +1032,12 @@ mod tests {
         samples[19] = Duration::from_millis(40);
 
         assert_eq!(p95_millis(&mut samples), 40.0);
+    }
+
+    #[test]
+    fn parse_rss_kb_extracts_the_numeric_column() {
+        assert_eq!(parse_rss_kb("  12345\n"), Some(12_345));
+        assert_eq!(parse_rss_kb("rss\n"), None);
     }
 
     fn temp_config_path(label: &str) -> PathBuf {
