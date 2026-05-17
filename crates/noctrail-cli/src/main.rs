@@ -1,6 +1,6 @@
 use std::{env, path::PathBuf, process};
 
-use noctrail_pty::{PtyCommand, PtySession, PtySize};
+use noctrail_pty::{PtyCommand, PtySession, PtySize, ResolvedShell};
 use noctrail_render::{RenderBackend, RenderPlan, RenderRect};
 use noctrail_term::recording::replay_recording_file;
 use noctrail_term::{Cell, Color, Cursor, ScreenRowSnapshot, Style, TerminalSnapshot};
@@ -13,6 +13,7 @@ Usage:
 
 Commands:
   doctor      Print basic environment diagnostics
+  doctor shell  Print shell resolution diagnostics
   replay      Replay one or more terminal recording fixtures
   render-smoke Run the render smoke check
   pty-smoke   Run the PTY smoke check
@@ -29,7 +30,17 @@ fn main() {
     match args.next().as_deref() {
         None | Some("help" | "-h" | "--help") => print!("{HELP}"),
         Some("-V" | "--version") => println!("noctrail {}", env!("CARGO_PKG_VERSION")),
-        Some("doctor") => print_doctor(),
+        Some("doctor") => {
+            let topic = args.next();
+            match topic.as_deref() {
+                None => print_doctor(),
+                Some("shell") => print_doctor_shell(),
+                Some(other) => {
+                    eprintln!("unknown doctor topic: {other}");
+                    process::exit(2);
+                }
+            }
+        }
         Some("render-smoke") => {
             if let Err(error) = run_render_smoke() {
                 eprintln!("{error}");
@@ -65,6 +76,55 @@ fn print_doctor() {
     println!("noctrail {}", env!("CARGO_PKG_VERSION"));
     println!("target: {}", env::consts::OS);
     println!("arch: {}", env::consts::ARCH);
+    println!("hint: run `noctrail doctor shell` for shell diagnostics");
+}
+
+fn print_doctor_shell() {
+    let shell = ResolvedShell::detect();
+
+    println!(
+        "shell.program={}",
+        shell.command().program().to_string_lossy()
+    );
+    if shell.command().argv().is_empty() {
+        println!("shell.argv=(none)");
+    } else {
+        let args = shell
+            .command()
+            .argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("shell.argv={args}");
+    }
+
+    match shell.cwd() {
+        Some(cwd) => println!("shell.cwd={}", cwd.display()),
+        None => println!("shell.cwd=(unavailable)"),
+    }
+
+    println!("shell.source={}", shell.source().label());
+    println!(
+        "shell.env_mode={}",
+        if shell.inherits_env() {
+            "inherit"
+        } else {
+            "clear"
+        }
+    );
+
+    if shell.env_overrides().is_empty() {
+        println!("shell.env_overrides=(none)");
+    } else {
+        for (key, value) in shell.env_overrides() {
+            println!(
+                "shell.env_override.{}={}",
+                key.to_string_lossy(),
+                value.to_string_lossy()
+            );
+        }
+    }
 }
 
 fn replay_fixtures(patterns: &[String]) -> Result<(), String> {

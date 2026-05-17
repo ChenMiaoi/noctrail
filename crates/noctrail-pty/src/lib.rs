@@ -8,6 +8,9 @@ use std::{
     path::PathBuf,
 };
 
+#[cfg(windows)]
+use std::path::Path;
+
 pub use portable_pty::ExitStatus as PtyExitStatus;
 use portable_pty::{Child, CommandBuilder, MasterPty, native_pty_system};
 use thiserror::Error;
@@ -42,6 +45,79 @@ pub struct PtyCommand {
     clear_env: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellSource {
+    EnvShell,
+    EnvComSpec,
+    PathPwsh,
+    PathPowerShell,
+    PathWsl,
+    FallbackSh,
+    FallbackCmd,
+}
+
+impl ShellSource {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::EnvShell => "env:SHELL",
+            Self::EnvComSpec => "env:COMSPEC",
+            Self::PathPwsh => "path:pwsh",
+            Self::PathPowerShell => "path:powershell",
+            Self::PathWsl => "path:wsl",
+            Self::FallbackSh => "fallback:/bin/sh",
+            Self::FallbackCmd => "fallback:cmd.exe",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedShell {
+    command: PtyCommand,
+    source: ShellSource,
+    cwd: Option<PathBuf>,
+}
+
+impl ResolvedShell {
+    pub fn detect() -> Self {
+        let cwd = env::current_dir().ok();
+        let (program, source) = detect_shell_program(env::vars_os(), env::split_paths);
+        let mut command = PtyCommand::new(program);
+        if let Some(path) = cwd.clone() {
+            command.cwd_path(path);
+        }
+
+        Self {
+            command,
+            source,
+            cwd,
+        }
+    }
+
+    pub fn command(&self) -> &PtyCommand {
+        &self.command
+    }
+
+    pub fn source(&self) -> ShellSource {
+        self.source
+    }
+
+    pub fn cwd(&self) -> Option<&PathBuf> {
+        self.cwd.as_ref()
+    }
+
+    pub fn inherits_env(&self) -> bool {
+        self.command.inherits_env()
+    }
+
+    pub fn env_overrides(&self) -> &[(OsString, OsString)] {
+        self.command.env()
+    }
+
+    pub fn into_command(self) -> PtyCommand {
+        self.command
+    }
+}
+
 impl PtyCommand {
     pub fn new(program: impl Into<OsString>) -> Self {
         Self {
@@ -54,7 +130,7 @@ impl PtyCommand {
     }
 
     pub fn shell() -> Self {
-        Self::new(resolve_default_shell_program())
+        ResolvedShell::detect().into_command()
     }
 
     pub fn program(&self) -> &OsStr {
@@ -71,6 +147,10 @@ impl PtyCommand {
 
     pub fn env(&self) -> &[(OsString, OsString)] {
         &self.env
+    }
+
+    pub fn inherits_env(&self) -> bool {
+        !self.clear_env
     }
 
     pub fn clear_env(&mut self) -> &mut Self {
@@ -298,20 +378,87 @@ impl Drop for PtySession {
     }
 }
 
-fn resolve_default_shell_program() -> OsString {
+fn detect_shell_program<I, F>(env_vars: I, _split_paths: F) -> (OsString, ShellSource)
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+    F: Fn(&OsStr) -> env::SplitPaths,
+{
     #[cfg(windows)]
     {
-        env::var_os("COMSPEC")
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| OsString::from("cmd.exe"))
+        detect_windows_shell_program(env_vars, _split_paths)
     }
 
     #[cfg(not(windows))]
     {
-        env::var_os("SHELL")
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| OsString::from("/bin/sh"))
+        detect_unix_shell_program(env_vars)
     }
+}
+
+fn detect_unix_shell_program<I>(env_vars: I) -> (OsString, ShellSource)
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    for (key, value) in env_vars {
+        if key == OsStr::new("SHELL") && !value.is_empty() {
+            return (value, ShellSource::EnvShell);
+        }
+    }
+
+    (OsString::from("/bin/sh"), ShellSource::FallbackSh)
+}
+
+#[cfg(windows)]
+fn detect_windows_shell_program<I, F>(env_vars: I, split_paths: F) -> (OsString, ShellSource)
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+    F: Fn(&OsStr) -> env::SplitPaths,
+{
+    let mut comspec = None;
+    let mut path_value = None;
+
+    for (key, value) in env_vars {
+        if key == OsStr::new("COMSPEC") && !value.is_empty() {
+            comspec = Some(value);
+        } else if key == OsStr::new("PATH") {
+            path_value = Some(value);
+        }
+    }
+
+    if let Some(program) = comspec {
+        return (program, ShellSource::EnvComSpec);
+    }
+
+    for (program, source) in [
+        ("pwsh.exe", ShellSource::PathPwsh),
+        ("powershell.exe", ShellSource::PathPowerShell),
+        ("wsl.exe", ShellSource::PathWsl),
+    ] {
+        if program_exists_on_path(path_value.as_deref(), program, &split_paths) {
+            return (OsString::from(program), source);
+        }
+    }
+
+    (OsString::from("cmd.exe"), ShellSource::FallbackCmd)
+}
+
+#[cfg(windows)]
+fn program_exists_on_path<F>(path_value: Option<&OsStr>, program: &str, split_paths: &F) -> bool
+where
+    F: Fn(&OsStr) -> env::SplitPaths,
+{
+    let Some(path_value) = path_value else {
+        return false;
+    };
+
+    split_paths(path_value).any(|dir| {
+        let candidate = dir.join(program);
+        path_is_executable(&candidate)
+    })
+}
+
+#[cfg(windows)]
+fn path_is_executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 fn closed_error(action: &'static str) -> PtyError {
@@ -330,6 +477,30 @@ mod tests {
     fn shell_command_resolves_to_a_program() {
         let command = PtyCommand::shell();
         assert!(!command.program().is_empty());
+    }
+
+    #[test]
+    fn resolved_shell_reports_cwd_and_env_mode() {
+        let shell = ResolvedShell::detect();
+        assert!(!shell.command().program().is_empty());
+        assert!(shell.inherits_env());
+        assert!(shell.cwd().is_some());
+        assert!(shell.env_overrides().is_empty());
+    }
+
+    #[test]
+    fn unix_shell_prefers_shell_env() {
+        let env_vars = vec![(OsString::from("SHELL"), OsString::from("/bin/fish"))];
+        let (program, source) = detect_unix_shell_program(env_vars);
+        assert_eq!(program, OsString::from("/bin/fish"));
+        assert_eq!(source, ShellSource::EnvShell);
+    }
+
+    #[test]
+    fn unix_shell_falls_back_to_bin_sh() {
+        let (program, source) = detect_unix_shell_program(Vec::<(OsString, OsString)>::new());
+        assert_eq!(program, OsString::from("/bin/sh"));
+        assert_eq!(source, ShellSource::FallbackSh);
     }
 
     #[test]
