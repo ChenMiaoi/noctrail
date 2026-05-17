@@ -538,4 +538,56 @@ mod tests {
         assert!(session.close()?.is_some());
         Ok(())
     }
+
+    #[test]
+    fn finite_command_reaches_eof_and_exit_status() -> Result<(), Box<dyn StdError>> {
+        let mut session = PtySession::spawn(finite_command("PTY_EOF_OK"), PtySize::new(80, 24))?;
+
+        let output = read_all_output(&mut session)?;
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("PTY_EOF_OK"),
+            "finite PTY command output missing marker: {text:?}"
+        );
+        assert!(
+            session.try_wait()?.is_some(),
+            "finite PTY command should exit after EOF"
+        );
+        assert!(
+            session.close()?.is_some(),
+            "close should reap the already-exited child handle"
+        );
+        Ok(())
+    }
+
+    fn read_all_output(session: &mut PtySession) -> Result<Vec<u8>, PtyError> {
+        let mut output = Vec::new();
+        let mut chunk = [0_u8; 1024];
+
+        loop {
+            let count = session.read(&mut chunk)?;
+            if count == 0 {
+                break;
+            }
+            output.extend_from_slice(&chunk[..count]);
+        }
+
+        Ok(output)
+    }
+
+    fn finite_command(marker: &str) -> PtyCommand {
+        #[cfg(windows)]
+        {
+            let mut command = PtyCommand::new("cmd.exe");
+            command.args(["/C", "echo", marker]);
+            command
+        }
+
+        #[cfg(not(windows))]
+        {
+            let mut command = PtyCommand::new("sh");
+            command.args(["-lc", &format!("printf '{marker}\\n'")]);
+            command
+        }
+    }
 }
