@@ -550,6 +550,39 @@ pub struct TerminalSnapshot {
     pub selection: Option<Selection>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DamageSet {
+    pub dirty_rows: Vec<usize>,
+    pub full_frame: bool,
+}
+
+impl DamageSet {
+    fn from_rows(mut dirty_rows: Vec<usize>, full_frame: bool) -> Self {
+        dirty_rows.sort_unstable();
+        dirty_rows.dedup();
+        Self {
+            dirty_rows,
+            full_frame,
+        }
+    }
+
+    fn full_frame(height: usize) -> Self {
+        Self {
+            dirty_rows: (0..height).collect(),
+            full_frame: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AdvanceResult {
+    pub damage: DamageSet,
+    pub cursor_moved: bool,
+    pub scrolled: bool,
+    pub alternate_screen_changed: bool,
+    pub title_changed: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct SavedState {
     cursor: Cursor,
@@ -570,6 +603,7 @@ pub struct TerminalState {
     bracketed_paste: bool,
     selection: Option<Selection>,
     parser: Parser,
+    pending_scroll: bool,
 }
 
 impl TerminalState {
@@ -585,6 +619,7 @@ impl TerminalState {
             bracketed_paste: false,
             selection: None,
             parser: Parser::new(),
+            pending_scroll: false,
         }
     }
 
@@ -687,13 +722,43 @@ impl TerminalState {
         self.advance_bytes(text.as_bytes());
     }
 
-    pub fn advance_bytes(&mut self, bytes: &[u8]) {
+    pub fn advance_bytes(&mut self, bytes: &[u8]) -> AdvanceResult {
+        let previous_cursor = self.active_grid().cursor();
+        let previous_alternate_screen = self.alternate.is_some();
+        self.pending_scroll = false;
+
         let mut parser = std::mem::take(&mut self.parser);
         {
             let mut performer = TerminalPerform { state: self };
             parser.advance(&mut performer, bytes);
         }
         self.parser = parser;
+
+        let alternate_screen_changed = previous_alternate_screen != self.alternate.is_some();
+        let current_cursor = self.active_grid().cursor();
+        let cursor_moved = previous_cursor != current_cursor || alternate_screen_changed;
+
+        if !alternate_screen_changed && cursor_moved {
+            let grid = self.active_grid_mut();
+            grid.mark_dirty(previous_cursor.row);
+            grid.mark_dirty(current_cursor.row);
+        }
+
+        let damage = if alternate_screen_changed {
+            let height = self.active_grid().height();
+            self.active_grid_mut().take_dirty_rows();
+            DamageSet::full_frame(height)
+        } else {
+            DamageSet::from_rows(self.active_grid_mut().take_dirty_rows(), false)
+        };
+
+        AdvanceResult {
+            damage,
+            cursor_moved,
+            scrolled: std::mem::take(&mut self.pending_scroll),
+            alternate_screen_changed,
+            title_changed: false,
+        }
     }
 
     pub fn snapshot(&self) -> TerminalSnapshot {
@@ -773,6 +838,7 @@ impl TerminalState {
         };
 
         if let Some(row) = scrolled {
+            self.pending_scroll = true;
             self.push_scrollback(row);
         }
     }
@@ -792,6 +858,9 @@ impl TerminalState {
             grid.advance_char_with_style(ch, style)
         };
 
+        if !scrolled.is_empty() {
+            self.pending_scroll = true;
+        }
         for row in scrolled {
             self.push_scrollback(row);
         }
@@ -1201,5 +1270,44 @@ mod tests {
         assert!(terminal.bracketed_paste_mode());
         terminal.advance_bytes(b"\x1b[?2004l");
         assert!(!terminal.bracketed_paste_mode());
+    }
+
+    #[test]
+    fn cursor_only_movements_mark_old_and_new_rows_dirty() {
+        let mut terminal = TerminalState::new(4, 2);
+        let _ = terminal.grid_mut().take_dirty_rows();
+
+        let first = terminal.advance_bytes(b"ab");
+        assert_eq!(first.damage.dirty_rows, vec![0]);
+        assert!(first.cursor_moved);
+        assert!(!first.scrolled);
+
+        let second = terminal.advance_bytes(b"\n");
+        assert_eq!(second.damage.dirty_rows, vec![0, 1]);
+        assert!(second.cursor_moved);
+        assert!(!second.scrolled);
+    }
+
+    #[test]
+    fn alternate_screen_switch_reports_full_frame_damage() {
+        let mut terminal = TerminalState::new(3, 2);
+        let _ = terminal.grid_mut().take_dirty_rows();
+
+        let result = terminal.advance_bytes(b"\x1b[?1049h");
+
+        assert!(result.alternate_screen_changed);
+        assert!(result.damage.full_frame);
+        assert_eq!(result.damage.dirty_rows, vec![0, 1]);
+    }
+
+    #[test]
+    fn scroll_events_are_reported_by_advance_result() {
+        let mut terminal = TerminalState::new(2, 1);
+        let _ = terminal.grid_mut().take_dirty_rows();
+
+        let result = terminal.advance_bytes(b"abc");
+
+        assert!(result.scrolled);
+        assert_eq!(result.damage.dirty_rows, vec![0]);
     }
 }
