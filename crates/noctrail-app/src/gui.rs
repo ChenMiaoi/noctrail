@@ -832,11 +832,19 @@ impl GuiApp {
             title.push_str(&self.app.command_blocks().len().to_string());
             title.push('/');
             title.push_str("100");
+            let failed = self.app.failed_command_blocks_count();
+            if failed > 0 {
+                title.push_str(" | failures ");
+                title.push_str(&failed.to_string());
+            }
             if let Some(index) = self.app.selected_command_block_index() {
                 title.push_str(" sel ");
                 title.push_str(&(index + 1).to_string());
             }
             if let Some(block) = self.app.selected_command_block() {
+                if block.failed() {
+                    title.push_str(" | FAIL");
+                }
                 if block.folded {
                     title.push_str(" | folded");
                 }
@@ -1363,6 +1371,9 @@ impl GuiApp {
                         {
                             self.clipboard.set_text(output);
                         }
+                    }
+                    "x" => {
+                        let _ = self.app.select_newest_failed_command_block();
                     }
                     _ => {}
                 }
@@ -2053,7 +2064,7 @@ mod tests {
         let _ = gui.app.select_newest_command_block();
 
         let unfolded = gui.title_text();
-        assert!(unfolded.contains("blocks on 1/100 sel 1"));
+        assert!(unfolded.contains("blocks on 1/100 | failures 1 sel 1"));
         assert!(unfolded.contains("lens json object 2 keys"));
         assert!(unfolded.contains("cmd cargo test -p noctrail-app"));
         assert!(unfolded.contains("code 7"));
@@ -2064,6 +2075,34 @@ mod tests {
         let folded = gui.title_text();
         assert!(folded.contains("| folded"));
         assert!(!folded.contains("out {\"line\":\"one\",\"count\":2}"));
+    }
+
+    #[test]
+    fn block_browser_title_highlights_failures() {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
+        gui.app.set_block_observer_enabled(true);
+        gui.app.advance_output(&block_probe_bytes(
+            "echo ok",
+            "/tmp/noctrail-ok",
+            0,
+            1,
+            "ok output\n",
+        ));
+        gui.app.advance_output(&block_probe_bytes(
+            "echo fail",
+            "/tmp/noctrail-fail",
+            7,
+            2,
+            "failure output\n",
+        ));
+        gui.block_browser = Some(BlockBrowser);
+        let _ = gui.app.select_newest_failed_command_block();
+
+        let title = gui.title_text();
+        assert!(title.contains("failures 1"));
+        assert!(title.contains("| FAIL"));
+        assert!(title.contains("code 7"));
     }
 
     #[test]

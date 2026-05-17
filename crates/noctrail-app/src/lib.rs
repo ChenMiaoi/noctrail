@@ -78,6 +78,10 @@ impl CommandBlock {
             && self.duration_ms.is_none()
             && self.output.is_empty()
     }
+
+    pub fn failed(&self) -> bool {
+        self.exit_code.is_some_and(|exit_code| exit_code != 0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,6 +237,16 @@ impl CommandBlockObserver {
         } else {
             None
         }
+    }
+
+    fn failed_count(&self) -> usize {
+        self.completed.iter().filter(|block| block.failed()).count()
+    }
+
+    fn select_newest_failed(&mut self) -> Option<usize> {
+        let index = self.completed.iter().rposition(CommandBlock::failed)?;
+        self.selected = Some(index);
+        Some(index)
     }
 
     fn observe_event(&mut self, event: ShellIntegrationEvent) {
@@ -487,6 +501,14 @@ impl TerminalPane {
 
     pub fn copy_selected_command_block_structured_output(&self) -> Option<String> {
         self.block_observer.copy_selected_structured_output()
+    }
+
+    pub fn failed_command_blocks_count(&self) -> usize {
+        self.block_observer.failed_count()
+    }
+
+    pub fn select_newest_failed_command_block(&mut self) -> Option<usize> {
+        self.block_observer.select_newest_failed()
     }
 
     pub fn paste_bytes(&self, text: &str) -> Vec<u8> {
@@ -870,6 +892,14 @@ impl DesktopApp {
     pub fn copy_selected_command_block_structured_output(&self) -> Option<String> {
         self.active_pane_ref()
             .copy_selected_command_block_structured_output()
+    }
+
+    pub fn failed_command_blocks_count(&self) -> usize {
+        self.active_pane_ref().failed_command_blocks_count()
+    }
+
+    pub fn select_newest_failed_command_block(&mut self) -> Option<usize> {
+        self.active_pane_mut().select_newest_failed_command_block()
     }
 
     pub fn pane_by_id(&self, pane_id: PaneId) -> Option<&TerminalPane> {
@@ -2215,6 +2245,43 @@ mod tests {
             .selected_command_block()
             .expect("plain block should be selected");
         assert!(block.structured_output.is_none());
+        assert!(
+            app.copy_selected_command_block_structured_output()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn failure_blocks_are_counted_and_selectable_without_agent_side_effects() {
+        let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(20, 4));
+        app.set_block_observer_enabled(true);
+
+        app.advance_output(&shell_integration_probe_bytes(
+            "echo ok",
+            "/tmp/ok",
+            0,
+            2,
+            b"ok output\n",
+        ));
+        app.advance_output(&shell_integration_probe_bytes(
+            "echo fail",
+            "/tmp/fail",
+            7,
+            3,
+            b"failure output\n",
+        ));
+
+        assert_eq!(app.failed_command_blocks_count(), 1);
+        assert_eq!(app.select_newest_failed_command_block(), Some(1));
+        let block = app
+            .selected_command_block()
+            .expect("failed block should be selected");
+        assert!(block.failed());
+        assert_eq!(block.exit_code, Some(7));
+        assert_eq!(
+            app.copy_selected_command_block_output().as_deref(),
+            Some("failure output\n")
+        );
         assert!(
             app.copy_selected_command_block_structured_output()
                 .is_none()

@@ -26,6 +26,7 @@ Usage:
 Commands:
   block-smoke Run the block browser/history probe
   crash-smoke Run the panic-hook recovery probe
+  failure-block-smoke Run the non-zero exit block probe
   gui       Open the GUI shell window (default)
   perf-smoke Run the performance smoke probe
   soak-smoke Run the split/close/resize soak probe
@@ -50,6 +51,7 @@ struct StartupOptions {
 enum StartupCommand {
     BlockSmoke,
     CrashSmoke,
+    FailureBlockSmoke,
     Gui,
     PerfSmoke,
     SoakSmoke,
@@ -111,6 +113,12 @@ fn main() {
                 process::exit(1);
             }
         }
+        StartupCommand::FailureBlockSmoke => {
+            if let Err(error) = run_failure_block_smoke() {
+                eprintln!("{error}");
+                process::exit(1);
+            }
+        }
         StartupCommand::Gui => {
             if let Err(error) = run_gui(&options) {
                 eprintln!("{error}");
@@ -159,6 +167,10 @@ fn parse_startup_options(args: &[String]) -> Result<StartupOptions, StartupError
             }
             "crash-smoke" if !command_set => {
                 command = StartupCommand::CrashSmoke;
+                command_set = true;
+            }
+            "failure-block-smoke" if !command_set => {
+                command = StartupCommand::FailureBlockSmoke;
                 command_set = true;
             }
             "gui" | "run" if !command_set => {
@@ -442,6 +454,67 @@ fn run_structured_output_smoke() -> Result<(), Box<dyn std::error::Error>> {
             .join("|"),
     );
     println!("structured output smoke ok");
+    Ok(())
+}
+
+fn run_failure_block_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24));
+    app.set_block_observer_enabled(true);
+    app.advance_output(&block_probe_bytes(
+        "echo ok",
+        "/tmp/noctrail-ok",
+        0,
+        1,
+        "ok output\n",
+    ));
+    app.advance_output(&block_probe_bytes(
+        "echo fail",
+        "/tmp/noctrail-fail",
+        7,
+        2,
+        "failure output\n",
+    ));
+
+    if app.failed_command_blocks_count() != 1 {
+        return Err(format!(
+            "expected exactly one failed block, got {}",
+            app.failed_command_blocks_count()
+        )
+        .into());
+    }
+    if app.select_newest_failed_command_block() != Some(1) {
+        return Err("failed to select the newest failed block".into());
+    }
+    let block = app
+        .selected_command_block()
+        .ok_or("failed block should be selected")?;
+    if !block.failed() {
+        return Err("selected block was not marked as failed".into());
+    }
+    if block.exit_code != Some(7) {
+        return Err(format!("unexpected failure exit code: {:?}", block.exit_code).into());
+    }
+    if app.copy_selected_command_block_output().as_deref() != Some("failure output\n") {
+        return Err("failure block output copy changed stdout".into());
+    }
+    if app
+        .copy_selected_command_block_structured_output()
+        .is_some()
+    {
+        return Err("plain failure output unexpectedly created a structured lens".into());
+    }
+
+    println!(
+        "blocks={} failed_blocks={} selected_failed={} exit_code={} structured_lens={} agent_trigger=none",
+        app.command_blocks().len(),
+        app.failed_command_blocks_count(),
+        app.selected_command_block_index()
+            .map(|index| index + 1)
+            .unwrap_or(0),
+        block.exit_code.unwrap_or_default(),
+        block.structured_output.is_some(),
+    );
+    println!("failure block smoke ok");
     Ok(())
 }
 
@@ -1186,6 +1259,16 @@ mod tests {
             parse_startup_options(&["crash-smoke".to_string()]).expect("options should parse");
 
         assert_eq!(options.command, StartupCommand::CrashSmoke);
+        assert_eq!(options.config_path, None);
+        assert!(!options.safe_mode);
+    }
+
+    #[test]
+    fn parses_failure_block_smoke_command() {
+        let options = parse_startup_options(&["failure-block-smoke".to_string()])
+            .expect("options should parse");
+
+        assert_eq!(options.command, StartupCommand::FailureBlockSmoke);
         assert_eq!(options.config_path, None);
         assert!(!options.safe_mode);
     }
