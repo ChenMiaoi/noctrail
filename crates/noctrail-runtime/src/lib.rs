@@ -1,6 +1,6 @@
 //! Pane runtime registry boundary for Noctrail.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use noctrail_pty::{PtyCommand, PtyError, PtyExitStatus, PtySession, PtySize};
 use thiserror::Error;
@@ -77,6 +77,158 @@ pub enum RuntimeError {
     PaneIdExhausted,
     #[error(transparent)]
     Pty(#[from] PtyError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputQueueConfig {
+    pub capacity_bytes: usize,
+    pub high_watermark_bytes: usize,
+    pub drain_budget_bytes: usize,
+}
+
+impl OutputQueueConfig {
+    pub const fn new(
+        capacity_bytes: usize,
+        high_watermark_bytes: usize,
+        drain_budget_bytes: usize,
+    ) -> Self {
+        Self {
+            capacity_bytes,
+            high_watermark_bytes,
+            drain_budget_bytes,
+        }
+    }
+}
+
+impl Default for OutputQueueConfig {
+    fn default() -> Self {
+        Self {
+            capacity_bytes: 256 * 1024,
+            high_watermark_bytes: 192 * 1024,
+            drain_budget_bytes: 32 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum OutputQueueError {
+    #[error("output queue capacity must be greater than zero")]
+    ZeroCapacity,
+    #[error("output queue high watermark must be within capacity")]
+    InvalidHighWatermark,
+    #[error("output queue drain budget must be greater than zero")]
+    ZeroDrainBudget,
+    #[error(
+        "output queue chunk of {chunk_bytes} bytes exceeds remaining capacity {remaining_bytes}"
+    )]
+    QueueFull {
+        chunk_bytes: usize,
+        remaining_bytes: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputDrain {
+    pub chunks: Vec<Vec<u8>>,
+    pub drained_bytes: usize,
+    pub remaining_bytes: usize,
+    pub hit_high_watermark: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct BoundedOutputQueue {
+    chunks: VecDeque<Vec<u8>>,
+    config: OutputQueueConfig,
+    buffered_bytes: usize,
+}
+
+impl BoundedOutputQueue {
+    pub fn new(config: OutputQueueConfig) -> Result<Self, OutputQueueError> {
+        if config.capacity_bytes == 0 {
+            return Err(OutputQueueError::ZeroCapacity);
+        }
+        if config.high_watermark_bytes > config.capacity_bytes {
+            return Err(OutputQueueError::InvalidHighWatermark);
+        }
+        if config.drain_budget_bytes == 0 {
+            return Err(OutputQueueError::ZeroDrainBudget);
+        }
+
+        Ok(Self {
+            chunks: VecDeque::new(),
+            config,
+            buffered_bytes: 0,
+        })
+    }
+
+    pub fn config(&self) -> OutputQueueConfig {
+        self.config
+    }
+
+    pub fn buffered_bytes(&self) -> usize {
+        self.buffered_bytes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.buffered_bytes == self.config.capacity_bytes
+    }
+
+    pub fn hit_high_watermark(&self) -> bool {
+        self.buffered_bytes >= self.config.high_watermark_bytes
+    }
+
+    pub fn remaining_capacity(&self) -> usize {
+        self.config
+            .capacity_bytes
+            .saturating_sub(self.buffered_bytes)
+    }
+
+    pub fn push(&mut self, bytes: Vec<u8>) -> Result<(), OutputQueueError> {
+        if bytes.len() > self.remaining_capacity() {
+            return Err(OutputQueueError::QueueFull {
+                chunk_bytes: bytes.len(),
+                remaining_bytes: self.remaining_capacity(),
+            });
+        }
+
+        self.buffered_bytes += bytes.len();
+        self.chunks.push_back(bytes);
+        Ok(())
+    }
+
+    pub fn drain_budget(&mut self) -> OutputDrain {
+        let mut chunks = Vec::new();
+        let mut drained_bytes = 0;
+
+        while let Some(next) = self.chunks.front() {
+            if drained_bytes > 0 && drained_bytes + next.len() > self.config.drain_budget_bytes {
+                break;
+            }
+
+            let next = self
+                .chunks
+                .pop_front()
+                .expect("front checked above should remain present");
+            drained_bytes += next.len();
+            self.buffered_bytes -= next.len();
+            chunks.push(next);
+
+            if drained_bytes >= self.config.drain_budget_bytes {
+                break;
+            }
+        }
+
+        OutputDrain {
+            chunks,
+            drained_bytes,
+            remaining_bytes: self.buffered_bytes,
+            hit_high_watermark: self.hit_high_watermark(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -312,5 +464,73 @@ mod tests {
             command.args(["-lc", &format!("printf '{marker}'")]);
             command
         }
+    }
+
+    #[test]
+    fn bounded_output_queue_stops_at_capacity() {
+        let mut queue =
+            BoundedOutputQueue::new(OutputQueueConfig::new(8, 6, 4)).expect("valid queue config");
+
+        queue.push(vec![1, 2, 3, 4]).expect("first chunk fits");
+        queue.push(vec![5, 6]).expect("second chunk fits");
+
+        let error = queue
+            .push(vec![7, 8, 9])
+            .expect_err("queue should reject overflow");
+        assert_eq!(
+            error,
+            OutputQueueError::QueueFull {
+                chunk_bytes: 3,
+                remaining_bytes: 2,
+            }
+        );
+        assert_eq!(queue.buffered_bytes(), 6);
+        assert!(queue.hit_high_watermark());
+        assert!(!queue.is_full());
+    }
+
+    #[test]
+    fn bounded_output_queue_drains_by_budget() {
+        let mut queue =
+            BoundedOutputQueue::new(OutputQueueConfig::new(16, 12, 5)).expect("valid queue config");
+        queue.push(vec![1, 2, 3]).expect("first chunk fits");
+        queue.push(vec![4, 5]).expect("second chunk fits");
+        queue.push(vec![6, 7, 8, 9]).expect("third chunk fits");
+
+        let first = queue.drain_budget();
+        assert_eq!(first.drained_bytes, 5);
+        assert_eq!(first.remaining_bytes, 4);
+        assert_eq!(first.chunks, vec![vec![1, 2, 3], vec![4, 5]]);
+        assert!(!first.hit_high_watermark);
+
+        let second = queue.drain_budget();
+        assert_eq!(second.drained_bytes, 4);
+        assert_eq!(second.remaining_bytes, 0);
+        assert_eq!(second.chunks, vec![vec![6, 7, 8, 9]]);
+        assert!(!second.hit_high_watermark);
+
+        let third = queue.drain_budget();
+        assert_eq!(third.drained_bytes, 0);
+        assert!(third.chunks.is_empty());
+        assert_eq!(third.remaining_bytes, 0);
+    }
+
+    #[test]
+    fn bounded_output_queue_rejects_invalid_config() {
+        assert_eq!(
+            BoundedOutputQueue::new(OutputQueueConfig::new(0, 0, 1))
+                .expect_err("zero capacity should fail"),
+            OutputQueueError::ZeroCapacity
+        );
+        assert_eq!(
+            BoundedOutputQueue::new(OutputQueueConfig::new(8, 9, 1))
+                .expect_err("high watermark beyond capacity should fail"),
+            OutputQueueError::InvalidHighWatermark
+        );
+        assert_eq!(
+            BoundedOutputQueue::new(OutputQueueConfig::new(8, 4, 0))
+                .expect_err("zero drain budget should fail"),
+            OutputQueueError::ZeroDrainBudget
+        );
     }
 }
