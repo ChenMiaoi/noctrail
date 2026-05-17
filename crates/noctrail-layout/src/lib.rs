@@ -836,6 +836,10 @@ mod tests {
             .collect()
     }
 
+    fn sample_surface() -> LayoutRect {
+        LayoutRect::new(0, 0, 120, 80)
+    }
+
     #[test]
     fn single_pane_fills_the_surface() {
         let tree = LayoutTree::new(PaneId::new(1));
@@ -883,6 +887,27 @@ mod tests {
         let layouts = map_layouts(tree.arrange(LayoutRect::new(0, 0, 120, 40)));
         assert_eq!(layouts[&PaneId::new(1)], LayoutRect::new(0, 0, 120, 20));
         assert_eq!(layouts[&PaneId::new(2)], LayoutRect::new(0, 20, 120, 20));
+    }
+
+    #[test]
+    fn splitting_a_non_active_target_inserts_next_to_that_leaf() {
+        let mut tree = LayoutTree::new(PaneId::new(1));
+        let surface = sample_surface();
+        tree.split_active(PaneId::new(2), surface)
+            .expect("first split should succeed");
+        tree.set_active_pane(PaneId::new(1))
+            .expect("pane 1 should exist");
+
+        let inserted = tree
+            .split_with_axis(PaneId::new(1), PaneId::new(3), SplitAxis::Horizontal)
+            .expect("targeted split should succeed");
+
+        assert_eq!(inserted, PaneId::new(3));
+        assert_eq!(tree.active_pane(), Some(PaneId::new(3)));
+        let layouts = map_layouts(tree.arrange(surface));
+        assert_eq!(layouts[&PaneId::new(1)], LayoutRect::new(0, 0, 60, 40));
+        assert_eq!(layouts[&PaneId::new(3)], LayoutRect::new(0, 40, 60, 40));
+        assert_eq!(layouts[&PaneId::new(2)], LayoutRect::new(60, 0, 60, 80));
     }
 
     #[test]
@@ -945,6 +970,19 @@ mod tests {
     }
 
     #[test]
+    fn closing_the_last_pane_empties_the_tree() {
+        let mut tree = LayoutTree::new(PaneId::new(1));
+
+        assert_eq!(
+            tree.close(PaneId::new(1)).expect("close should succeed"),
+            None
+        );
+        assert_eq!(tree.active_pane(), None);
+        assert_eq!(tree.pane_count(), 0);
+        assert!(tree.arrange(sample_surface()).is_empty());
+    }
+
+    #[test]
     fn directional_focus_finds_the_adjacent_pane() {
         let mut tree = LayoutTree::new(PaneId::new(1));
         let surface = LayoutRect::new(0, 0, 120, 80);
@@ -994,6 +1032,17 @@ mod tests {
     }
 
     #[test]
+    fn setting_active_pane_rejects_unknown_ids() {
+        let mut tree = LayoutTree::new(PaneId::new(1));
+
+        assert_eq!(
+            tree.set_active_pane(PaneId::new(99)),
+            Err(LayoutError::PaneNotFound(PaneId::new(99)))
+        );
+        assert_eq!(tree.active_pane(), Some(PaneId::new(1)));
+    }
+
+    #[test]
     fn resizing_active_split_changes_neighbor_rects() {
         let mut tree = LayoutTree::new(PaneId::new(1));
         let surface = LayoutRect::new(0, 0, 120, 40);
@@ -1006,6 +1055,21 @@ mod tests {
         let layouts = map_layouts(tree.arrange(surface));
         assert_eq!(layouts[&PaneId::new(1)], LayoutRect::new(0, 0, 48, 40));
         assert_eq!(layouts[&PaneId::new(2)], LayoutRect::new(48, 0, 72, 40));
+    }
+
+    #[test]
+    fn duplicate_pane_ids_are_rejected_for_split_paths() {
+        let mut tree = LayoutTree::new(PaneId::new(1));
+        let surface = sample_surface();
+
+        assert_eq!(
+            tree.split_active(PaneId::new(1), surface),
+            Err(LayoutError::DuplicatePane(PaneId::new(1)))
+        );
+        assert_eq!(
+            tree.split_with_axis(PaneId::new(1), PaneId::new(1), SplitAxis::Vertical),
+            Err(LayoutError::DuplicatePane(PaneId::new(1)))
+        );
     }
 
     #[test]
@@ -1074,6 +1138,45 @@ mod tests {
         assert_eq!(
             workspaces.active_layout().active_pane(),
             Some(PaneId::new(2))
+        );
+    }
+
+    #[test]
+    fn workspace_helpers_expose_sorted_entries_and_mutable_access() {
+        let mut workspaces = WorkspaceSet::new(PaneId::new(1));
+        let surface = sample_surface();
+
+        assert!(workspaces.contains_workspace(WorkspaceId::new(1)));
+        assert!(!workspaces.contains_workspace(WorkspaceId::new(3)));
+        workspaces.switch_to(WorkspaceId::new(3));
+        workspaces
+            .layout_mut(WorkspaceId::new(3))
+            .expect("workspace 3 should exist")
+            .insert_root(PaneId::new(30))
+            .expect("workspace 3 root insert should succeed");
+        workspaces
+            .layout_mut(WorkspaceId::new(1))
+            .expect("workspace 1 should exist")
+            .split_active(PaneId::new(2), surface)
+            .expect("workspace 1 split should succeed");
+
+        assert_eq!(
+            workspaces.workspace_ids(),
+            vec![WorkspaceId::new(1), WorkspaceId::new(3)]
+        );
+        assert_eq!(
+            workspaces
+                .layout(WorkspaceId::new(1))
+                .expect("workspace 1 should exist")
+                .pane_count(),
+            2
+        );
+        assert_eq!(
+            workspaces
+                .layout(WorkspaceId::new(3))
+                .expect("workspace 3 should exist")
+                .active_pane(),
+            Some(PaneId::new(30))
         );
     }
 
