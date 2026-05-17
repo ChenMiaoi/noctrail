@@ -106,6 +106,14 @@ dependencies = [
 [[package]]
 name = "noctrail-app"
 version = "0.1.0"
+dependencies = [
+ "noctrail-layout",
+ "noctrail-pty",
+ "noctrail-render",
+ "noctrail-runtime",
+ "noctrail-term",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "noctrail-cli"

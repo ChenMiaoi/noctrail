@@ -9,3 +9,13 @@ description = "Desktop app shell for Noctrail."
 publish = false
 
 [dependencies]
+noctrail-layout = { path = "../noctrail-layout" }
+noctrail-pty = { path = "../noctrail-pty" }
+noctrail-render = { path = "../noctrail-render" }
+noctrail-runtime = { path = "../noctrail-runtime" }
+noctrail-term = { path = "../noctrail-term" }
+thiserror = "2"
+
+[[bin]]
+name = "noctrail-app"
+path = "src/main.rs"
