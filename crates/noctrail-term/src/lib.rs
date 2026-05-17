@@ -128,6 +128,15 @@ pub enum MouseTrackingMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShellIntegrationEvent {
+    Prompt,
+    CommandStart,
+    CommandEnd,
+    Cwd(String),
+    ExitCode(i32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Selection {
     pub mode: SelectionMode,
     pub start: Position,
@@ -552,6 +561,20 @@ impl Default for Grid {
     }
 }
 
+fn osc_value(params: &[&[u8]], start: usize) -> Option<String> {
+    if start >= params.len() {
+        return None;
+    }
+
+    Some(
+        params[start..]
+            .iter()
+            .map(|segment| String::from_utf8_lossy(segment).into_owned())
+            .collect::<Vec<_>>()
+            .join(";"),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TerminalSnapshot {
     pub rows: Vec<ScreenRowSnapshot>,
@@ -620,6 +643,7 @@ pub struct TerminalState {
     mouse_tracking: MouseTrackingMode,
     mouse_reporting_sgr: bool,
     selection: Option<Selection>,
+    shell_integration_events: VecDeque<ShellIntegrationEvent>,
     parser: Parser,
     pending_scroll: bool,
 }
@@ -638,6 +662,7 @@ impl TerminalState {
             mouse_tracking: MouseTrackingMode::Disabled,
             mouse_reporting_sgr: false,
             selection: None,
+            shell_integration_events: VecDeque::new(),
             parser: Parser::new(),
             pending_scroll: false,
         }
@@ -742,6 +767,10 @@ impl TerminalState {
         let selection = self.selection.as_ref()?.clone().normalized();
         let rows = self.active_rows();
         Some(render_selection(&rows, &selection, line_ending))
+    }
+
+    pub fn drain_shell_integration_events(&mut self) -> Vec<ShellIntegrationEvent> {
+        self.shell_integration_events.drain(..).collect()
     }
 
     pub fn advance_char(&mut self, ch: char) {
@@ -860,6 +889,39 @@ impl TerminalState {
         self.primary_scrollback.push_back(row);
         while self.primary_scrollback.len() > self.scrollback_limit {
             self.primary_scrollback.pop_front();
+        }
+    }
+
+    fn push_shell_integration_event(&mut self, event: ShellIntegrationEvent) {
+        self.shell_integration_events.push_back(event);
+    }
+
+    fn handle_osc_dispatch(&mut self, params: &[&[u8]]) {
+        if params.len() < 3 || params[0] != b"1337" || params[1] != b"Noctrail" {
+            return;
+        }
+
+        match params[2] {
+            b"Prompt" => self.push_shell_integration_event(ShellIntegrationEvent::Prompt),
+            b"CommandStart" => {
+                self.push_shell_integration_event(ShellIntegrationEvent::CommandStart);
+            }
+            b"CommandEnd" => {
+                self.push_shell_integration_event(ShellIntegrationEvent::CommandEnd);
+            }
+            b"Cwd" => {
+                if let Some(value) = osc_value(params, 3) {
+                    self.push_shell_integration_event(ShellIntegrationEvent::Cwd(value));
+                }
+            }
+            b"ExitCode" => {
+                if let Some(value) =
+                    osc_value(params, 3).and_then(|value| value.trim().parse::<i32>().ok())
+                {
+                    self.push_shell_integration_event(ShellIntegrationEvent::ExitCode(value));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1187,7 +1249,9 @@ impl Perform for TerminalPerform<'_> {
 
     fn unhook(&mut self) {}
 
-    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        self.state.handle_osc_dispatch(params);
+    }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], _ignore: bool, action: char) {
         let mut values = params.iter().map(first_value);
@@ -1353,6 +1417,45 @@ mod tests {
         terminal.advance_bytes(b"\x1b[?1006l");
         assert_eq!(terminal.mouse_tracking_mode(), MouseTrackingMode::Disabled);
         assert!(!terminal.sgr_mouse_mode());
+    }
+
+    #[test]
+    fn noctrail_osc_markers_emit_events_without_visible_cells() {
+        let mut terminal = TerminalState::new(8, 2);
+
+        terminal.advance_bytes(b"\x1b]1337;Noctrail;Prompt\x07");
+        terminal.advance_bytes(b"\x1b]1337;Noctrail;CommandStart\x1b\\");
+        terminal.advance_bytes(b"\x1b]1337;Noctrail;Cwd;/tmp/noctrail\x07");
+        terminal.advance_bytes(b"\x1b]1337;Noctrail;ExitCode;42\x07");
+        terminal.advance_bytes(b"\x1b]1337;Noctrail;CommandEnd\x07");
+
+        let snapshot = terminal.snapshot();
+        assert!(
+            snapshot
+                .rows
+                .iter()
+                .all(|row| row.rendered_text().trim().is_empty())
+        );
+        assert_eq!(
+            terminal.drain_shell_integration_events(),
+            vec![
+                ShellIntegrationEvent::Prompt,
+                ShellIntegrationEvent::CommandStart,
+                ShellIntegrationEvent::Cwd("/tmp/noctrail".to_string()),
+                ShellIntegrationEvent::ExitCode(42),
+                ShellIntegrationEvent::CommandEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_osc_markers_are_ignored() {
+        let mut terminal = TerminalState::new(4, 1);
+
+        terminal.advance_bytes(b"\x1b]1337;Other;Prompt\x07");
+        terminal.advance_bytes(b"\x1b]1337;Noctrail;ExitCode;nope\x07");
+
+        assert!(terminal.drain_shell_integration_events().is_empty());
     }
 
     #[test]

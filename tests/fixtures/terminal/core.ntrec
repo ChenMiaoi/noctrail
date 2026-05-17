@@ -38,6 +38,26 @@
       }
     },
     {
+      "name": "noctrail_osc_markers",
+      "width": 8,
+      "height": 2,
+      "input_hex": "1b5d313333373b4e6f63747261696c3b50726f6d7074071b5d313333373b4e6f63747261696c3b436f6d6d616e6453746172741b5c1b5d313333373b4e6f63747261696c3b4377643b2f746d702f6e6f63747261696c071b5d313333373b4e6f63747261696c3b45786974436f64653b3432071b5d313333373b4e6f63747261696c3b436f6d6d616e64456e6407",
+      "expected": {
+        "rows": [
+          { "cells": [{}, {}, {}, {}, {}, {}, {}, {}] },
+          { "cells": [{}, {}, {}, {}, {}, {}, {}, {}] }
+        ],
+        "cursor": { "row": 0, "col": 0 }
+      },
+      "expected_shell_events": [
+        "Prompt",
+        "CommandStart",
+        { "Cwd": "/tmp/noctrail" },
+        { "ExitCode": 42 },
+        "CommandEnd"
+      ]
+    },
+    {
       "name": "cr_overwrite",
       "width": 3,
       "height": 1,

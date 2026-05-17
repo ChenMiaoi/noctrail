@@ -4,7 +4,7 @@ use std::{error::Error, fmt, fs, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{LineEnding, Selection, TerminalSnapshot, TerminalState};
+use crate::{LineEnding, Selection, ShellIntegrationEvent, TerminalSnapshot, TerminalState};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingSuite {
@@ -28,6 +28,8 @@ pub struct RecordingCase {
     pub expected: TerminalSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_selection_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_shell_events: Vec<ShellIntegrationEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +134,19 @@ pub fn replay_recording_case(
                 actual_selection_text
             )));
         }
+    }
+
+    let actual_shell_events = terminal.drain_shell_integration_events();
+    if actual_shell_events != case.expected_shell_events {
+        let expected = serde_json::to_string_pretty(&case.expected_shell_events)
+            .unwrap_or_else(|_| "<failed to format expected shell events>".to_string());
+        let actual = serde_json::to_string_pretty(&actual_shell_events)
+            .unwrap_or_else(|_| "<failed to format actual shell events>".to_string());
+        return Err(RecordingError::new(format!(
+            "{} [{}]: shell event mismatch\nexpected:\n{expected}\nactual:\n{actual}",
+            path.display(),
+            case.name
+        )));
     }
 
     Ok(())
