@@ -10,8 +10,8 @@ use noctrail_pty::ShellSource;
 use noctrail_pty::{PtySession, PtySize, ResolvedShell};
 use noctrail_render::{
     FontDiagnostics, FontFamilyDiagnostics, FontPreferences, GlyphRasterConfig, PaintLayer,
-    RenderBackend, RenderPlan, RenderRect, prepare_render_frame, probe_font_diagnostics,
-    probe_gpu_backend,
+    PaneBorderStyle, RenderBackend, RenderPlan, RenderRect, Rgba, prepare_render_frame,
+    probe_font_diagnostics, probe_gpu_backend,
 };
 use noctrail_runtime::{PaneId, PaneRuntimeRegistry, RuntimeCommand, RuntimeEvent};
 use noctrail_term::recording::replay_recording_file;
@@ -270,8 +270,12 @@ struct RenderFixture {
     surface: RenderFixtureRect,
     #[serde(default)]
     backend: FixtureBackend,
+    #[serde(default = "default_active")]
+    active: bool,
     snapshot: TerminalSnapshot,
     damage: RenderFixtureDamage,
+    #[serde(default)]
+    border: FixtureBorder,
     #[serde(default)]
     glyph_raster: FixtureGlyphRaster,
     expect: RenderFixtureExpect,
@@ -300,6 +304,39 @@ struct RenderFixtureDamage {
     dirty_rows: Vec<usize>,
     #[serde(default)]
     full_frame: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct FixtureBorder {
+    #[serde(default)]
+    width: usize,
+    #[serde(default = "default_active_border")]
+    active: FixtureColor,
+    #[serde(default = "default_inactive_border")]
+    inactive: FixtureColor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+struct FixtureColor(HexColor);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+struct HexColor {
+    red: u8,
+    green: u8,
+    blue: u8,
+    alpha: u8,
+}
+
+impl Default for FixtureBorder {
+    fn default() -> Self {
+        Self {
+            width: 0,
+            active: default_active_border(),
+            inactive: default_inactive_border(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -335,6 +372,7 @@ struct RenderFixtureExpect {
     selection_rects: Option<Vec<ExpectedRect>>,
     underline_rects: Option<Vec<ExpectedRect>>,
     cursor_rects: Option<Vec<ExpectedRect>>,
+    border_segments: Option<Vec<ExpectedBorderSegment>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -344,8 +382,21 @@ struct ExpectedRect {
     span: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct ExpectedBorderSegment {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    color: FixtureColor,
+}
+
 fn default_scale() -> f32 {
     1.0
+}
+
+fn default_active() -> bool {
+    true
 }
 
 fn default_cell_width() -> f32 {
@@ -354,6 +405,71 @@ fn default_cell_width() -> f32 {
 
 fn default_line_height() -> f32 {
     19.6
+}
+
+fn default_active_border() -> FixtureColor {
+    FixtureColor(HexColor {
+        red: 0x7a,
+        green: 0xa2,
+        blue: 0xf7,
+        alpha: u8::MAX,
+    })
+}
+
+fn default_inactive_border() -> FixtureColor {
+    FixtureColor(HexColor {
+        red: 0x3b,
+        green: 0x42,
+        blue: 0x61,
+        alpha: u8::MAX,
+    })
+}
+
+impl TryFrom<String> for HexColor {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let Some(hex) = value.strip_prefix('#') else {
+            return Err(format!("expected #RRGGBB or #RRGGBBAA, got {value:?}"));
+        };
+        let bytes = match hex.len() {
+            6 => [
+                parse_hex_byte(&hex[0..2])?,
+                parse_hex_byte(&hex[2..4])?,
+                parse_hex_byte(&hex[4..6])?,
+                u8::MAX,
+            ],
+            8 => [
+                parse_hex_byte(&hex[0..2])?,
+                parse_hex_byte(&hex[2..4])?,
+                parse_hex_byte(&hex[4..6])?,
+                parse_hex_byte(&hex[6..8])?,
+            ],
+            _ => return Err(format!("expected 6 or 8 hex digits, got {value:?}")),
+        };
+
+        Ok(Self {
+            red: bytes[0],
+            green: bytes[1],
+            blue: bytes[2],
+            alpha: bytes[3],
+        })
+    }
+}
+
+impl From<FixtureColor> for Rgba {
+    fn from(value: FixtureColor) -> Self {
+        Self {
+            red: value.0.red,
+            green: value.0.green,
+            blue: value.0.blue,
+            alpha: value.0.alpha,
+        }
+    }
+}
+
+fn parse_hex_byte(raw: &str) -> Result<u8, String> {
+    u8::from_str_radix(raw, 16).map_err(|error| format!("invalid hex byte {raw:?}: {error}"))
 }
 
 fn run_render_fixtures(patterns: &[String]) -> Result<(), String> {
@@ -396,7 +512,12 @@ fn run_render_fixture(path: &Path) -> Result<(), String> {
         backend,
         snapshot: &fixture.snapshot,
         damage: &damage,
-        active: true,
+        active: fixture.active,
+        border: PaneBorderStyle {
+            width: fixture.border.width,
+            active: fixture.border.active.into(),
+            inactive: fixture.border.inactive.into(),
+        },
     });
     let prepared = prepare_render_frame(
         &plan,
@@ -520,6 +641,7 @@ fn assert_render_fixture(
         expect.cursor_rects.as_deref(),
         prepared,
     )?;
+    assert_expected_border_segments(path, expect.border_segments.as_deref(), prepared)?;
 
     Ok(())
 }
@@ -551,6 +673,44 @@ fn assert_expected_rects(
             "{} {} rects mismatch: expected {:?}, got {:?}",
             path.display(),
             label,
+            expected,
+            actual
+        ));
+    }
+
+    Ok(())
+}
+
+fn assert_expected_border_segments(
+    path: &Path,
+    expected: Option<&[ExpectedBorderSegment]>,
+    prepared: &noctrail_render::PreparedRenderFrame,
+) -> Result<(), String> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let actual = prepared
+        .border
+        .segments
+        .iter()
+        .map(|segment| ExpectedBorderSegment {
+            x: segment.x,
+            y: segment.y,
+            width: segment.width,
+            height: segment.height,
+            color: FixtureColor(HexColor {
+                red: segment.color.red,
+                green: segment.color.green,
+                blue: segment.color.blue,
+                alpha: segment.color.alpha,
+            }),
+        })
+        .collect::<Vec<_>>();
+
+    if actual != expected {
+        return Err(format!(
+            "{} border segments mismatch: expected {:?}, got {:?}",
+            path.display(),
             expected,
             actual
         ));

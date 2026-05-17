@@ -11,7 +11,7 @@ use noctrail_layout::{
     FocusDirection, LayoutError, LayoutRect, PaneLayout, SplitAxis, WorkspaceId, WorkspaceSet,
 };
 use noctrail_pty::{PtyCommand, PtyError, PtyExitStatus, PtySize};
-use noctrail_render::{RenderBackend, RenderInput, RenderPlan, RenderRect};
+use noctrail_render::{PaneBorderStyle, RenderBackend, RenderInput, RenderPlan, RenderRect};
 use noctrail_runtime::{PaneId, PaneRuntime};
 use noctrail_term::{
     Cursor, DamageSet, LineEnding, MouseTrackingMode, Position, Selection, SelectionMode,
@@ -250,6 +250,7 @@ impl TerminalPane {
             snapshot: &snapshot,
             damage: &self.last_damage,
             active,
+            border: PaneBorderStyle::default(),
         })
     }
 

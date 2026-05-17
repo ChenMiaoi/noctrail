@@ -1093,7 +1093,7 @@ mod tests {
     use super::*;
     use crate::DesktopFrame;
     use noctrail_layout::WorkspaceId;
-    use noctrail_render::{RenderBackend, RenderPlan, RenderRect};
+    use noctrail_render::{PaneBorderStyle, RenderBackend, RenderPlan, RenderRect};
     use noctrail_runtime::PaneId;
     use std::{
         fs,
@@ -1133,6 +1133,7 @@ mod tests {
                 alternate_screen: false,
                 selection: None,
                 active: true,
+                border: PaneBorderStyle::default(),
                 rows: Vec::new(),
             },
         };

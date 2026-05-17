@@ -1,0 +1,31 @@
+{
+  "surface": { "x": 10, "y": 20, "width": 120, "height": 80 },
+  "backend": "software",
+  "active": false,
+  "snapshot": {
+    "rows": [],
+    "cursor": { "row": 0, "col": 0 }
+  },
+  "damage": {
+    "dirty_rows": [],
+    "full_frame": true
+  },
+  "border": {
+    "width": 2,
+    "active": "#7aa2f7",
+    "inactive": "#3b4261"
+  },
+  "expect": {
+    "prepared_rows": [],
+    "raster_jobs": 0,
+    "glyphs_prepared": 0,
+    "paint_rects": 0,
+    "full_frame": true,
+    "border_segments": [
+      { "x": 10, "y": 20, "width": 120, "height": 2, "color": "#3b4261" },
+      { "x": 10, "y": 98, "width": 120, "height": 2, "color": "#3b4261" },
+      { "x": 10, "y": 22, "width": 2, "height": 76, "color": "#3b4261" },
+      { "x": 128, "y": 22, "width": 2, "height": 76, "color": "#3b4261" }
+    ]
+  }
+}

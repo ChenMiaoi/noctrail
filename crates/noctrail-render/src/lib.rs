@@ -40,6 +40,42 @@ impl RenderRect {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rgba {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub alpha: u8,
+}
+
+impl Rgba {
+    pub const fn opaque(red: u8, green: u8, blue: u8) -> Self {
+        Self {
+            red,
+            green,
+            blue,
+            alpha: u8::MAX,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PaneBorderStyle {
+    pub width: usize,
+    pub active: Rgba,
+    pub inactive: Rgba,
+}
+
+impl PaneBorderStyle {
+    pub fn color_for(self, active: bool) -> Rgba {
+        if active { self.active } else { self.inactive }
+    }
+
+    pub fn enabled(self) -> bool {
+        self.width > 0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderGlyph {
     pub col: usize,
@@ -102,6 +138,7 @@ pub struct RenderInput<'a> {
     pub snapshot: &'a TerminalSnapshot,
     pub damage: &'a DamageSet,
     pub active: bool,
+    pub border: PaneBorderStyle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -114,6 +151,7 @@ pub struct RenderPlan {
     pub alternate_screen: bool,
     pub selection: Option<Selection>,
     pub active: bool,
+    pub border: PaneBorderStyle,
     pub rows: Vec<RenderRow>,
 }
 
@@ -136,6 +174,7 @@ impl RenderPlan {
                 full_frame: true,
             },
             active: true,
+            border: PaneBorderStyle::default(),
         })
     }
 
@@ -149,6 +188,7 @@ impl RenderPlan {
             alternate_screen: input.snapshot.alternate_screen,
             selection: input.snapshot.selection.clone(),
             active: input.active,
+            border: input.border,
             rows: input
                 .snapshot
                 .rows
@@ -336,6 +376,20 @@ pub struct CellPaintFrame {
     pub prepared_rows: Vec<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BorderSegment {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+    pub color: Rgba,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BorderFrame {
+    pub segments: Vec<BorderSegment>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FrameStats {
     pub full_frame: bool,
@@ -344,12 +398,14 @@ pub struct FrameStats {
     pub glyphs_prepared: usize,
     pub atlas_uploads: usize,
     pub paint_rects: usize,
+    pub border_segments: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedRenderFrame {
     pub glyphs: PreparedGlyphFrame,
     pub paint: CellPaintFrame,
+    pub border: BorderFrame,
     pub stats: FrameStats,
 }
 
@@ -373,6 +429,7 @@ pub fn prepare_render_frame(
     let mut font_system = FontSystem::new();
     let glyphs = prepare_glyph_frame_with_font_system(&mut font_system, plan, config)?;
     let paint = prepare_cell_paint_frame(plan);
+    let border = prepare_border_frame(plan);
     let stats = FrameStats {
         full_frame: plan.damage.full_frame,
         scrollback_rows: plan.scrollback_rows,
@@ -380,11 +437,13 @@ pub fn prepare_render_frame(
         glyphs_prepared: glyphs.glyphs.len(),
         atlas_uploads: glyphs.raster_jobs(),
         paint_rects: paint.rects.len(),
+        border_segments: border.segments.len(),
     };
 
     Ok(PreparedRenderFrame {
         glyphs,
         paint,
+        border,
         stats,
     })
 }
@@ -468,6 +527,61 @@ pub fn prepare_cell_paint_frame(plan: &RenderPlan) -> CellPaintFrame {
         rects,
         prepared_rows,
     }
+}
+
+pub fn prepare_border_frame(plan: &RenderPlan) -> BorderFrame {
+    if !plan.border.enabled() || plan.viewport.width == 0 || plan.viewport.height == 0 {
+        return BorderFrame::default();
+    }
+
+    let thickness = plan
+        .border
+        .width
+        .min(plan.viewport.width)
+        .min(plan.viewport.height);
+    if thickness == 0 {
+        return BorderFrame::default();
+    }
+
+    let mut segments = Vec::with_capacity(4);
+    let color = plan.border.color_for(plan.active);
+    segments.push(BorderSegment {
+        x: plan.viewport.x,
+        y: plan.viewport.y,
+        width: plan.viewport.width,
+        height: thickness,
+        color,
+    });
+    segments.push(BorderSegment {
+        x: plan.viewport.x,
+        y: plan.viewport.y + plan.viewport.height.saturating_sub(thickness),
+        width: plan.viewport.width,
+        height: thickness,
+        color,
+    });
+
+    let side_height = plan
+        .viewport
+        .height
+        .saturating_sub(thickness.saturating_mul(2));
+    if side_height > 0 {
+        segments.push(BorderSegment {
+            x: plan.viewport.x,
+            y: plan.viewport.y + thickness,
+            width: thickness,
+            height: side_height,
+            color,
+        });
+        segments.push(BorderSegment {
+            x: plan.viewport.x + plan.viewport.width.saturating_sub(thickness),
+            y: plan.viewport.y + thickness,
+            width: thickness,
+            height: side_height,
+            color,
+        });
+    }
+
+    BorderFrame { segments }
 }
 
 fn collect_font_diagnostics(
@@ -1560,6 +1674,7 @@ mod tests {
             snapshot: &snapshot,
             damage: &damage,
             active: true,
+            border: PaneBorderStyle::default(),
         });
 
         let prepared = prepare_render_frame(&plan, &GlyphRasterConfig::default()).unwrap();
@@ -1621,6 +1736,7 @@ mod tests {
             snapshot: &snapshot,
             damage: &damage,
             active: true,
+            border: PaneBorderStyle::default(),
         });
 
         let prepared = prepare_render_frame(&plan, &GlyphRasterConfig::default()).unwrap();
@@ -1629,6 +1745,99 @@ mod tests {
         assert!(prepared.paint.rects.iter().any(|rect| {
             rect.layer == PaintLayer::Selection && rect.row == 0 && rect.col == 1 && rect.span == 2
         }));
+    }
+
+    #[test]
+    fn border_frame_uses_active_color_on_all_edges() {
+        let plan = RenderPlan {
+            backend: RenderBackend::Software,
+            viewport: RenderRect::new(10, 20, 120, 80),
+            damage: DamageSet {
+                dirty_rows: vec![0],
+                full_frame: true,
+            },
+            scrollback_rows: 0,
+            cursor: Cursor::default(),
+            alternate_screen: false,
+            selection: None,
+            active: true,
+            border: PaneBorderStyle {
+                width: 2,
+                active: Rgba::opaque(0x7a, 0xa2, 0xf7),
+                inactive: Rgba::opaque(0x3b, 0x42, 0x61),
+            },
+            rows: Vec::new(),
+        };
+
+        let border = prepare_border_frame(&plan);
+
+        assert_eq!(
+            border.segments,
+            vec![
+                BorderSegment {
+                    x: 10,
+                    y: 20,
+                    width: 120,
+                    height: 2,
+                    color: Rgba::opaque(0x7a, 0xa2, 0xf7),
+                },
+                BorderSegment {
+                    x: 10,
+                    y: 98,
+                    width: 120,
+                    height: 2,
+                    color: Rgba::opaque(0x7a, 0xa2, 0xf7),
+                },
+                BorderSegment {
+                    x: 10,
+                    y: 22,
+                    width: 2,
+                    height: 76,
+                    color: Rgba::opaque(0x7a, 0xa2, 0xf7),
+                },
+                BorderSegment {
+                    x: 128,
+                    y: 22,
+                    width: 2,
+                    height: 76,
+                    color: Rgba::opaque(0x7a, 0xa2, 0xf7),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn border_frame_switches_to_inactive_color() {
+        let plan = RenderPlan {
+            backend: RenderBackend::Software,
+            viewport: RenderRect::new(0, 0, 8, 4),
+            damage: DamageSet {
+                dirty_rows: vec![0],
+                full_frame: true,
+            },
+            scrollback_rows: 0,
+            cursor: Cursor::default(),
+            alternate_screen: false,
+            selection: None,
+            active: false,
+            border: PaneBorderStyle {
+                width: 1,
+                active: Rgba::opaque(0x7a, 0xa2, 0xf7),
+                inactive: Rgba::opaque(0x3b, 0x42, 0x61),
+            },
+            rows: Vec::new(),
+        };
+
+        let prepared = prepare_render_frame(&plan, &GlyphRasterConfig::default()).unwrap();
+
+        assert_eq!(prepared.stats.border_segments, 4);
+        assert!(
+            prepared
+                .border
+                .segments
+                .iter()
+                .all(|segment| segment.color == Rgba::opaque(0x3b, 0x42, 0x61))
+        );
     }
 
     #[test]
@@ -1651,11 +1860,13 @@ mod tests {
             snapshot: &snapshot,
             damage: &damage,
             active: false,
+            border: PaneBorderStyle::default(),
         });
 
         assert_eq!(plan.viewport, RenderRect::new(4, 5, 6, 7));
         assert_eq!(plan.damage, damage);
         assert!(!plan.active);
+        assert_eq!(plan.border, PaneBorderStyle::default());
         assert_eq!(plan.rows[0].glyphs.len(), 3);
     }
 
