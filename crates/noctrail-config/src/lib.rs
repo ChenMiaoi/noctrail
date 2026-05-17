@@ -413,6 +413,54 @@ fn validate_config(path: &Path, config: &Config) -> Result<(), ConfigError> {
             reason: "agent.provider must be configured when agent.enabled = true".to_string(),
         });
     }
+    if let Some(provider) = config.agent.provider.as_ref() {
+        match provider.kind {
+            AgentProviderKind::OpenAiCompatible => {
+                if provider
+                    .endpoint
+                    .as_deref()
+                    .is_none_or(|endpoint| endpoint.trim().is_empty())
+                {
+                    return Err(ConfigError::Validation {
+                        path: path.to_path_buf(),
+                        reason: "agent.provider.endpoint must be set for openai-compatible"
+                            .to_string(),
+                    });
+                }
+                if provider
+                    .model
+                    .as_deref()
+                    .is_none_or(|model| model.trim().is_empty())
+                {
+                    return Err(ConfigError::Validation {
+                        path: path.to_path_buf(),
+                        reason: "agent.provider.model must be set for openai-compatible"
+                            .to_string(),
+                    });
+                }
+            }
+            AgentProviderKind::Local => {
+                if provider
+                    .model
+                    .as_deref()
+                    .is_none_or(|model| model.trim().is_empty())
+                {
+                    return Err(ConfigError::Validation {
+                        path: path.to_path_buf(),
+                        reason: "agent.provider.model must be set for local".to_string(),
+                    });
+                }
+            }
+            AgentProviderKind::Cli => {
+                if provider.command.is_empty() {
+                    return Err(ConfigError::Validation {
+                        path: path.to_path_buf(),
+                        reason: "agent.provider.command must be set for cli".to_string(),
+                    });
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -584,6 +632,66 @@ mod tests {
         match error {
             ConfigError::Validation { reason, .. } => {
                 assert!(reason.contains("agent.provider must be configured"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn openai_provider_requires_endpoint_and_model() {
+        let path = temp_config_path("agent-openai-endpoint");
+        fs::write(
+            &path,
+            "[agent]\nenabled = true\n\n[agent.provider]\ntype = \"openai-compatible\"\nmodel = \"gpt-5\"\n",
+        )
+        .expect("write config");
+
+        let error = Config::load_from_path(&path).expect_err("config should fail");
+        match error {
+            ConfigError::Validation { reason, .. } => {
+                assert!(reason.contains("agent.provider.endpoint"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn cli_provider_requires_command() {
+        let path = temp_config_path("agent-cli-command");
+        fs::write(
+            &path,
+            "[agent]\nenabled = true\n\n[agent.provider]\ntype = \"cli\"\n",
+        )
+        .expect("write config");
+
+        let error = Config::load_from_path(&path).expect_err("config should fail");
+        match error {
+            ConfigError::Validation { reason, .. } => {
+                assert!(reason.contains("agent.provider.command"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn local_provider_requires_model() {
+        let path = temp_config_path("agent-local-model");
+        fs::write(
+            &path,
+            "[agent]\nenabled = true\n\n[agent.provider]\ntype = \"local\"\n",
+        )
+        .expect("write config");
+
+        let error = Config::load_from_path(&path).expect_err("config should fail");
+        match error {
+            ConfigError::Validation { reason, .. } => {
+                assert!(reason.contains("agent.provider.model"));
             }
             other => panic!("unexpected error: {other:?}"),
         }

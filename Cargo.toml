@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/noctrail-agent",
     "crates/noctrail-app",
     "crates/noctrail-cli",
     "crates/noctrail-config",

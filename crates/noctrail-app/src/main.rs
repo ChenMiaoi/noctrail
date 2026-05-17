@@ -3,11 +3,13 @@ use std::{
     path::PathBuf,
     process,
     sync::{Mutex, OnceLock},
+    thread,
     time::{Duration, Instant},
 };
 
+use noctrail_agent::{ProviderAdapter, ProviderError};
 use noctrail_app::{
-    DesktopApp, PaneChromeConfig,
+    AgentContextPreview, DesktopApp, PaneChromeConfig,
     gui::{self, GuiLaunchOptions},
     input, redaction,
 };
@@ -30,6 +32,7 @@ Usage:
 Commands:
   agent-context-smoke Run the read-only agent context preview probe
   agent-default-smoke Run the default-off agent policy probe
+  agent-provider-smoke Run the provider failure isolation probe
   block-smoke Run the block browser/history probe
   crash-smoke Run the panic-hook recovery probe
   failure-block-smoke Run the non-zero exit block probe
@@ -58,6 +61,7 @@ struct StartupOptions {
 enum StartupCommand {
     AgentContextSmoke,
     AgentDefaultSmoke,
+    AgentProviderSmoke,
     BlockSmoke,
     CrashSmoke,
     FailureBlockSmoke,
@@ -127,6 +131,12 @@ fn main() {
         }
         StartupCommand::AgentDefaultSmoke => {
             if let Err(error) = run_agent_default_smoke() {
+                eprintln!("{error}");
+                process::exit(1);
+            }
+        }
+        StartupCommand::AgentProviderSmoke => {
+            if let Err(error) = run_agent_provider_smoke() {
                 eprintln!("{error}");
                 process::exit(1);
             }
@@ -203,6 +213,10 @@ fn parse_startup_options(args: &[String]) -> Result<StartupOptions, StartupError
             }
             "agent-default-smoke" if !command_set => {
                 command = StartupCommand::AgentDefaultSmoke;
+                command_set = true;
+            }
+            "agent-provider-smoke" if !command_set => {
+                command = StartupCommand::AgentProviderSmoke;
                 command_set = true;
             }
             "block-smoke" if !command_set => {
@@ -760,6 +774,111 @@ fn run_agent_context_smoke() -> Result<(), Box<dyn std::error::Error>> {
             .join(","),
     );
     println!("agent context smoke ok");
+    Ok(())
+}
+
+fn run_agent_provider_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    let mut app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24))?;
+    app.set_block_observer_enabled(true);
+    app.advance_output(&block_probe_bytes(
+        "cargo test -p noctrail-app",
+        "/tmp/noctrail-agent-provider",
+        0,
+        21,
+        "safe context\n",
+    ));
+    let _ = app.select_newest_command_block();
+    app.set_agent_explicit_files(vec![PathBuf::from("/tmp/noctrail/Cargo.toml")]);
+
+    let preview = redaction::redact_agent_context_preview(&app.agent_context_preview());
+    let prompt = format_agent_prompt(&preview);
+    let providers = vec![
+        (
+            "openai-compatible",
+            AgentConfig {
+                enabled: true,
+                read_env: false,
+                read_history: false,
+                provider: Some(AgentProviderConfig {
+                    kind: AgentProviderKind::OpenAiCompatible,
+                    model: Some("gpt-5".to_string()),
+                    endpoint: Some("http://127.0.0.1:1/v1/responses".to_string()),
+                    command: Vec::new(),
+                }),
+            },
+        ),
+        (
+            "local",
+            AgentConfig {
+                enabled: true,
+                read_env: false,
+                read_history: false,
+                provider: Some(AgentProviderConfig {
+                    kind: AgentProviderKind::Local,
+                    model: Some("llama".to_string()),
+                    endpoint: Some("http://127.0.0.1:9/v1/responses".to_string()),
+                    command: Vec::new(),
+                }),
+            },
+        ),
+        (
+            "cli",
+            AgentConfig {
+                enabled: true,
+                read_env: false,
+                read_history: false,
+                provider: Some(AgentProviderConfig {
+                    kind: AgentProviderKind::Cli,
+                    model: None,
+                    endpoint: None,
+                    command: failing_cli_provider_command(),
+                }),
+            },
+        ),
+    ];
+
+    let mut labels = Vec::new();
+    for (label, config) in providers {
+        let adapter = ProviderAdapter::from_agent_config(&config)?
+            .ok_or("agent provider should be enabled in smoke")?;
+        let request = adapter.request_preview(&prompt);
+        if request.prompt_chars == 0 {
+            return Err(format!("{label} provider built an empty request").into());
+        }
+        match adapter.invoke(&prompt) {
+            Err(
+                ProviderError::HttpTransport { .. }
+                | ProviderError::HttpStatus { .. }
+                | ProviderError::CliExit { .. },
+            ) => labels.push(label),
+            Err(other) => {
+                return Err(format!("{label} provider returned unexpected error: {other}").into());
+            }
+            Ok(response) => {
+                return Err(format!(
+                    "{label} provider unexpectedly succeeded with {:?}",
+                    response.text
+                )
+                .into());
+            }
+        }
+    }
+
+    app.write_input(shell_marker_command("NOCTRAIL_AGENT_PROVIDER_OK").as_bytes())?;
+    app.write_input(shell_exit_command().as_bytes())?;
+    thread::sleep(Duration::from_millis(100));
+    let output = read_all_runtime_output(&mut app)?;
+    let _ = app.close_runtime()?;
+    let text = String::from_utf8_lossy(&output);
+    if !text.contains("NOCTRAIL_AGENT_PROVIDER_OK") {
+        return Err("provider failures prevented shell output from continuing".into());
+    }
+
+    println!(
+        "providers={} shell_marker=NOCTRAIL_AGENT_PROVIDER_OK",
+        labels.join(",")
+    );
+    println!("agent provider smoke ok");
     Ok(())
 }
 
@@ -1407,6 +1526,43 @@ fn animations_enabled(theme: &ThemeConfig) -> bool {
     theme.animation.enabled && !theme.low_power.enabled
 }
 
+fn format_agent_prompt(preview: &AgentContextPreview) -> String {
+    let mut prompt = String::from("Noctrail agent context\n");
+    if let Some(cwd) = preview.cwd.as_deref() {
+        prompt.push_str("cwd: ");
+        prompt.push_str(&cwd.display().to_string());
+        prompt.push('\n');
+    }
+    if let Some(selection) = preview.selection.as_deref() {
+        prompt.push_str("selection: ");
+        prompt.push_str(selection);
+        prompt.push('\n');
+    }
+    if let Some(block) = preview.current_block.as_ref() {
+        if let Some(command) = block.command.as_deref() {
+            prompt.push_str("command: ");
+            prompt.push_str(command);
+            prompt.push('\n');
+        }
+        if !block.output.is_empty() {
+            prompt.push_str("output:\n");
+            prompt.push_str(&block.output);
+            if !block.output.ends_with('\n') {
+                prompt.push('\n');
+            }
+        }
+    }
+    if !preview.explicit_files.is_empty() {
+        prompt.push_str("files:\n");
+        for path in &preview.explicit_files {
+            prompt.push_str("- ");
+            prompt.push_str(&path.display().to_string());
+            prompt.push('\n');
+        }
+    }
+    prompt
+}
+
 fn agent_access_policy(config: &AgentConfig) -> AgentAccessPolicy {
     AgentAccessPolicy {
         enabled: config.enabled,
@@ -1418,6 +1574,26 @@ fn agent_access_policy(config: &AgentConfig) -> AgentAccessPolicy {
 
 fn on_off(enabled: bool) -> &'static str {
     if enabled { "on" } else { "off" }
+}
+
+fn failing_cli_provider_command() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        vec![
+            "cmd".to_string(),
+            "/C".to_string(),
+            "echo provider-fail 1>&2 & exit /b 17".to_string(),
+        ]
+    }
+
+    #[cfg(not(windows))]
+    {
+        vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            "printf provider-fail >&2; exit 17".to_string(),
+        ]
+    }
 }
 
 fn display_status_path(path: Option<&std::path::Path>) -> String {
@@ -1456,6 +1632,16 @@ mod tests {
             parse_startup_options(&["redaction-smoke".to_string()]).expect("options should parse");
 
         assert_eq!(options.command, StartupCommand::RedactionSmoke);
+        assert_eq!(options.config_path, None);
+        assert!(!options.safe_mode);
+    }
+
+    #[test]
+    fn parses_agent_provider_smoke_command() {
+        let options = parse_startup_options(&["agent-provider-smoke".to_string()])
+            .expect("options should parse");
+
+        assert_eq!(options.command, StartupCommand::AgentProviderSmoke);
         assert_eq!(options.config_path, None);
         assert!(!options.safe_mode);
     }
@@ -1647,6 +1833,26 @@ mod tests {
         assert!(!policy.read_env);
         assert!(!policy.read_history);
         assert!(!policy.provider_request);
+    }
+
+    #[test]
+    fn agent_prompt_includes_only_visible_context_fields() {
+        let prompt = format_agent_prompt(&AgentContextPreview {
+            current_block: Some(noctrail_app::AgentContextBlock {
+                command: Some("cargo test".to_string()),
+                output: "ok\n".to_string(),
+                exit_code: Some(0),
+            }),
+            selection: Some("focus".to_string()),
+            cwd: Some(PathBuf::from("/tmp/noctrail")),
+            explicit_files: vec![PathBuf::from("/tmp/noctrail/Cargo.toml")],
+        });
+
+        assert!(prompt.contains("cwd: /tmp/noctrail"));
+        assert!(prompt.contains("selection: focus"));
+        assert!(prompt.contains("command: cargo test"));
+        assert!(prompt.contains("output:\nok"));
+        assert!(prompt.contains("- /tmp/noctrail/Cargo.toml"));
     }
 
     #[test]

@@ -1,0 +1,15 @@
+[package]
+name = "noctrail-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Agent provider adapters for Noctrail."
+publish = false
+
+[dependencies]
+noctrail-config = { path = "../noctrail-config" }
+serde_json = "1"
+thiserror = "2"
+ureq = { version = "2.12", features = ["json"] }
