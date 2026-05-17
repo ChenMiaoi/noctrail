@@ -298,6 +298,7 @@ pub struct PreparedGlyph {
 pub struct PreparedGlyphFrame {
     pub glyphs: Vec<PreparedGlyph>,
     pub unique_cache_keys: Vec<CacheKey>,
+    pub prepared_rows: Vec<usize>,
 }
 
 impl PreparedGlyphFrame {
@@ -332,6 +333,24 @@ pub struct PaintRect {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CellPaintFrame {
     pub rects: Vec<PaintRect>,
+    pub prepared_rows: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FrameStats {
+    pub full_frame: bool,
+    pub scrollback_rows: usize,
+    pub dirty_rows: usize,
+    pub glyphs_prepared: usize,
+    pub atlas_uploads: usize,
+    pub paint_rects: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedRenderFrame {
+    pub glyphs: PreparedGlyphFrame,
+    pub paint: CellPaintFrame,
+    pub stats: FrameStats,
 }
 
 pub fn probe_font_diagnostics(preferences: &FontPreferences) -> FontDiagnostics {
@@ -347,10 +366,38 @@ pub fn prepare_glyph_frame(
     prepare_glyph_frame_with_font_system(&mut font_system, plan, config)
 }
 
+pub fn prepare_render_frame(
+    plan: &RenderPlan,
+    config: &GlyphRasterConfig,
+) -> Result<PreparedRenderFrame, GlyphPrepareError> {
+    let mut font_system = FontSystem::new();
+    let glyphs = prepare_glyph_frame_with_font_system(&mut font_system, plan, config)?;
+    let paint = prepare_cell_paint_frame(plan);
+    let stats = FrameStats {
+        full_frame: plan.damage.full_frame,
+        scrollback_rows: plan.scrollback_rows,
+        dirty_rows: glyphs.prepared_rows.len(),
+        glyphs_prepared: glyphs.glyphs.len(),
+        atlas_uploads: glyphs.raster_jobs(),
+        paint_rects: paint.rects.len(),
+    };
+
+    Ok(PreparedRenderFrame {
+        glyphs,
+        paint,
+        stats,
+    })
+}
+
 pub fn prepare_cell_paint_frame(plan: &RenderPlan) -> CellPaintFrame {
+    let prepared_rows = effective_render_rows(plan);
     let mut rects = Vec::new();
 
     for row in &plan.rows {
+        if !prepared_rows.contains(&row.row) {
+            continue;
+        }
+
         for glyph in &row.glyphs {
             if glyph.wide_continuation {
                 continue;
@@ -388,7 +435,7 @@ pub fn prepare_cell_paint_frame(plan: &RenderPlan) -> CellPaintFrame {
     if let Some(selection) = plan.selection.as_ref() {
         let selection = selection.clone().normalized();
         for (row, start_col, end_col) in selection_ranges(&plan.rows, &selection) {
-            if end_col > start_col {
+            if prepared_rows.contains(&row) && end_col > start_col {
                 rects.push(PaintRect {
                     layer: PaintLayer::Selection,
                     row,
@@ -400,7 +447,9 @@ pub fn prepare_cell_paint_frame(plan: &RenderPlan) -> CellPaintFrame {
         }
     }
 
-    if let Some(row) = plan.rows.get(plan.cursor.row) {
+    if prepared_rows.contains(&plan.cursor.row)
+        && let Some(row) = plan.rows.get(plan.cursor.row)
+    {
         let span = row
             .glyphs
             .get(plan.cursor.col)
@@ -415,7 +464,10 @@ pub fn prepare_cell_paint_frame(plan: &RenderPlan) -> CellPaintFrame {
         });
     }
 
-    CellPaintFrame { rects }
+    CellPaintFrame {
+        rects,
+        prepared_rows,
+    }
 }
 
 fn collect_font_diagnostics(
@@ -737,10 +789,15 @@ fn prepare_glyph_frame_with_font_system(
         return Err(GlyphPrepareError::NoFonts);
     }
 
+    let prepared_rows = effective_render_rows(plan);
     let mut glyphs = Vec::new();
     let mut unique_cache_keys = BTreeSet::new();
 
     for row in &plan.rows {
+        if !prepared_rows.contains(&row.row) {
+            continue;
+        }
+
         for glyph in &row.glyphs {
             if glyph.wide_continuation || glyph.text.is_empty() {
                 continue;
@@ -778,6 +835,7 @@ fn prepare_glyph_frame_with_font_system(
     Ok(PreparedGlyphFrame {
         glyphs,
         unique_cache_keys: unique_cache_keys.into_iter().collect(),
+        prepared_rows,
     })
 }
 
@@ -818,6 +876,32 @@ fn shape_cluster(
         .layout_runs()
         .flat_map(|run| run.glyphs.iter().cloned())
         .collect()
+}
+
+fn effective_render_rows(plan: &RenderPlan) -> Vec<usize> {
+    if plan.damage.full_frame {
+        return plan.rows.iter().map(|row| row.row).collect();
+    }
+
+    let mut rows = BTreeSet::new();
+    for row in &plan.damage.dirty_rows {
+        if *row < plan.rows.len() {
+            rows.insert(*row);
+        }
+    }
+
+    if plan.cursor.row < plan.rows.len() {
+        rows.insert(plan.cursor.row);
+    }
+
+    if let Some(selection) = plan.selection.as_ref() {
+        let selection = selection.clone().normalized();
+        for (row, _, _) in selection_ranges(&plan.rows, &selection) {
+            rows.insert(row);
+        }
+    }
+
+    rows.into_iter().collect()
 }
 
 fn push_paint_rect(rects: &mut Vec<PaintRect>, next: PaintRect) {
@@ -1435,6 +1519,107 @@ mod tests {
                 color: None,
             }]
         );
+    }
+
+    #[test]
+    fn partial_damage_limits_prepared_rows_and_keeps_cursor_overlay() {
+        let snapshot = TerminalSnapshot {
+            rows: vec![
+                ScreenRowSnapshot {
+                    cells: vec![cell("A"), cell("A")],
+                    wrapped: false,
+                },
+                ScreenRowSnapshot {
+                    cells: vec![cell("B"), cell("B")],
+                    wrapped: false,
+                },
+                ScreenRowSnapshot {
+                    cells: vec![cell("C"), cell("C")],
+                    wrapped: false,
+                },
+            ],
+            cursor: Cursor { row: 2, col: 1 },
+            ..TerminalSnapshot::default()
+        };
+        let damage = DamageSet {
+            dirty_rows: vec![1],
+            full_frame: false,
+        };
+        let plan = RenderPlan::from_input(RenderInput {
+            viewport: RenderRect::new(0, 0, 2, 3),
+            backend: RenderBackend::Software,
+            snapshot: &snapshot,
+            damage: &damage,
+            active: true,
+        });
+
+        let prepared = prepare_render_frame(&plan, &GlyphRasterConfig::default()).unwrap();
+
+        assert_eq!(prepared.glyphs.prepared_rows, vec![1, 2]);
+        assert_eq!(prepared.paint.prepared_rows, vec![1, 2]);
+        assert_eq!(prepared.stats.dirty_rows, 2);
+        assert_eq!(
+            prepared
+                .glyphs
+                .glyphs
+                .iter()
+                .map(|glyph| glyph.row)
+                .collect::<Vec<_>>(),
+            vec![1, 1, 2, 2]
+        );
+        assert!(
+            prepared
+                .paint
+                .rects
+                .iter()
+                .any(|rect| rect.layer == PaintLayer::Cursor && rect.row == 2)
+        );
+        assert!(prepared.paint.rects.iter().all(|rect| rect.row != 0));
+    }
+
+    #[test]
+    fn selection_rows_are_included_even_when_not_dirty() {
+        let snapshot = TerminalSnapshot {
+            rows: vec![
+                ScreenRowSnapshot {
+                    cells: vec![cell("A"), cell("B"), cell("C")],
+                    wrapped: false,
+                },
+                ScreenRowSnapshot {
+                    cells: vec![cell("D"), cell("E"), cell("F")],
+                    wrapped: false,
+                },
+                ScreenRowSnapshot {
+                    cells: vec![cell("G"), cell("H"), cell("I")],
+                    wrapped: false,
+                },
+            ],
+            cursor: Cursor { row: 2, col: 0 },
+            selection: Some(Selection {
+                mode: noctrail_term::SelectionMode::Normal,
+                start: noctrail_term::Position { row: 0, col: 1 },
+                end: noctrail_term::Position { row: 0, col: 2 },
+            }),
+            ..TerminalSnapshot::default()
+        };
+        let damage = DamageSet {
+            dirty_rows: vec![1],
+            full_frame: false,
+        };
+        let plan = RenderPlan::from_input(RenderInput {
+            viewport: RenderRect::new(0, 0, 3, 3),
+            backend: RenderBackend::Software,
+            snapshot: &snapshot,
+            damage: &damage,
+            active: true,
+        });
+
+        let prepared = prepare_render_frame(&plan, &GlyphRasterConfig::default()).unwrap();
+
+        assert_eq!(prepared.glyphs.prepared_rows, vec![0, 1, 2]);
+        assert!(prepared.paint.rects.iter().any(|rect| {
+            rect.layer == PaintLayer::Selection && rect.row == 0 && rect.col == 1 && rect.span == 2
+        }));
     }
 
     #[test]
