@@ -1,6 +1,6 @@
 use std::{env, process};
 
-use noctrail_app::DesktopApp;
+use noctrail_app::{DesktopApp, gui};
 use noctrail_layout::LayoutRect;
 use noctrail_pty::PtySize;
 
@@ -11,6 +11,7 @@ Usage:
   noctrail-app [command]
 
 Commands:
+  gui       Open the GUI shell window (default)
   smoke     Spawn a shell, build the single-pane frame, and shut it down
   help      Print this help text
 
@@ -21,7 +22,13 @@ Options:
 fn main() {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
-        None | Some("help" | "-h" | "--help") => print!("{HELP}"),
+        None | Some("gui" | "run") => {
+            if let Err(error) = run_gui() {
+                eprintln!("{error}");
+                process::exit(1);
+            }
+        }
+        Some("help" | "-h" | "--help") => print!("{HELP}"),
         Some("smoke") => {
             if let Err(error) = run_smoke() {
                 eprintln!("{error}");
@@ -34,6 +41,10 @@ fn main() {
             process::exit(2);
         }
     }
+}
+
+fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
+    gui::run()
 }
 
 fn run_smoke() -> Result<(), Box<dyn std::error::Error>> {

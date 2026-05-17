@@ -14,6 +14,7 @@ noctrail-pty = { path = "../noctrail-pty" }
 noctrail-render = { path = "../noctrail-render" }
 noctrail-runtime = { path = "../noctrail-runtime" }
 noctrail-term = { path = "../noctrail-term" }
+winit = "0.30.13"
 thiserror = "2"
 
 [[bin]]

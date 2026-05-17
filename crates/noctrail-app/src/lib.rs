@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+pub mod gui;
+
 use noctrail_layout::LayoutRect;
 use noctrail_pty::{PtyCommand, PtyError, PtyExitStatus, PtySize};
 use noctrail_render::{RenderBackend, RenderPlan, RenderRect};
