@@ -9,6 +9,7 @@ description = "Desktop app shell for Noctrail."
 publish = false
 
 [dependencies]
+noctrail-config = { path = "../noctrail-config" }
 noctrail-layout = { path = "../noctrail-layout" }
 noctrail-pty = { path = "../noctrail-pty" }
 noctrail-render = { path = "../noctrail-render" }

@@ -9,7 +9,7 @@ use std::{
 
 use noctrail_layout::LayoutRect;
 use noctrail_pty::{PtyOutputReader, PtySize};
-use noctrail_render::GpuRenderer;
+use noctrail_render::{GpuRenderer, RenderBackend};
 use noctrail_term::{MouseTrackingMode, Position, SelectionMode};
 use winit::{
     application::ApplicationHandler,
@@ -29,6 +29,25 @@ const DEFAULT_CELL_HEIGHT: u32 = 16;
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(600);
 
 pub fn run() -> Result<(), Box<dyn Error>> {
+    run_with_options(GuiLaunchOptions::default())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuiLaunchOptions {
+    pub safe_mode: bool,
+    pub renderer_backend: RenderBackend,
+}
+
+impl Default for GuiLaunchOptions {
+    fn default() -> Self {
+        Self {
+            safe_mode: false,
+            renderer_backend: RenderBackend::Gpu,
+        }
+    }
+}
+
+pub fn run_with_options(options: GuiLaunchOptions) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new()?;
     let initial_surface = LayoutRect::new(
         0,
@@ -41,7 +60,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         DEFAULT_WINDOW_HEIGHT,
     ));
     let app = DesktopApp::spawn_shell(initial_surface, initial_terminal)?;
-    let mut gui = GuiApp::new(app);
+    let mut gui = GuiApp::new(app, options);
     event_loop.run_app(&mut gui)?;
     Ok(())
 }
@@ -96,6 +115,7 @@ struct MouseSelectionDrag {
 
 struct GuiApp {
     app: DesktopApp,
+    launch_options: GuiLaunchOptions,
     window: Option<Arc<Window>>,
     renderer: Option<GpuRenderer>,
     gpu_fallback_error: Option<String>,
@@ -114,10 +134,11 @@ struct GuiApp {
 }
 
 impl GuiApp {
-    fn new(app: DesktopApp) -> Self {
+    fn new(app: DesktopApp, launch_options: GuiLaunchOptions) -> Self {
         let now = Instant::now();
         Self {
             app,
+            launch_options,
             window: None,
             renderer: None,
             gpu_fallback_error: None,
@@ -156,6 +177,10 @@ impl GuiApp {
         Ok(())
     }
 
+    fn should_attempt_gpu_renderer(&self) -> bool {
+        !self.launch_options.safe_mode && self.launch_options.renderer_backend == RenderBackend::Gpu
+    }
+
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), Box<dyn Error>> {
         let attributes = Window::default_attributes()
             .with_title("Noctrail")
@@ -167,15 +192,25 @@ impl GuiApp {
         let window = Arc::new(event_loop.create_window(attributes)?);
         let size = window.inner_size();
         self.sync_surface(size)?;
-        match GpuRenderer::new(window.clone(), size) {
-            Ok(renderer) => {
-                self.renderer = Some(renderer);
-                self.gpu_fallback_error = None;
-                self.app.set_backend(noctrail_render::RenderBackend::Gpu);
+        if self.launch_options.safe_mode {
+            self.renderer = None;
+            self.gpu_fallback_error = Some("safe-mode".to_string());
+            self.app.set_backend(RenderBackend::Software);
+        } else if self.should_attempt_gpu_renderer() {
+            match GpuRenderer::new(window.clone(), size) {
+                Ok(renderer) => {
+                    self.renderer = Some(renderer);
+                    self.gpu_fallback_error = None;
+                    self.app.set_backend(RenderBackend::Gpu);
+                }
+                Err(error) => {
+                    self.record_gpu_fallback(error.to_string());
+                }
             }
-            Err(error) => {
-                self.record_gpu_fallback(error.to_string());
-            }
+        } else {
+            self.renderer = None;
+            self.gpu_fallback_error = None;
+            self.app.set_backend(RenderBackend::Software);
         }
         self.window = Some(window);
         self.update_title();
@@ -722,7 +757,7 @@ mod tests {
     #[test]
     fn gpu_fallback_switches_backend_without_exiting() {
         let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
-        let mut gui = GuiApp::new(app);
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
         gui.app.set_backend(RenderBackend::Gpu);
 
         gui.record_gpu_fallback("adapter missing".to_string());
@@ -733,9 +768,37 @@ mod tests {
     }
 
     #[test]
+    fn safe_mode_launch_options_skip_gpu_attempts() {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
+        let gui = GuiApp::new(
+            app,
+            GuiLaunchOptions {
+                safe_mode: true,
+                renderer_backend: RenderBackend::Gpu,
+            },
+        );
+
+        assert!(!gui.should_attempt_gpu_renderer());
+    }
+
+    #[test]
+    fn software_backend_launch_options_skip_gpu_attempts() {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
+        let gui = GuiApp::new(
+            app,
+            GuiLaunchOptions {
+                safe_mode: false,
+                renderer_backend: RenderBackend::Software,
+            },
+        );
+
+        assert!(!gui.should_attempt_gpu_renderer());
+    }
+
+    #[test]
     fn cursor_blink_only_flips_after_deadline() {
         let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
-        let mut gui = GuiApp::new(app);
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
         let now = Instant::now();
         gui.next_cursor_blink_at = now + Duration::from_millis(50);
 
@@ -750,7 +813,7 @@ mod tests {
     #[test]
     fn cursor_blink_stops_when_window_is_unfocused() {
         let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
-        let mut gui = GuiApp::new(app);
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
         let now = Instant::now();
         gui.window_focused = false;
         gui.next_cursor_blink_at = now;
@@ -762,7 +825,7 @@ mod tests {
     #[test]
     fn ime_preedit_updates_gui_state() -> Result<(), Box<dyn Error>> {
         let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
-        let mut gui = GuiApp::new(app);
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
 
         gui.handle_ime_event(Ime::Preedit("zhong".to_string(), None))?;
         assert_eq!(gui.ime_preedit.as_deref(), Some("zhong"));
@@ -775,7 +838,7 @@ mod tests {
     #[test]
     fn mouse_drag_updates_selection() -> Result<(), Box<dyn Error>> {
         let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(8, 2));
-        let mut gui = GuiApp::new(app);
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
         gui.app.advance_output(b"hello");
 
         gui.handle_cursor_moved(PhysicalPosition::new(1.0, 1.0))?;
@@ -791,7 +854,7 @@ mod tests {
     #[test]
     fn wheel_scroll_moves_scrollback_view() -> Result<(), Box<dyn Error>> {
         let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(8, 2));
-        let mut gui = GuiApp::new(app);
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
         gui.app.advance_output(b"one\r\ntwo\r\nthree");
 
         gui.handle_mouse_wheel(MouseScrollDelta::LineDelta(0.0, 1.0))?;
@@ -809,7 +872,7 @@ mod tests {
     #[test]
     fn output_pump_feeds_shell_output_into_render_plan() -> Result<(), Box<dyn Error>> {
         let app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24))?;
-        let mut gui = GuiApp::new(app);
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
         gui.attach_output_pump()?;
 
         gui.app
@@ -857,7 +920,7 @@ mod tests {
     #[test]
     fn ime_commit_writes_text_to_shell() -> Result<(), Box<dyn Error>> {
         let app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24))?;
-        let mut gui = GuiApp::new(app);
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
         gui.attach_output_pump()?;
 
         gui.handle_ime_event(Ime::Commit("NOCTRAIL_IME".to_string()))?;
@@ -907,7 +970,7 @@ mod tests {
             mouse_report_hex_dump_command(),
             PtySize::new(80, 24),
         )?;
-        let mut gui = GuiApp::new(app);
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
         gui.app.advance_output(b"\x1b[?1000h\x1b[?1006h");
 
         gui.handle_cursor_moved(PhysicalPosition::new(9.0, 17.0))?;
