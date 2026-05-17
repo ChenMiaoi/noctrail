@@ -173,6 +173,13 @@ pub struct GpuDiagnostics {
     pub height: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuBackendDiagnostics {
+    pub adapter_name: String,
+    pub backend: wgpu::Backend,
+    pub device_type: wgpu::DeviceType,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderOutcome {
     Presented,
@@ -357,6 +364,32 @@ impl GpuRenderer {
             .map_err(GpuRendererError::RequestAdapter)?;
         Ok(())
     }
+}
+
+pub fn probe_gpu_backend() -> Result<GpuBackendDiagnostics, GpuRendererError> {
+    pollster::block_on(async {
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .map_err(GpuRendererError::RequestAdapter)?;
+        let _device_and_queue = adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await
+            .map_err(GpuRendererError::RequestDevice)?;
+        let adapter_info = adapter.get_info();
+
+        Ok(GpuBackendDiagnostics {
+            adapter_name: adapter_info.name,
+            backend: adapter_info.backend,
+            device_type: adapter_info.device_type,
+        })
+    })
 }
 
 #[cfg(test)]

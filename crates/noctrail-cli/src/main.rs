@@ -3,7 +3,7 @@ use std::{env, path::PathBuf, process, thread, time::Duration};
 #[cfg(windows)]
 use noctrail_pty::ShellSource;
 use noctrail_pty::{PtySession, PtySize, ResolvedShell};
-use noctrail_render::{RenderBackend, RenderPlan, RenderRect};
+use noctrail_render::{RenderBackend, RenderPlan, RenderRect, probe_gpu_backend};
 use noctrail_runtime::{PaneId, PaneRuntimeRegistry, RuntimeCommand, RuntimeEvent};
 use noctrail_term::recording::replay_recording_file;
 use noctrail_term::{Cell, Color, Cursor, ScreenRowSnapshot, Style, TerminalSnapshot};
@@ -17,6 +17,7 @@ Usage:
 Commands:
   doctor      Print basic environment diagnostics
   doctor shell  Print shell resolution diagnostics
+  doctor gpu  Print GPU backend diagnostics
   replay      Replay one or more terminal recording fixtures
   render-smoke Run the render smoke check
   pty-smoke   Run the PTY smoke check
@@ -38,6 +39,12 @@ fn main() {
             match topic.as_deref() {
                 None => print_doctor(),
                 Some("shell") => print_doctor_shell(),
+                Some("gpu") => {
+                    if let Err(error) = print_doctor_gpu() {
+                        eprintln!("{error}");
+                        process::exit(1);
+                    }
+                }
                 Some(other) => {
                     eprintln!("unknown doctor topic: {other}");
                     process::exit(2);
@@ -128,6 +135,14 @@ fn print_doctor_shell() {
             );
         }
     }
+}
+
+fn print_doctor_gpu() -> Result<(), String> {
+    let diagnostics = probe_gpu_backend().map_err(|error| error.to_string())?;
+    println!("gpu.adapter={}", diagnostics.adapter_name);
+    println!("gpu.backend={:?}", diagnostics.backend);
+    println!("gpu.device_type={:?}", diagnostics.device_type);
+    Ok(())
 }
 
 fn replay_fixtures(patterns: &[String]) -> Result<(), String> {
