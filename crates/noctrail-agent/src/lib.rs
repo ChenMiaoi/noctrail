@@ -42,6 +42,100 @@ pub struct ProviderResponse {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandRisk {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl CommandRisk {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "critical" => Some(Self::Critical),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandPermission {
+    Review,
+    StrongReview,
+    Deny,
+}
+
+impl CommandPermission {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Review => "review",
+            Self::StrongReview => "strong-review",
+            Self::Deny => "deny",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "review" => Some(Self::Review),
+            "strong-review" => Some(Self::StrongReview),
+            "deny" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandProposal {
+    pub command: String,
+    pub reason: String,
+    pub risk: CommandRisk,
+    pub permission: CommandPermission,
+}
+
+#[derive(Debug, Error)]
+pub enum CommandProposalError {
+    #[error("command proposal payload was not valid JSON: {source}")]
+    Json {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("command proposal payload must contain a non-empty proposals array")]
+    MissingProposals,
+    #[error("command proposal #{index} must contain a non-empty command")]
+    MissingCommand { index: usize },
+    #[error("command proposal #{index} must contain a non-empty reason")]
+    MissingReason { index: usize },
+    #[error("command proposal #{index} used an unknown risk level: {value}")]
+    InvalidRisk { index: usize, value: String },
+    #[error("command proposal #{index} used an unknown permission: {value}")]
+    InvalidPermission { index: usize, value: String },
+    #[error(
+        "command proposal #{index} with {risk} risk must require strong-review or deny permission"
+    )]
+    StrongReviewRequired { index: usize, risk: &'static str },
+}
+
+#[derive(Debug, Error)]
+pub enum SuggestionError {
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
+    #[error(transparent)]
+    Proposal(#[from] CommandProposalError),
+}
+
 #[derive(Debug, Error)]
 pub enum ProviderError {
     #[error("agent provider is missing")]
@@ -156,6 +250,99 @@ impl ProviderAdapter {
             Self::OpenAiCompatible(provider) | Self::Local(provider) => provider.invoke(prompt),
             Self::Cli(provider) => provider.invoke(prompt),
         }
+    }
+
+    pub fn propose_commands(&self, prompt: &str) -> Result<Vec<CommandProposal>, SuggestionError> {
+        let response = self.invoke(prompt)?;
+        CommandProposal::parse_many(&response.text).map_err(SuggestionError::from)
+    }
+}
+
+impl CommandProposal {
+    pub fn parse_many(text: &str) -> Result<Vec<Self>, CommandProposalError> {
+        let value = serde_json::from_str::<JsonValue>(text)
+            .map_err(|source| CommandProposalError::Json { source })?;
+        let raw_proposals = match &value {
+            JsonValue::Array(proposals) => proposals,
+            JsonValue::Object(object) => object
+                .get("proposals")
+                .and_then(JsonValue::as_array)
+                .ok_or(CommandProposalError::MissingProposals)?,
+            _ => return Err(CommandProposalError::MissingProposals),
+        };
+        if raw_proposals.is_empty() {
+            return Err(CommandProposalError::MissingProposals);
+        }
+
+        raw_proposals
+            .iter()
+            .enumerate()
+            .map(|(index, proposal)| Self::from_value(index, proposal))
+            .collect()
+    }
+
+    fn from_value(index: usize, value: &JsonValue) -> Result<Self, CommandProposalError> {
+        let Some(object) = value.as_object() else {
+            return Err(CommandProposalError::MissingCommand { index });
+        };
+        let command = object
+            .get("command")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or(CommandProposalError::MissingCommand { index })?;
+        let reason = object
+            .get("reason")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or(CommandProposalError::MissingReason { index })?;
+        let risk_raw = object
+            .get("risk")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| CommandProposalError::InvalidRisk {
+                index,
+                value: "<missing>".to_string(),
+            })?;
+        let risk =
+            CommandRisk::parse(risk_raw).ok_or_else(|| CommandProposalError::InvalidRisk {
+                index,
+                value: risk_raw.to_string(),
+            })?;
+        let permission_raw = object
+            .get("permission")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| CommandProposalError::InvalidPermission {
+                index,
+                value: "<missing>".to_string(),
+            })?;
+        let permission = CommandPermission::parse(permission_raw).ok_or_else(|| {
+            CommandProposalError::InvalidPermission {
+                index,
+                value: permission_raw.to_string(),
+            }
+        })?;
+
+        if matches!(risk, CommandRisk::High | CommandRisk::Critical)
+            && !matches!(
+                permission,
+                CommandPermission::StrongReview | CommandPermission::Deny
+            )
+        {
+            return Err(CommandProposalError::StrongReviewRequired {
+                index,
+                risk: risk.label(),
+            });
+        }
+
+        Ok(Self {
+            command,
+            reason,
+            risk,
+            permission,
+        })
     }
 }
 
@@ -431,6 +618,73 @@ mod tests {
         assert!(matches!(error, ProviderError::CliExit { .. }));
     }
 
+    #[test]
+    fn command_proposals_parse_reason_risk_and_permission() {
+        let proposals = CommandProposal::parse_many(
+            &json!({
+                "proposals": [
+                    {
+                        "command": "git status",
+                        "reason": "Inspect the repo before making changes.",
+                        "risk": "low",
+                        "permission": "review"
+                    },
+                    {
+                        "command": "rm -rf build",
+                        "reason": "Clean a broken build directory.",
+                        "risk": "high",
+                        "permission": "strong-review"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(proposals.len(), 2);
+        assert_eq!(proposals[0].risk, CommandRisk::Low);
+        assert_eq!(proposals[0].permission, CommandPermission::Review);
+        assert_eq!(proposals[1].risk, CommandRisk::High);
+        assert_eq!(proposals[1].permission, CommandPermission::StrongReview);
+    }
+
+    #[test]
+    fn high_risk_proposals_require_strong_review() {
+        let error = CommandProposal::parse_many(
+            &json!([
+                {
+                    "command": "sudo reboot",
+                    "reason": "Restart the machine.",
+                    "risk": "critical",
+                    "permission": "review"
+                }
+            ])
+            .to_string(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CommandProposalError::StrongReviewRequired { .. }
+        ));
+    }
+
+    #[test]
+    fn propose_commands_runs_provider_and_parses_json_payload() {
+        let provider = AgentProviderConfig {
+            kind: AgentProviderKind::Cli,
+            model: None,
+            endpoint: None,
+            command: proposal_cli_command(),
+        };
+
+        let adapter = ProviderAdapter::from_provider_config(&provider).unwrap();
+        let proposals = adapter.propose_commands("hello provider").unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].command, "git status");
+        assert_eq!(proposals[0].permission, CommandPermission::Review);
+    }
+
     fn spawn_fake_http_server(
         status_line: &'static str,
         body: String,
@@ -440,9 +694,42 @@ mod tests {
         let endpoint = format!("http://{}/v1/responses", listener.local_addr().unwrap());
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buffer = [0_u8; 4096];
-            let count = stream.read(&mut buffer).unwrap();
-            let request = String::from_utf8_lossy(&buffer[..count]).to_string();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            let mut expected_len = None;
+
+            loop {
+                let count = stream.read(&mut buffer).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+
+                if expected_len.is_none()
+                    && let Some(header_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if name.eq_ignore_ascii_case("content-length") {
+                                value.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default();
+                    expected_len = Some(header_end + 4 + content_length);
+                }
+
+                if expected_len.is_some_and(|expected_len| request.len() >= expected_len) {
+                    break;
+                }
+            }
+
+            let request = String::from_utf8_lossy(&request).to_string();
             if let Some(fragment) = expected_fragment {
                 assert!(request.contains(fragment), "{request}");
             }
@@ -492,6 +779,36 @@ mod tests {
                 "sh".to_string(),
                 "-lc".to_string(),
                 "printf provider-fail >&2; exit 17".to_string(),
+            ]
+        }
+    }
+
+    fn proposal_cli_command() -> Vec<String> {
+        let payload = json!([
+            {
+                "command": "git status",
+                "reason": "Inspect the repository state.",
+                "risk": "low",
+                "permission": "review"
+            }
+        ])
+        .to_string();
+
+        #[cfg(windows)]
+        {
+            vec![
+                "cmd".to_string(),
+                "/C".to_string(),
+                format!("echo {payload}"),
+            ]
+        }
+
+        #[cfg(not(windows))]
+        {
+            vec![
+                "sh".to_string(),
+                "-lc".to_string(),
+                format!("printf '%s' '{payload}'"),
             ]
         }
     }

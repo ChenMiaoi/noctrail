@@ -13,6 +13,7 @@ pub mod gui;
 pub mod input;
 pub mod redaction;
 
+use noctrail_agent::CommandProposal;
 use noctrail_layout::{
     FocusDirection, LayoutError, LayoutRect, PaneLayout, SplitAxis, WorkspaceId, WorkspaceSet,
 };
@@ -139,6 +140,11 @@ struct CommandBlockObserver {
     current: Option<CommandBlock>,
     completed: Vec<CommandBlock>,
     selected: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct AgentProposalState {
+    proposals: Vec<CommandProposal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,6 +361,7 @@ pub struct TerminalPane {
     last_damage: DamageSet,
     status_line: PaneStatusLine,
     block_observer: CommandBlockObserver,
+    agent_proposals: AgentProposalState,
 }
 
 impl fmt::Debug for TerminalPane {
@@ -385,6 +392,7 @@ impl TerminalPane {
             last_damage: full_frame_damage(terminal_size),
             status_line: PaneStatusLine::default(),
             block_observer: CommandBlockObserver::default(),
+            agent_proposals: AgentProposalState::default(),
         }
     }
 
@@ -410,6 +418,7 @@ impl TerminalPane {
             last_damage: full_frame_damage(terminal_size),
             status_line,
             block_observer: CommandBlockObserver::default(),
+            agent_proposals: AgentProposalState::default(),
         })
     }
 
@@ -560,6 +569,18 @@ impl TerminalPane {
             cwd,
             explicit_files: explicit_files.to_vec(),
         }
+    }
+
+    pub fn agent_command_proposals(&self) -> &[CommandProposal] {
+        &self.agent_proposals.proposals
+    }
+
+    pub fn set_agent_command_proposals(&mut self, proposals: Vec<CommandProposal>) {
+        self.agent_proposals.proposals = proposals;
+    }
+
+    pub fn clear_agent_command_proposals(&mut self) {
+        self.agent_proposals.proposals.clear();
     }
 
     pub fn advance_output(&mut self, bytes: &[u8]) {
@@ -1051,6 +1072,19 @@ impl DesktopApp {
 
     pub fn agent_explicit_files(&self) -> &[PathBuf] {
         &self.explicit_agent_files
+    }
+
+    pub fn agent_command_proposals(&self) -> &[CommandProposal] {
+        self.active_pane_ref().agent_command_proposals()
+    }
+
+    pub fn set_agent_command_proposals(&mut self, proposals: Vec<CommandProposal>) {
+        self.active_pane_mut()
+            .set_agent_command_proposals(proposals);
+    }
+
+    pub fn clear_agent_command_proposals(&mut self) {
+        self.active_pane_mut().clear_agent_command_proposals();
     }
 
     pub fn mouse_tracking_mode(&self) -> MouseTrackingMode {
@@ -2399,6 +2433,23 @@ mod tests {
                 PathBuf::from("/tmp/noctrail/crates/noctrail-app/src/lib.rs"),
             ]
         );
+    }
+
+    #[test]
+    fn agent_command_proposals_stay_read_only_on_desktop_state() {
+        let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(20, 4));
+        app.set_agent_command_proposals(vec![CommandProposal {
+            command: "git status".to_string(),
+            reason: "Inspect the repository state.".to_string(),
+            risk: noctrail_agent::CommandRisk::Low,
+            permission: noctrail_agent::CommandPermission::Review,
+        }]);
+
+        assert_eq!(app.agent_command_proposals().len(), 1);
+        assert_eq!(app.agent_command_proposals()[0].command, "git status");
+
+        app.clear_agent_command_proposals();
+        assert!(app.agent_command_proposals().is_empty());
     }
 
     #[test]

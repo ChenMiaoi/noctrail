@@ -21,6 +21,7 @@ use noctrail_layout::{FocusDirection, LayoutRect, SplitAxis};
 use noctrail_pty::{PtyCommand, PtySize};
 use noctrail_render::{PaneBorderStyle, RenderBackend, Rgba};
 use noctrail_term::{Position, SelectionMode};
+use serde_json::json;
 use winit::keyboard::{Key, ModifiersState};
 
 const HELP: &str = "\
@@ -32,6 +33,7 @@ Usage:
 Commands:
   agent-context-smoke Run the read-only agent context preview probe
   agent-default-smoke Run the default-off agent policy probe
+  agent-proposal-smoke Run the command proposal suggestion probe
   agent-provider-smoke Run the provider failure isolation probe
   block-smoke Run the block browser/history probe
   crash-smoke Run the panic-hook recovery probe
@@ -61,6 +63,7 @@ struct StartupOptions {
 enum StartupCommand {
     AgentContextSmoke,
     AgentDefaultSmoke,
+    AgentProposalSmoke,
     AgentProviderSmoke,
     BlockSmoke,
     CrashSmoke,
@@ -131,6 +134,12 @@ fn main() {
         }
         StartupCommand::AgentDefaultSmoke => {
             if let Err(error) = run_agent_default_smoke() {
+                eprintln!("{error}");
+                process::exit(1);
+            }
+        }
+        StartupCommand::AgentProposalSmoke => {
+            if let Err(error) = run_agent_proposal_smoke() {
                 eprintln!("{error}");
                 process::exit(1);
             }
@@ -213,6 +222,10 @@ fn parse_startup_options(args: &[String]) -> Result<StartupOptions, StartupError
             }
             "agent-default-smoke" if !command_set => {
                 command = StartupCommand::AgentDefaultSmoke;
+                command_set = true;
+            }
+            "agent-proposal-smoke" if !command_set => {
+                command = StartupCommand::AgentProposalSmoke;
                 command_set = true;
             }
             "agent-provider-smoke" if !command_set => {
@@ -774,6 +787,114 @@ fn run_agent_context_smoke() -> Result<(), Box<dyn std::error::Error>> {
             .join(","),
     );
     println!("agent context smoke ok");
+    Ok(())
+}
+
+fn run_agent_proposal_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    let mut app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24))?;
+    app.set_block_observer_enabled(true);
+    app.advance_output(&block_probe_bytes(
+        "cargo test -p noctrail-app",
+        "/tmp/noctrail-agent-proposal",
+        0,
+        34,
+        "current context\n",
+    ));
+    let _ = app.select_newest_command_block();
+    app.set_agent_explicit_files(vec![PathBuf::from("/tmp/noctrail/Cargo.toml")]);
+
+    let preview = redaction::redact_agent_context_preview(&app.agent_context_preview());
+    let prompt = format_agent_prompt(&preview);
+    let executed_marker = env::temp_dir().join(format!(
+        "noctrail-agent-proposal-executed-{}",
+        process::id()
+    ));
+    let fixture_path = env::temp_dir().join(format!(
+        "noctrail-agent-proposal-payload-{}.json",
+        process::id()
+    ));
+    let _ = fs::remove_file(&executed_marker);
+    let _ = fs::remove_file(&fixture_path);
+
+    let proposal_command = inert_proposal_command(&executed_marker);
+    fs::write(
+        &fixture_path,
+        json!({
+            "proposals": [
+                {
+                    "command": proposal_command,
+                    "reason": "Inspect the repo before changing files.",
+                    "risk": "low",
+                    "permission": "review"
+                },
+                {
+                    "command": "rm -rf build",
+                    "reason": "Remove an inconsistent build directory.",
+                    "risk": "high",
+                    "permission": "strong-review"
+                }
+            ]
+        })
+        .to_string(),
+    )?;
+
+    let config = AgentConfig {
+        enabled: true,
+        read_env: false,
+        read_history: false,
+        provider: Some(AgentProviderConfig {
+            kind: AgentProviderKind::Cli,
+            model: None,
+            endpoint: None,
+            command: successful_cli_proposal_command(&fixture_path),
+        }),
+    };
+    let adapter = ProviderAdapter::from_agent_config(&config)?
+        .ok_or("agent proposal provider was disabled")?;
+    let proposals = adapter.propose_commands(&prompt)?;
+    if proposals.len() != 2 {
+        return Err(format!("expected 2 command proposals, got {}", proposals.len()).into());
+    }
+    if proposals[0].reason.is_empty() {
+        return Err("first proposal lost its reason".into());
+    }
+    if proposals[0].risk.label() != "low" || proposals[0].permission.label() != "review" {
+        return Err("first proposal lost risk/permission metadata".into());
+    }
+    if proposals[1].risk.label() != "high" || proposals[1].permission.label() != "strong-review" {
+        return Err("high-risk proposal did not require strong review".into());
+    }
+
+    app.set_agent_command_proposals(proposals.clone());
+    if app.agent_command_proposals().len() != proposals.len() {
+        return Err("desktop state lost the parsed agent proposals".into());
+    }
+
+    app.write_input(shell_marker_command("NOCTRAIL_AGENT_PROPOSAL_OK").as_bytes())?;
+    app.write_input(shell_exit_command().as_bytes())?;
+    thread::sleep(Duration::from_millis(100));
+    let output = read_all_runtime_output(&mut app)?;
+    let _ = app.close_runtime()?;
+    let _ = fs::remove_file(&fixture_path);
+
+    if executed_marker.exists() {
+        let _ = fs::remove_file(&executed_marker);
+        return Err("agent proposal was executed instead of remaining a suggestion".into());
+    }
+
+    let text = String::from_utf8_lossy(&output);
+    if !text.contains("NOCTRAIL_AGENT_PROPOSAL_OK") {
+        return Err("agent proposal flow broke foreground shell output".into());
+    }
+
+    println!(
+        "proposals={} risk={} permission={} command={}",
+        proposals.len(),
+        proposals[1].risk.label(),
+        proposals[1].permission.label(),
+        proposals[0].command
+    );
+    println!("agent proposal smoke ok");
     Ok(())
 }
 
@@ -1596,6 +1717,38 @@ fn failing_cli_provider_command() -> Vec<String> {
     }
 }
 
+fn successful_cli_proposal_command(path: &std::path::Path) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        vec![
+            "cmd".to_string(),
+            "/C".to_string(),
+            format!("type \"{}\"", path.display()),
+        ]
+    }
+
+    #[cfg(not(windows))]
+    {
+        vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            format!("cat \"{}\"", path.display()),
+        ]
+    }
+}
+
+fn inert_proposal_command(path: &std::path::Path) -> String {
+    #[cfg(windows)]
+    {
+        format!("cmd /C echo agent-ran>\"{}\"", path.display())
+    }
+
+    #[cfg(not(windows))]
+    {
+        format!("sh -lc 'printf agent-ran > \"{}\"'", path.display())
+    }
+}
+
 fn display_status_path(path: Option<&std::path::Path>) -> String {
     path.map(|path| path.display().to_string())
         .unwrap_or_else(|| "none".to_string())
@@ -1642,6 +1795,16 @@ mod tests {
             .expect("options should parse");
 
         assert_eq!(options.command, StartupCommand::AgentProviderSmoke);
+        assert_eq!(options.config_path, None);
+        assert!(!options.safe_mode);
+    }
+
+    #[test]
+    fn parses_agent_proposal_smoke_command() {
+        let options = parse_startup_options(&["agent-proposal-smoke".to_string()])
+            .expect("options should parse");
+
+        assert_eq!(options.command, StartupCommand::AgentProposalSmoke);
         assert_eq!(options.config_path, None);
         assert!(!options.safe_mode);
     }

@@ -907,6 +907,17 @@ impl GuiApp {
                 title.push_str(&preview_paths(&preview.explicit_files, 48));
             }
         }
+        if let Some(proposal) = self.app.agent_command_proposals().first() {
+            title.push_str(" | agent-proposal");
+            title.push_str(" | risk ");
+            title.push_str(proposal.risk.label());
+            title.push_str(" | permission ");
+            title.push_str(proposal.permission.label());
+            title.push_str(" | cmd ");
+            title.push_str(&preview_text(&proposal.command, 32));
+            title.push_str(" | reason ");
+            title.push_str(&preview_text(&proposal.reason, 32));
+        }
         if let Some(palette) = self.command_palette.as_ref() {
             title.push_str(" | palette ");
             if palette.query.is_empty() {
@@ -2145,6 +2156,27 @@ mod tests {
         assert!(title.contains("cwd /tmp/noctrail-agent"));
         assert!(title.contains("files 2"));
         assert!(title.contains("/tmp/noctrail/Cargo.toml"));
+    }
+
+    #[test]
+    fn title_reflects_agent_command_proposals() {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
+        gui.app
+            .set_agent_command_proposals(vec![noctrail_agent::CommandProposal {
+                command: "git status".to_string(),
+                reason: "Inspect the repository state.".to_string(),
+                risk: noctrail_agent::CommandRisk::Low,
+                permission: noctrail_agent::CommandPermission::Review,
+            }]);
+
+        let title = gui.title_text();
+
+        assert!(title.contains("agent-proposal"));
+        assert!(title.contains("risk low"));
+        assert!(title.contains("permission review"));
+        assert!(title.contains("cmd git status"));
+        assert!(title.contains("reason Inspect the repository state."));
     }
 
     #[test]
