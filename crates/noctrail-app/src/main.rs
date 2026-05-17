@@ -1,13 +1,20 @@
-use std::{env, path::PathBuf, process};
+use std::{
+    env,
+    path::PathBuf,
+    process,
+    time::{Duration, Instant},
+};
 
 use noctrail_app::{
     DesktopApp, PaneChromeConfig,
     gui::{self, GuiLaunchOptions},
+    input,
 };
 use noctrail_config::{Config, ConfigError, RendererBackend as ConfigRendererBackend, ThemeConfig};
-use noctrail_layout::LayoutRect;
-use noctrail_pty::PtySize;
+use noctrail_layout::{FocusDirection, LayoutRect, SplitAxis};
+use noctrail_pty::{PtyCommand, PtySize};
 use noctrail_render::{PaneBorderStyle, RenderBackend, Rgba};
+use winit::keyboard::{Key, ModifiersState};
 
 const HELP: &str = "\
 Noctrail app smoke harness
@@ -17,6 +24,7 @@ Usage:
 
 Commands:
   gui       Open the GUI shell window (default)
+  perf-smoke Run the performance smoke probe
   smoke     Spawn a shell, build the single-pane frame, and shut it down
   help      Print this help text
 
@@ -36,6 +44,7 @@ struct StartupOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StartupCommand {
     Gui,
+    PerfSmoke,
     Smoke,
     Help,
 }
@@ -86,6 +95,12 @@ fn main() {
                 process::exit(1);
             }
         }
+        StartupCommand::PerfSmoke => {
+            if let Err(error) = run_perf_smoke(&options) {
+                eprintln!("{error}");
+                process::exit(1);
+            }
+        }
         StartupCommand::Smoke => {
             if let Err(error) = run_smoke(&options) {
                 eprintln!("{error}");
@@ -106,6 +121,10 @@ fn parse_startup_options(args: &[String]) -> Result<StartupOptions, StartupError
         match args[index].as_str() {
             "gui" | "run" if !command_set => {
                 command = StartupCommand::Gui;
+                command_set = true;
+            }
+            "perf-smoke" if !command_set => {
+                command = StartupCommand::PerfSmoke;
                 command_set = true;
             }
             "smoke" if !command_set => {
@@ -247,6 +266,79 @@ fn run_smoke(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>>
             .as_deref()
             .unwrap_or("none"),
     );
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PerfSmokeReport {
+    high_output_p95_ms: f64,
+    scrollback_p95_ms: f64,
+    multi_pane_p95_ms: f64,
+    input_encode_p95_ms: f64,
+    idle_premature_redraw: bool,
+    idle_next_wakeup_ms: u128,
+}
+
+fn run_perf_smoke(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>> {
+    let launch_options = resolve_launch_options(options)?;
+    let high_output_p95_ms = measure_high_output_p95_ms();
+    let scrollback_p95_ms = measure_scrollback_p95_ms();
+    let multi_pane_p95_ms = measure_multi_pane_p95_ms()?;
+    let input_encode_p95_ms = measure_input_encode_p95_ms();
+    let idle = gui::idle_schedule_probe(&launch_options.theme);
+    let report = PerfSmokeReport {
+        high_output_p95_ms,
+        scrollback_p95_ms,
+        multi_pane_p95_ms,
+        input_encode_p95_ms,
+        idle_premature_redraw: idle.premature_redraw,
+        idle_next_wakeup_ms: idle.next_wakeup.as_millis(),
+    };
+
+    println!(
+        "high_output_p95_ms={:.3} scrollback_p95_ms={:.3} multi_pane_p95_ms={:.3} input_encode_p95_ms={:.3} idle_next_wakeup_ms={} idle_premature_redraw={}",
+        report.high_output_p95_ms,
+        report.scrollback_p95_ms,
+        report.multi_pane_p95_ms,
+        report.input_encode_p95_ms,
+        report.idle_next_wakeup_ms,
+        report.idle_premature_redraw,
+    );
+
+    const P95_BUDGET_MS: f64 = 30.0;
+    if report.high_output_p95_ms > P95_BUDGET_MS {
+        return Err(format!(
+            "high output p95 exceeded budget: {:.3}ms",
+            report.high_output_p95_ms
+        )
+        .into());
+    }
+    if report.scrollback_p95_ms > P95_BUDGET_MS {
+        return Err(format!(
+            "scrollback p95 exceeded budget: {:.3}ms",
+            report.scrollback_p95_ms
+        )
+        .into());
+    }
+    if report.multi_pane_p95_ms > P95_BUDGET_MS {
+        return Err(format!(
+            "multi-pane p95 exceeded budget: {:.3}ms",
+            report.multi_pane_p95_ms
+        )
+        .into());
+    }
+    if report.input_encode_p95_ms > P95_BUDGET_MS {
+        return Err(format!(
+            "input encoding p95 exceeded budget: {:.3}ms",
+            report.input_encode_p95_ms
+        )
+        .into());
+    }
+    if report.idle_premature_redraw {
+        return Err("idle scheduler requested redraw before the blink deadline".into());
+    }
+
+    println!("perf smoke ok");
     Ok(())
 }
 
@@ -403,6 +495,131 @@ fn shell_exit_command() -> &'static str {
     "exit\r\n"
 }
 
+fn measure_high_output_p95_ms() -> f64 {
+    let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(120, 40));
+    let mut samples = Vec::with_capacity(512);
+
+    for index in 0..512 {
+        let line = format!("line-{index:04}\r\n");
+        let started_at = Instant::now();
+        app.advance_output(line.as_bytes());
+        let _ = app.frame();
+        samples.push(started_at.elapsed());
+    }
+
+    p95_millis(&mut samples)
+}
+
+fn measure_scrollback_p95_ms() -> f64 {
+    let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(120, 40));
+    for index in 0..2_000 {
+        let line = format!("scrollback-{index:05}\r\n");
+        app.advance_output(line.as_bytes());
+    }
+
+    let mut samples = Vec::with_capacity(128);
+    for step in 0..128 {
+        let delta = if step % 2 == 0 { 1 } else { -1 };
+        let started_at = Instant::now();
+        app.scroll_scrollback(delta);
+        let _ = app.frame();
+        samples.push(started_at.elapsed());
+    }
+
+    p95_millis(&mut samples)
+}
+
+fn measure_multi_pane_p95_ms() -> Result<f64, Box<dyn std::error::Error>> {
+    let mut app = DesktopApp::spawn(
+        LayoutRect::new(0, 0, 120, 80),
+        perf_pane_command(),
+        PtySize::new(120, 40),
+    )?;
+    app.advance_output(b"pane-1\r\n");
+
+    for index in 0..7 {
+        let axis = if index % 2 == 0 {
+            SplitAxis::Horizontal
+        } else {
+            SplitAxis::Vertical
+        };
+        app.split_active_pane_with_axis(perf_pane_command(), axis)?;
+        let line = format!("pane-{}\r\n", index + 2);
+        app.advance_output(line.as_bytes());
+    }
+
+    let directions = [
+        FocusDirection::Left,
+        FocusDirection::Up,
+        FocusDirection::Right,
+        FocusDirection::Down,
+    ];
+    let mut samples = Vec::with_capacity(128);
+    for index in 0..128 {
+        focus_any_direction(&mut app, &directions)?;
+        let started_at = Instant::now();
+        app.advance_output(b"tick\r\n");
+        let _ = app.frame();
+        samples.push(started_at.elapsed());
+        if index % 16 == 15 {
+            app.resize_active_split(FocusDirection::Right, 1)?;
+        }
+    }
+
+    Ok(p95_millis(&mut samples))
+}
+
+fn measure_input_encode_p95_ms() -> f64 {
+    let key = Key::Character("a".into());
+    let modifiers = ModifiersState::default();
+    let mut samples = Vec::with_capacity(128);
+
+    for _ in 0..128 {
+        let started_at = Instant::now();
+        let bytes = input::key_to_pty_bytes(&key, Some("a"), modifiers)
+            .expect("plain character key should encode");
+        samples.push(started_at.elapsed());
+        debug_assert_eq!(bytes, b"a");
+    }
+
+    p95_millis(&mut samples)
+}
+
+fn focus_any_direction(
+    app: &mut DesktopApp,
+    directions: &[FocusDirection],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for direction in directions {
+        if app.focus_direction(*direction).is_ok() {
+            return Ok(());
+        }
+    }
+
+    Err("unable to move focus between panes during perf smoke".into())
+}
+
+fn perf_pane_command() -> PtyCommand {
+    #[cfg(windows)]
+    {
+        let mut command = PtyCommand::new("cmd");
+        command.args(["/C", "exit 0"]);
+        command
+    }
+
+    #[cfg(not(windows))]
+    {
+        let mut command = PtyCommand::new("sh");
+        command.args(["-lc", "exit 0"]);
+        command
+    }
+}
+
+fn p95_millis(samples: &mut [Duration]) -> f64 {
+    samples.sort_unstable();
+    let index = ((samples.len().saturating_sub(1)) * 95) / 100;
+    samples[index].as_secs_f64() * 1000.0
+}
+
 fn animations_enabled(theme: &ThemeConfig) -> bool {
     theme.animation.enabled && !theme.low_power.enabled
 }
@@ -439,6 +656,16 @@ mod tests {
             Some(PathBuf::from("/tmp/noctrail.toml"))
         );
         assert!(options.safe_mode);
+    }
+
+    #[test]
+    fn parses_perf_smoke_command() {
+        let options =
+            parse_startup_options(&["perf-smoke".to_string()]).expect("options should parse");
+
+        assert_eq!(options.command, StartupCommand::PerfSmoke);
+        assert_eq!(options.config_path, None);
+        assert!(!options.safe_mode);
     }
 
     #[test]
@@ -641,6 +868,15 @@ mod tests {
         assert_eq!(mode.blur_mode, "off");
         assert_eq!(mode.blur_fallback_reason, Some("low-power"));
         assert!(!animations_enabled(&launch.theme));
+    }
+
+    #[test]
+    fn p95_millis_selects_the_upper_tail_sample() {
+        let mut samples = vec![Duration::from_millis(1); 20];
+        samples[18] = Duration::from_millis(40);
+        samples[19] = Duration::from_millis(40);
+
+        assert_eq!(p95_millis(&mut samples), 40.0);
     }
 
     fn temp_config_path(label: &str) -> PathBuf {

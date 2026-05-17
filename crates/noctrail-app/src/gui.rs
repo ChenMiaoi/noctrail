@@ -73,6 +73,32 @@ impl Default for GuiLaunchOptions {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdleScheduleProbe {
+    pub premature_redraw: bool,
+    pub next_wakeup: Duration,
+}
+
+pub fn idle_schedule_probe(theme: &ThemeConfig) -> IdleScheduleProbe {
+    let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
+    let mut gui = GuiApp::new(
+        app,
+        GuiLaunchOptions {
+            theme: theme.clone(),
+            ..GuiLaunchOptions::default()
+        },
+    );
+    let now = Instant::now();
+    gui.window_focused = true;
+    gui.cursor_visible = true;
+    gui.next_cursor_blink_at = now + gui.frame_interval;
+
+    IdleScheduleProbe {
+        premature_redraw: gui.advance_cursor_blink(now + gui.frame_interval / 2),
+        next_wakeup: gui.next_cursor_blink_at.saturating_duration_since(now),
+    }
+}
+
 pub fn run_with_options(options: GuiLaunchOptions) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new()?;
     let initial_surface = LayoutRect::new(
@@ -2143,6 +2169,14 @@ mod tests {
 
         assert!(observed, "ime commit did not reach the shell");
         Ok(())
+    }
+
+    #[test]
+    fn idle_schedule_probe_waits_for_the_blink_deadline() {
+        let probe = idle_schedule_probe(&ThemeConfig::default());
+
+        assert!(!probe.premature_redraw);
+        assert!(probe.next_wakeup >= Duration::from_millis(500));
     }
 
     #[cfg(not(windows))]
