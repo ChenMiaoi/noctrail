@@ -9,9 +9,9 @@ pub mod input;
 
 use noctrail_layout::LayoutRect;
 use noctrail_pty::{PtyCommand, PtyError, PtyExitStatus, PtySize};
-use noctrail_render::{RenderBackend, RenderPlan, RenderRect};
+use noctrail_render::{RenderBackend, RenderInput, RenderPlan, RenderRect};
 use noctrail_runtime::{PaneId, PaneRuntime};
-use noctrail_term::{LineEnding, TerminalSnapshot, TerminalState};
+use noctrail_term::{DamageSet, LineEnding, TerminalSnapshot, TerminalState};
 use thiserror::Error;
 
 const ROOT_PANE_ID: PaneId = PaneId::new(1);
@@ -29,6 +29,7 @@ pub struct TerminalPane {
     terminal: TerminalState,
     runtime: Option<PaneRuntime>,
     terminal_size: PtySize,
+    last_damage: DamageSet,
 }
 
 impl fmt::Debug for TerminalPane {
@@ -44,14 +45,18 @@ impl fmt::Debug for TerminalPane {
 
 impl TerminalPane {
     pub fn new(pane_id: PaneId, terminal_size: PtySize) -> Self {
+        let mut terminal = TerminalState::new(
+            usize::from(terminal_size.cols),
+            usize::from(terminal_size.rows),
+        );
+        let _ = terminal.grid_mut().take_dirty_rows();
+
         Self {
             pane_id,
-            terminal: TerminalState::new(
-                usize::from(terminal_size.cols),
-                usize::from(terminal_size.rows),
-            ),
+            terminal,
             runtime: None,
             terminal_size,
+            last_damage: full_frame_damage(terminal_size),
         }
     }
 
@@ -61,14 +66,18 @@ impl TerminalPane {
         terminal_size: PtySize,
     ) -> Result<Self, AppError> {
         let runtime = PaneRuntime::spawn(command, terminal_size)?;
+        let mut terminal = TerminalState::new(
+            usize::from(terminal_size.cols),
+            usize::from(terminal_size.rows),
+        );
+        let _ = terminal.grid_mut().take_dirty_rows();
+
         Ok(Self {
             pane_id,
-            terminal: TerminalState::new(
-                usize::from(terminal_size.cols),
-                usize::from(terminal_size.rows),
-            ),
+            terminal,
             runtime: Some(runtime),
             terminal_size,
+            last_damage: full_frame_damage(terminal_size),
         })
     }
 
@@ -121,7 +130,7 @@ impl TerminalPane {
     }
 
     pub fn advance_output(&mut self, bytes: &[u8]) {
-        self.terminal.advance_bytes(bytes);
+        self.last_damage = self.terminal.advance_bytes(bytes).damage;
     }
 
     pub fn write_input(&mut self, bytes: &[u8]) -> Result<usize, AppError> {
@@ -142,6 +151,8 @@ impl TerminalPane {
         self.terminal
             .resize(usize::from(size.cols), usize::from(size.rows));
         self.terminal_size = size;
+        self.last_damage = full_frame_damage(size);
+        let _ = self.terminal.grid_mut().take_dirty_rows();
         Ok(())
     }
 
@@ -150,16 +161,18 @@ impl TerminalPane {
     }
 
     pub fn render_plan(&self, surface: LayoutRect, backend: RenderBackend) -> RenderPlan {
-        RenderPlan::from_terminal(
-            RenderRect::new(
+        let snapshot = self.snapshot();
+        RenderPlan::from_input(RenderInput {
+            viewport: RenderRect::new(
                 usize::from(surface.x),
                 usize::from(surface.y),
                 usize::from(surface.width),
                 usize::from(surface.height),
             ),
             backend,
-            &self.snapshot(),
-        )
+            snapshot: &snapshot,
+            damage: &self.last_damage,
+        })
     }
 
     pub fn close_runtime(&mut self) -> Result<Option<PtyExitStatus>, AppError> {
@@ -278,6 +291,13 @@ fn selection_line_ending() -> LineEnding {
     }
 }
 
+fn full_frame_damage(size: PtySize) -> DamageSet {
+    DamageSet {
+        dirty_rows: (0..usize::from(size.rows)).collect(),
+        full_frame: true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,6 +312,8 @@ mod tests {
         assert_eq!(frame.terminal_size, PtySize::new(10, 3));
         assert!(frame.process_id.is_none());
         assert_eq!(frame.render_plan.rows.len(), 3);
+        assert!(frame.render_plan.damage.full_frame);
+        assert_eq!(frame.render_plan.damage.dirty_rows, vec![0, 1, 2]);
         assert_eq!(frame.render_plan.scrollback_rows, 0);
         assert!(frame.render_plan.selection.is_none());
     }
@@ -304,6 +326,8 @@ mod tests {
 
         let frame = app.frame();
         assert_eq!(frame.render_plan.rows.len(), 2);
+        assert_eq!(frame.render_plan.damage.dirty_rows, vec![0]);
+        assert!(!frame.render_plan.damage.full_frame);
         assert_eq!(frame.render_plan.rows[0].glyphs[0].text, "h");
         assert_eq!(frame.render_plan.rows[0].glyphs[1].text, "i");
     }
@@ -316,6 +340,8 @@ mod tests {
         let frame = app.frame();
         assert_eq!(frame.surface, LayoutRect::new(10, 20, 160, 90));
         assert_eq!(frame.terminal_size, PtySize::new(7, 4));
+        assert!(frame.render_plan.damage.full_frame);
+        assert_eq!(frame.render_plan.damage.dirty_rows, vec![0, 1, 2, 3]);
         Ok(())
     }
 }

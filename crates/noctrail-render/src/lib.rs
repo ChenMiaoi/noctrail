@@ -1,6 +1,8 @@
 //! Render plan and backend boundary for Noctrail.
 
-use noctrail_term::{Cell, Cursor, ScreenRowSnapshot, Selection, Style, TerminalSnapshot};
+use noctrail_term::{
+    Cell, Cursor, DamageSet, ScreenRowSnapshot, Selection, Style, TerminalSnapshot,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RenderBackend {
@@ -83,10 +85,19 @@ impl RenderRow {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct RenderInput<'a> {
+    pub viewport: RenderRect,
+    pub backend: RenderBackend,
+    pub snapshot: &'a TerminalSnapshot,
+    pub damage: &'a DamageSet,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RenderPlan {
     pub backend: RenderBackend,
     pub viewport: RenderRect,
+    pub damage: DamageSet,
     pub scrollback_rows: usize,
     pub cursor: Cursor,
     pub alternate_screen: bool,
@@ -104,14 +115,28 @@ impl RenderPlan {
         backend: RenderBackend,
         snapshot: &TerminalSnapshot,
     ) -> Self {
-        Self {
-            backend,
+        Self::from_input(RenderInput {
             viewport,
-            scrollback_rows: snapshot.scrollback.len(),
-            cursor: snapshot.cursor,
-            alternate_screen: snapshot.alternate_screen,
-            selection: snapshot.selection.clone(),
-            rows: snapshot
+            backend,
+            snapshot,
+            damage: &DamageSet {
+                dirty_rows: (0..snapshot.rows.len()).collect(),
+                full_frame: true,
+            },
+        })
+    }
+
+    pub fn from_input(input: RenderInput<'_>) -> Self {
+        Self {
+            backend: input.backend,
+            viewport: input.viewport,
+            damage: input.damage.clone(),
+            scrollback_rows: input.snapshot.scrollback.len(),
+            cursor: input.snapshot.cursor,
+            alternate_screen: input.snapshot.alternate_screen,
+            selection: input.snapshot.selection.clone(),
+            rows: input
+                .snapshot
                 .rows
                 .iter()
                 .enumerate()
@@ -187,6 +212,8 @@ mod tests {
 
         assert_eq!(plan.backend, RenderBackend::Gpu);
         assert_eq!(plan.viewport, RenderRect::new(1, 2, 80, 24));
+        assert!(plan.damage.full_frame);
+        assert_eq!(plan.damage.dirty_rows, vec![0]);
         assert_eq!(plan.scrollback_rows, 1);
         assert_eq!(plan.cursor, snapshot.cursor);
         assert!(plan.alternate_screen);
@@ -242,5 +269,31 @@ mod tests {
 
         assert_eq!(plan.rows[0].glyphs[0].text, "e\u{301}");
         assert_eq!(plan.rows[0].glyphs[0].span, 1);
+    }
+
+    #[test]
+    fn from_input_preserves_damage_metadata() {
+        let snapshot = TerminalSnapshot {
+            rows: vec![ScreenRowSnapshot {
+                cells: vec![cell("a"), cell("b"), cell("c")],
+                wrapped: false,
+            }],
+            ..TerminalSnapshot::default()
+        };
+        let damage = DamageSet {
+            dirty_rows: vec![0],
+            full_frame: false,
+        };
+
+        let plan = RenderPlan::from_input(RenderInput {
+            viewport: RenderRect::new(4, 5, 6, 7),
+            backend: RenderBackend::Software,
+            snapshot: &snapshot,
+            damage: &damage,
+        });
+
+        assert_eq!(plan.viewport, RenderRect::new(4, 5, 6, 7));
+        assert_eq!(plan.damage, damage);
+        assert_eq!(plan.rows[0].glyphs.len(), 3);
     }
 }

@@ -290,6 +290,10 @@ mod tests {
             render_plan: RenderPlan {
                 backend: RenderBackend::Gpu,
                 viewport: RenderRect::new(0, 0, 120, 80),
+                damage: noctrail_term::DamageSet {
+                    dirty_rows: vec![1],
+                    full_frame: false,
+                },
                 scrollback_rows: 9,
                 cursor: noctrail_term::Cursor { row: 1, col: 2 },
                 alternate_screen: false,
