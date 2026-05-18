@@ -1,9 +1,7 @@
 use std::{
     error::Error,
-    io::Read,
     path::{Path, PathBuf},
     sync::Arc,
-    sync::mpsc::{self, Receiver, TryRecvError},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -14,7 +12,7 @@ use noctrail_config::{
     ThemeConfig,
 };
 use noctrail_layout::{FocusDirection, LayoutRect, SplitAxis, WorkspaceId};
-use noctrail_pty::{PtyOutputReader, PtySize};
+use noctrail_pty::PtySize;
 use noctrail_render::{
     FontPreferences, GlyphRasterConfig, GpuRenderer, PaneBorderStyle, RenderBackend, RenderGlyph,
     RenderPlan, RenderRect, RenderRow, Rgba, SoftwareRenderPalette, rasterize_software_frame,
@@ -25,10 +23,14 @@ use winit::{
     application::ApplicationHandler,
     dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize},
     event::{ElementState, Ime, MouseButton as WinitMouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
     keyboard::ModifiersState,
-    window::{Window, WindowId},
+    window::{CursorIcon, ResizeDirection, Window, WindowId},
 };
+
+#[cfg(target_os = "macos")]
+use winit::platform::macos::WindowAttributesExtMacOS;
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 
 use crate::{DesktopApp, DesktopFrame, PaneChromeConfig, clipboard::ClipboardBridge, input};
 
@@ -37,6 +39,13 @@ const DEFAULT_WINDOW_HEIGHT: u32 = 800;
 const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const STARTUP_DEBUG_WINDOW: Duration = Duration::from_secs(3);
 const STABLE_DEBUG_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
+const WINDOW_RESIZE_HANDLE_PX: f64 = 6.0;
+const MAX_OUTPUT_DRAINS_PER_EVENT: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuiEvent {
+    RuntimeOutput,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct VisualEffectsPolicy {
@@ -359,7 +368,8 @@ pub fn patch_preview_smoke() -> Result<(), Box<dyn Error>> {
 }
 
 pub fn run_with_options(options: GuiLaunchOptions) -> Result<(), Box<dyn Error>> {
-    let event_loop = EventLoop::new()?;
+    let event_loop = EventLoop::<GuiEvent>::with_user_event().build()?;
+    let event_proxy = event_loop.create_proxy();
     let initial_surface = LayoutRect::new(
         0,
         0,
@@ -373,6 +383,7 @@ pub fn run_with_options(options: GuiLaunchOptions) -> Result<(), Box<dyn Error>>
     );
     let app = DesktopApp::spawn_shell(initial_surface, initial_terminal)?;
     let mut gui = GuiApp::new(app, options);
+    gui.set_event_proxy(event_proxy);
     event_loop.run_app(&mut gui)?;
     Ok(())
 }
@@ -1016,6 +1027,7 @@ struct ReviewPanel {
 struct GuiApp {
     app: DesktopApp,
     launch_options: GuiLaunchOptions,
+    event_proxy: Option<EventLoopProxy<GuiEvent>>,
     config_reloader: Option<ConfigReloader>,
     window: Option<Arc<Window>>,
     renderer: Option<GpuRenderer>,
@@ -1034,7 +1046,6 @@ struct GuiApp {
     mouse_position: Option<PhysicalPosition<f64>>,
     mouse_selection: Option<MouseSelectionDrag>,
     mouse_button: Option<input::MouseButton>,
-    output_rx: Option<Receiver<OutputPumpEvent>>,
     output_thread: Option<JoinHandle<()>>,
     transition: Option<ActiveTransition>,
     started_at: Instant,
@@ -1106,6 +1117,7 @@ impl GuiApp {
         Self {
             app,
             launch_options,
+            event_proxy: None,
             config_reloader,
             window: None,
             renderer: None,
@@ -1124,7 +1136,6 @@ impl GuiApp {
             mouse_position: None,
             mouse_selection: None,
             mouse_button: None,
-            output_rx: None,
             output_thread: None,
             transition: None,
             started_at: now,
@@ -1139,23 +1150,34 @@ impl GuiApp {
         }
     }
 
+    fn set_event_proxy(&mut self, event_proxy: EventLoopProxy<GuiEvent>) {
+        self.event_proxy = Some(event_proxy);
+    }
+
     fn window_id(&self) -> Option<WindowId> {
         self.window.as_ref().map(|window| window.id())
     }
 
     fn attach_output_pump(&mut self) -> Result<(), Box<dyn Error>> {
-        if self.output_rx.is_some() {
+        if self.output_thread.is_some() {
             return Ok(());
         }
 
-        let Some(runtime) = self.app.pane().runtime() else {
+        let Some(runtime) = self.app.pane_mut().runtime_mut() else {
             return Ok(());
         };
-        let reader = runtime.session().clone_output_reader()?;
-        let (tx, rx) = mpsc::channel();
-        let handle = thread::spawn(move || pump_output(reader, tx));
-        self.output_rx = Some(rx);
-        self.output_thread = Some(handle);
+        let Some(rx) = runtime.take_output_notification_receiver()? else {
+            return Ok(());
+        };
+        if let Some(proxy) = self.event_proxy.clone() {
+            self.output_thread = Some(thread::spawn(move || {
+                while rx.recv().is_ok() {
+                    if proxy.send_event(GuiEvent::RuntimeOutput).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
         info!("attached PTY output pump");
         Ok(())
     }
@@ -1364,14 +1386,22 @@ impl GuiApp {
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), Box<dyn Error>> {
         let requested_transparency = self.theme.opacity < 1.0 && !self.launch_options.safe_mode;
-        let attributes = Window::default_attributes()
+        let mut attributes = Window::default_attributes()
             .with_title("Noctrail")
             .with_inner_size(LogicalSize::new(
                 f64::from(DEFAULT_WINDOW_WIDTH),
                 f64::from(DEFAULT_WINDOW_HEIGHT),
             ))
             .with_resizable(true)
+            .with_decorations(false)
             .with_transparent(requested_transparency);
+        #[cfg(target_os = "macos")]
+        {
+            attributes = attributes
+                .with_titlebar_hidden(true)
+                .with_fullsize_content_view(true)
+                .with_movable_by_window_background(true);
+        }
         info!(
             safe_mode = self.launch_options.safe_mode,
             backend = ?self.launch_options.renderer_backend,
@@ -1434,11 +1464,7 @@ impl GuiApp {
         Ok(())
     }
 
-    fn update_title(&self) {
-        if let Some(window) = self.window.as_ref() {
-            window.set_title(&self.title_text());
-        }
-    }
+    fn update_title(&self) {}
 
     fn concise_title_text(&self, frame: &DesktopFrame) -> String {
         let shell = frame.status_line.shell.as_deref().unwrap_or("shell");
@@ -2015,34 +2041,60 @@ impl GuiApp {
     }
 
     fn drain_output_events(&mut self) -> bool {
-        let Some(rx) = self.output_rx.as_ref() else {
+        if let Some(error) = self.app.take_runtime_output_error() {
+            error!(reason = %error, "PTY output pump failed");
+        }
+        if self.app.buffered_runtime_output_bytes() == 0 {
             return false;
-        };
+        }
 
-        let mut received_output = false;
-        loop {
-            match rx.try_recv() {
-                Ok(OutputPumpEvent::Bytes(bytes)) => {
-                    self.app.advance_output(&bytes);
-                    received_output = true;
-                }
-                Ok(OutputPumpEvent::Error(error)) => {
-                    error!(reason = %error, "PTY output pump failed");
-                    break;
-                }
-                Ok(OutputPumpEvent::Eof) => break,
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+        let mut drained_any = false;
+        let mut total_drained_bytes = 0;
+        let mut remaining_bytes = 0;
+        let mut drain_count = 0;
+
+        while drain_count < MAX_OUTPUT_DRAINS_PER_EVENT
+            && self.app.buffered_runtime_output_bytes() > 0
+        {
+            let Ok(drain) = self.app.drain_runtime_output_budget() else {
+                break;
+            };
+            if drain.drained_bytes == 0 {
+                remaining_bytes = drain.remaining_bytes;
+                break;
             }
+
+            for chunk in drain.chunks {
+                self.app.advance_output(&chunk);
+            }
+
+            drained_any = true;
+            total_drained_bytes += drain.drained_bytes;
+            remaining_bytes = drain.remaining_bytes;
+            drain_count += 1;
         }
 
-        if received_output {
-            debug!("drained PTY output into terminal state");
-            self.touch_cursor_blink();
-            self.update_title();
-            self.request_redraw();
+        if !drained_any {
+            return false;
         }
 
-        received_output
+        debug!(
+            drained_bytes = total_drained_bytes,
+            remaining_bytes, drain_count, "drained PTY output into terminal state"
+        );
+        self.touch_cursor_blink();
+        self.request_redraw();
+        if remaining_bytes > 0 {
+            self.requeue_runtime_output_event();
+        }
+
+        true
+    }
+
+    fn requeue_runtime_output_event(&self) {
+        if let Some(proxy) = self.event_proxy.as_ref() {
+            let _ = proxy.send_event(GuiEvent::RuntimeOutput);
+        }
     }
 
     fn handle_ime_event(&mut self, ime: Ime) -> Result<(), Box<dyn Error>> {
@@ -2051,7 +2103,6 @@ impl GuiApp {
             Ime::Preedit(text, _cursor) => {
                 self.ime_preedit = if text.is_empty() { None } else { Some(text) };
                 self.touch_cursor_blink();
-                self.update_title();
                 self.request_redraw();
                 Ok(())
             }
@@ -2062,9 +2113,48 @@ impl GuiApp {
                     self.touch_cursor_blink();
                     self.request_redraw();
                 }
-                self.update_title();
                 Ok(())
             }
+        }
+    }
+
+    fn handle_window_resize_interaction(&self) {
+        if let (Some(window), Some(position)) = (self.window.as_ref(), self.mouse_position)
+            && let Some(direction) = self.resize_direction_for_position(position)
+        {
+            let _ = window.drag_resize_window(direction);
+        }
+    }
+
+    fn resize_direction_for_position(
+        &self,
+        position: PhysicalPosition<f64>,
+    ) -> Option<ResizeDirection> {
+        let window = self.window.as_ref()?;
+        let size = window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return None;
+        }
+
+        let x = position.x;
+        let y = position.y;
+        let width = f64::from(size.width);
+        let height = f64::from(size.height);
+        let left = x <= WINDOW_RESIZE_HANDLE_PX;
+        let right = x >= width - WINDOW_RESIZE_HANDLE_PX;
+        let top = y <= WINDOW_RESIZE_HANDLE_PX;
+        let bottom = y >= height - WINDOW_RESIZE_HANDLE_PX;
+
+        match (left, right, top, bottom) {
+            (true, false, true, false) => Some(ResizeDirection::NorthWest),
+            (false, true, true, false) => Some(ResizeDirection::NorthEast),
+            (true, false, false, true) => Some(ResizeDirection::SouthWest),
+            (false, true, false, true) => Some(ResizeDirection::SouthEast),
+            (true, false, false, false) => Some(ResizeDirection::West),
+            (false, true, false, false) => Some(ResizeDirection::East),
+            (false, false, true, false) => Some(ResizeDirection::North),
+            (false, false, false, true) => Some(ResizeDirection::South),
+            _ => None,
         }
     }
 
@@ -2101,6 +2191,13 @@ impl GuiApp {
         position: PhysicalPosition<f64>,
     ) -> Result<(), Box<dyn Error>> {
         self.mouse_position = Some(position);
+        if let Some(window) = self.window.as_ref() {
+            let cursor = self
+                .resize_direction_for_position(position)
+                .map(CursorIcon::from)
+                .unwrap_or(CursorIcon::Text);
+            window.set_cursor(cursor);
+        }
 
         if self.app.mouse_reporting_enabled() {
             if self.app.mouse_tracking_mode() == MouseTrackingMode::Motion
@@ -2129,7 +2226,6 @@ impl GuiApp {
             );
             self.touch_cursor_blink();
             self.request_redraw();
-            self.update_title();
         }
 
         Ok(())
@@ -2178,6 +2274,21 @@ impl GuiApp {
 
         match state {
             ElementState::Pressed => {
+                if self
+                    .mouse_position
+                    .and_then(|position| self.resize_direction_for_position(position))
+                    .is_some()
+                {
+                    self.handle_window_resize_interaction();
+                    return Ok(());
+                }
+                #[cfg(not(target_os = "macos"))]
+                if self.modifiers.alt_key() {
+                    if let Some(window) = self.window.as_ref() {
+                        let _ = window.drag_window();
+                    }
+                    return Ok(());
+                }
                 if let Some(cell) = cell {
                     self.mouse_selection = Some(MouseSelectionDrag {
                         anchor: cell,
@@ -2187,7 +2298,6 @@ impl GuiApp {
                         .select_viewport_range(cell, cell, SelectionMode::Normal);
                     self.touch_cursor_blink();
                     self.request_redraw();
-                    self.update_title();
                 }
             }
             ElementState::Released => {
@@ -2876,6 +2986,14 @@ fn read_all_runtime_output_for_gui(app: &mut DesktopApp) -> Result<Vec<u8>, Box<
     let mut chunk = [0_u8; 1024];
 
     loop {
+        let drain = runtime.drain_output_budget();
+        for bytes in drain.chunks {
+            output.extend_from_slice(&bytes);
+        }
+        if drain.remaining_bytes > 0 {
+            continue;
+        }
+
         let count = runtime.read_output(&mut chunk)?;
         if count == 0 {
             break;
@@ -2886,14 +3004,13 @@ fn read_all_runtime_output_for_gui(app: &mut DesktopApp) -> Result<Vec<u8>, Box<
     Ok(output)
 }
 
-pub fn pane_chrome_from_theme(theme: &ThemeConfig, font: &FontConfig) -> PaneChromeConfig {
+pub fn pane_chrome_from_theme(theme: &ThemeConfig, _font: &FontConfig) -> PaneChromeConfig {
     let terminal_background = rgba_from_config(theme.color.background);
     let background = mix_rgba(
         rgba_from_config(theme.color.chrome_background),
         terminal_background,
-        0.08,
+        0.03,
     );
-    let chrome_foreground = rgba_from_config(theme.color.chrome_foreground);
     let accent = rgba_from_config(theme.color.chrome_accent);
     let inactive = rgba_from_config(theme.border.inactive);
     PaneChromeConfig {
@@ -2903,28 +3020,16 @@ pub fn pane_chrome_from_theme(theme: &ThemeConfig, font: &FontConfig) -> PaneChr
             inactive: rgba_from_config(theme.border.inactive),
         },
         background,
-        status_background: mix_rgba(chrome_foreground, background, 0.88),
-        status_separator: mix_rgba(accent, background, 0.58),
+        status_background: background,
+        status_separator: mix_rgba(accent, background, 0.3),
         active_indicator: accent,
-        inactive_indicator: mix_rgba(inactive, background, 0.45),
+        inactive_indicator: mix_rgba(inactive, background, 0.2),
         gap: theme.pane.gap,
         padding: theme.pane.padding,
         radius: theme.pane.radius,
-        status_height: status_bar_height(theme, font),
-        status_spacing: status_bar_spacing(theme),
+        status_height: 0,
+        status_spacing: 0,
     }
-}
-
-fn status_bar_height(theme: &ThemeConfig, font: &FontConfig) -> u16 {
-    let line_height = (font.size * font.line_height).round() as u16;
-    line_height
-        .saturating_add(theme.pane.padding.saturating_mul(2))
-        .saturating_add(10)
-        .max(32)
-}
-
-fn status_bar_spacing(theme: &ThemeConfig) -> u16 {
-    theme.pane.padding.saturating_add(4).max(8)
 }
 
 fn rgba_from_config(color: noctrail_config::RgbaColor) -> Rgba {
@@ -2933,39 +3038,6 @@ fn rgba_from_config(color: noctrail_config::RgbaColor) -> Rgba {
         green: color.green,
         blue: color.blue,
         alpha: color.alpha,
-    }
-}
-
-enum OutputPumpEvent {
-    Bytes(Vec<u8>),
-    Eof,
-    Error(String),
-}
-
-fn pump_output(mut reader: PtyOutputReader, tx: mpsc::Sender<OutputPumpEvent>) {
-    debug!("PTY output pump thread started");
-    let mut chunk = [0_u8; 4096];
-    loop {
-        match reader.read(&mut chunk) {
-            Ok(0) => {
-                let _ = tx.send(OutputPumpEvent::Eof);
-                debug!("PTY output pump reached EOF");
-                break;
-            }
-            Ok(count) => {
-                if tx
-                    .send(OutputPumpEvent::Bytes(chunk[..count].to_vec()))
-                    .is_err()
-                {
-                    debug!("PTY output pump receiver dropped");
-                    break;
-                }
-            }
-            Err(error) => {
-                let _ = tx.send(OutputPumpEvent::Error(error.to_string()));
-                break;
-            }
-        }
     }
 }
 
@@ -2998,7 +3070,7 @@ fn exit_on_error<T, E>(event_loop: &ActiveEventLoop, result: Result<T, E>) {
     }
 }
 
-impl ApplicationHandler for GuiApp {
+impl ApplicationHandler<GuiEvent> for GuiApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         info!("GUI application resumed");
         if self.window.is_none() && self.create_window(event_loop).is_err() {
@@ -3168,12 +3240,19 @@ impl ApplicationHandler for GuiApp {
                     }
                     return;
                 }
-                if let Some(bytes) = input::key_event_to_pty_bytes(
-                    event.state,
-                    &event.logical_key,
-                    event.text.as_deref(),
-                    self.modifiers,
-                ) {
+                let key_without_modifiers = event.key_without_modifiers();
+                let key_without_modifiers = match key_without_modifiers.as_ref() {
+                    winit::keyboard::Key::Character(text) => Some(&text[..]),
+                    _ => None,
+                };
+                if let Some(bytes) = input::encode_key_event(input::KeyboardEncodeRequest {
+                    state: event.state,
+                    logical_key: &event.logical_key,
+                    text: event.text.as_deref(),
+                    key_without_modifiers,
+                    modifiers: self.modifiers,
+                    repeat: event.repeat,
+                }) {
                     if self.app.write_input(&bytes).is_err() {
                         event_loop.exit();
                         return;
@@ -3242,9 +3321,16 @@ impl ApplicationHandler for GuiApp {
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         let _ = self.app.close_runtime();
-        self.output_rx.take();
         if let Some(handle) = self.output_thread.take() {
             let _ = handle.join();
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: GuiEvent) {
+        match event {
+            GuiEvent::RuntimeOutput => {
+                let _ = self.drain_output_events();
+            }
         }
     }
 }
@@ -3842,7 +3928,7 @@ mod tests {
 
         assert_eq!(
             gui.app.frame_for_pane(PaneId::new(1))?.surface,
-            LayoutRect::new(0, 10, 120, 10)
+            LayoutRect::new(0, 0, 120, 20)
         );
         let split = gui
             .app
@@ -3850,7 +3936,7 @@ mod tests {
             .expect("split pane should be active");
         assert_eq!(
             gui.app.frame_for_pane(split)?.surface,
-            LayoutRect::new(0, 30, 120, 10)
+            LayoutRect::new(0, 20, 120, 20)
         );
         let split_status = gui
             .app
@@ -4103,7 +4189,6 @@ mod tests {
 
         gui.app.write_input(shell_exit_bytes().as_slice())?;
         let _ = gui.app.close_runtime()?;
-        gui.output_rx.take();
         if let Some(handle) = gui.output_thread.take() {
             let _ = handle.join();
         }
@@ -4111,6 +4196,41 @@ mod tests {
         assert!(
             observed,
             "output pump did not feed shell output into render plan"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn drain_output_events_consumes_multiple_runtime_budgets_in_one_pass()
+    -> Result<(), Box<dyn Error>> {
+        let app = DesktopApp::spawn_shell(LayoutRect::new(0, 0, 120, 80), PtySize::new(80, 24))?;
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
+        gui.attach_output_pump()?;
+        let marker = "NOCTRAIL_MULTI_DRAIN";
+
+        gui.app
+            .write_input(shell_large_output_command_bytes(marker).as_slice())?;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && gui.app.buffered_runtime_output_bytes() == 0 {
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            gui.drain_output_events(),
+            "expected buffered output to drain in one pass"
+        );
+
+        let rendered = rendered_text(&gui.app.frame()).replace('\n', "");
+        gui.app.write_input(shell_exit_bytes().as_slice())?;
+        let _ = gui.app.close_runtime()?;
+        if let Some(handle) = gui.output_thread.take() {
+            let _ = handle.join();
+        }
+
+        assert!(
+            rendered.contains(marker),
+            "multi-budget drain did not preserve trailing output: {rendered:?}"
         );
         Ok(())
     }
@@ -4201,7 +4321,6 @@ mod tests {
 
         gui.app.write_input(shell_exit_bytes().as_slice())?;
         let _ = gui.app.close_runtime()?;
-        gui.output_rx.take();
         if let Some(handle) = gui.output_thread.take() {
             let _ = handle.join();
         }
@@ -4269,6 +4388,24 @@ mod tests {
         shell_command_text(marker).into_bytes()
     }
 
+    fn shell_large_output_command_bytes(marker: &str) -> Vec<u8> {
+        #[cfg(windows)]
+        {
+            format!(
+                "powershell -NoProfile -Command \"$payload='x'*40000; Write-Output $payload; Write-Output '{marker}'\"\r\n"
+            )
+            .into_bytes()
+        }
+
+        #[cfg(not(windows))]
+        {
+            format!(
+                "i=0; while [ $i -lt 40000 ]; do printf x; i=$((i+1)); done; printf '\\n{marker}\\n'\r"
+            )
+            .into_bytes()
+        }
+    }
+
     fn shell_exit_bytes() -> Vec<u8> {
         b"exit\r\n".to_vec()
     }
@@ -4311,6 +4448,14 @@ mod tests {
         let mut chunk = [0_u8; 1024];
 
         loop {
+            let drain = runtime.drain_output_budget();
+            for bytes in drain.chunks {
+                output.extend_from_slice(&bytes);
+            }
+            if drain.remaining_bytes > 0 {
+                continue;
+            }
+
             let count = runtime.read_output(&mut chunk)?;
             if count == 0 {
                 break;

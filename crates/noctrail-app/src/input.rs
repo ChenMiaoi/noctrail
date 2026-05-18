@@ -1,3 +1,5 @@
+mod keyboard_encoder;
+
 use noctrail_config::KeymapConfig;
 use noctrail_layout::FocusDirection;
 use winit::{
@@ -33,6 +35,16 @@ pub enum MouseReportKind {
     Move,
     WheelUp,
     WheelDown,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct KeyboardEncodeRequest<'a> {
+    pub state: ElementState,
+    pub logical_key: &'a Key,
+    pub text: Option<&'a str>,
+    pub key_without_modifiers: Option<&'a str>,
+    pub modifiers: ModifiersState,
+    pub repeat: bool,
 }
 
 pub fn shortcut_action(
@@ -100,31 +112,14 @@ pub fn key_to_pty_bytes(
     text: Option<&str>,
     modifiers: ModifiersState,
 ) -> Option<Vec<u8>> {
-    if modifiers.super_key() {
-        return None;
-    }
-
-    let mut bytes = match logical_key.as_ref() {
-        Key::Named(named) => named_key_bytes(named, modifiers)?,
-        Key::Character(ch) => character_bytes(ch, text, modifiers)?,
-        Key::Dead(_) | Key::Unidentified(_) => {
-            let text = text?;
-            if modifiers.control_key() {
-                control_text_bytes(text)?
-            } else {
-                text.as_bytes().to_vec()
-            }
-        }
-    };
-
-    if modifiers.alt_key() && !matches!(logical_key.as_ref(), Key::Named(NamedKey::Escape)) {
-        let mut prefixed = Vec::with_capacity(bytes.len() + 1);
-        prefixed.push(0x1b);
-        prefixed.append(&mut bytes);
-        bytes = prefixed;
-    }
-
-    Some(bytes)
+    encode_key_event(KeyboardEncodeRequest {
+        state: ElementState::Pressed,
+        logical_key,
+        text,
+        key_without_modifiers: None,
+        modifiers,
+        repeat: false,
+    })
 }
 
 pub fn paste_bytes(text: &str, bracketed_paste: bool) -> Vec<u8> {
@@ -149,11 +144,18 @@ pub fn key_event_to_pty_bytes(
     text: Option<&str>,
     modifiers: ModifiersState,
 ) -> Option<Vec<u8>> {
-    if !state.is_pressed() {
-        return None;
-    }
+    encode_key_event(KeyboardEncodeRequest {
+        state,
+        logical_key,
+        text,
+        key_without_modifiers: None,
+        modifiers,
+        repeat: false,
+    })
+}
 
-    key_to_pty_bytes(logical_key, text, modifiers)
+pub(crate) fn encode_key_event(request: KeyboardEncodeRequest<'_>) -> Option<Vec<u8>> {
+    keyboard_encoder::encode(request)
 }
 
 pub fn mouse_report_bytes(kind: MouseReportKind, row: usize, col: usize, sgr: bool) -> Vec<u8> {
@@ -177,16 +179,6 @@ pub fn mouse_report_bytes(kind: MouseReportKind, row: usize, col: usize, sgr: bo
             .and_then(|value| value.checked_add(32))
             .unwrap_or(u8::MAX);
         vec![b'\x1b', b'[', b'M', button + 32, encoded_col, encoded_row]
-    }
-}
-
-fn character_bytes(ch: &str, text: Option<&str>, modifiers: ModifiersState) -> Option<Vec<u8>> {
-    let text = text.unwrap_or(ch);
-
-    if modifiers.control_key() {
-        control_text_bytes(text)
-    } else {
-        Some(text.as_bytes().to_vec())
     }
 }
 
@@ -328,6 +320,24 @@ mod tests {
         KeymapConfig::default()
     }
 
+    fn request<'a>(
+        state: ElementState,
+        logical_key: &'a Key,
+        text: Option<&'a str>,
+        key_without_modifiers: Option<&'a str>,
+        modifiers: ModifiersState,
+        repeat: bool,
+    ) -> KeyboardEncodeRequest<'a> {
+        KeyboardEncodeRequest {
+            state,
+            logical_key,
+            text,
+            key_without_modifiers,
+            modifiers,
+            repeat,
+        }
+    }
+
     #[test]
     fn printable_text_is_forwarded() {
         let bytes = key_to_pty_bytes(
@@ -366,6 +376,63 @@ mod tests {
         let bytes = key_to_pty_bytes(&Key::Character("x".into()), Some("x"), ModifiersState::ALT)
             .expect("alt-x should map");
         assert_eq!(bytes, b"\x1bx");
+    }
+
+    #[test]
+    fn repeat_key_event_uses_press_encoding() {
+        let bytes = encode_key_event(request(
+            ElementState::Pressed,
+            &Key::Character("a".into()),
+            Some("a"),
+            Some("a"),
+            ModifiersState::empty(),
+            true,
+        ))
+        .expect("repeat should map like press");
+        assert_eq!(bytes, b"a");
+    }
+
+    #[test]
+    fn released_key_event_does_not_write_pty_bytes() {
+        assert_eq!(
+            encode_key_event(request(
+                ElementState::Released,
+                &Key::Character("a".into()),
+                Some("a"),
+                Some("a"),
+                ModifiersState::empty(),
+                false,
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_two_prefers_unmodified_key_for_nul() {
+        let bytes = encode_key_event(request(
+            ElementState::Pressed,
+            &Key::Character("@".into()),
+            Some("@"),
+            Some("2"),
+            ModifiersState::CONTROL | ModifiersState::SHIFT,
+            false,
+        ))
+        .expect("ctrl-shift-2 should map");
+        assert_eq!(bytes, vec![0x00]);
+    }
+
+    #[test]
+    fn ctrl_shift_question_mark_falls_back_to_shifted_text() {
+        let bytes = encode_key_event(request(
+            ElementState::Pressed,
+            &Key::Character("?".into()),
+            Some("?"),
+            Some("/"),
+            ModifiersState::CONTROL | ModifiersState::SHIFT,
+            false,
+        ))
+        .expect("ctrl-shift-? should map");
+        assert_eq!(bytes, vec![0x7f]);
     }
 
     #[test]
