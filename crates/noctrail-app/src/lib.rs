@@ -241,6 +241,15 @@ impl TerminalPane {
         &self.status_line
     }
 
+    pub fn set_status_line(&mut self, status_line: PaneStatusLine) {
+        if self.status_line == status_line {
+            return;
+        }
+
+        self.status_line = status_line;
+        self.invalidate_full_frame();
+    }
+
     pub fn prompt_ready(&self) -> bool {
         self.prompt_ready
     }
@@ -529,14 +538,14 @@ impl TerminalPane {
         let chrome_rects = pane_chrome_rects(pane_surface, status_surface, active, chrome);
         RenderPlan::from_input(RenderInput {
             pane_rect: RenderRect::new(
-                usize::from(pane_surface.x),
-                usize::from(pane_surface.y),
+                0,
+                0,
                 usize::from(pane_surface.width),
                 usize::from(pane_surface.height),
             ),
             viewport: RenderRect::new(
-                usize::from(content_surface.x),
-                usize::from(content_surface.y),
+                usize::from(content_surface.x.saturating_sub(pane_surface.x)),
+                usize::from(content_surface.y.saturating_sub(pane_surface.y)),
                 usize::from(content_surface.width),
                 usize::from(content_surface.height),
             ),
@@ -896,6 +905,18 @@ impl DesktopApp {
         self.panes.get_mut(&pane_id)
     }
 
+    pub fn set_status_line_for_pane(
+        &mut self,
+        pane_id: PaneId,
+        status_line: PaneStatusLine,
+    ) -> Result<(), AppError> {
+        let pane = self
+            .pane_mut_by_id(pane_id)
+            .ok_or(AppError::PaneNotFound(pane_id))?;
+        pane.set_status_line(status_line);
+        Ok(())
+    }
+
     pub fn focus_direction(&mut self, direction: FocusDirection) -> Result<PaneId, AppError> {
         Ok(self
             .workspaces
@@ -925,11 +946,44 @@ impl DesktopApp {
         self.split_active_pane_with(PtyCommand::shell())
     }
 
+    pub fn split_active_pane_empty(&mut self) -> Result<PaneId, AppError> {
+        if let Some(axis) = self.default_split_axis {
+            return self.split_active_pane_empty_with_axis(axis);
+        }
+
+        let new_pane_id = self.allocate_pane_id()?;
+        let terminal_size = self.active_pane_ref().terminal_size();
+        let pane = TerminalPane::new(new_pane_id, terminal_size);
+
+        self.workspaces
+            .active_layout_mut()
+            .split_active(new_pane_id, self.surface)?;
+        self.panes.insert(new_pane_id, pane);
+        self.sync_pane_terminal_sizes()?;
+        Ok(new_pane_id)
+    }
+
     pub fn split_active_pane_shell_with_axis(
         &mut self,
         axis: SplitAxis,
     ) -> Result<PaneId, AppError> {
         self.split_active_pane_with_axis(PtyCommand::shell(), axis)
+    }
+
+    pub fn split_active_pane_empty_with_axis(
+        &mut self,
+        axis: SplitAxis,
+    ) -> Result<PaneId, AppError> {
+        let new_pane_id = self.allocate_pane_id()?;
+        let terminal_size = self.active_pane_ref().terminal_size();
+        let pane = TerminalPane::new(new_pane_id, terminal_size);
+
+        self.workspaces
+            .active_layout_mut()
+            .split_active_with_axis(new_pane_id, axis)?;
+        self.panes.insert(new_pane_id, pane);
+        self.sync_pane_terminal_sizes()?;
+        Ok(new_pane_id)
     }
 
     pub fn split_active_pane_with(&mut self, command: PtyCommand) -> Result<PaneId, AppError> {
@@ -1242,6 +1296,35 @@ impl DesktopApp {
                     self.scratch_height_percent,
                 ),
             )?;
+            self.panes.insert(pane_id, pane);
+            self.scratch_pane_id = Some(pane_id);
+            pane_id
+        };
+
+        self.scratch_visible = true;
+        self.sync_pane_terminal_sizes()?;
+        Ok(pane_id)
+    }
+
+    pub fn toggle_scratch_empty(&mut self) -> Result<PaneId, AppError> {
+        if self.scratch_visible {
+            self.scratch_visible = false;
+            return self.active_workspace_pane_id();
+        }
+
+        let pane_id = if let Some(pane_id) = self.scratch_pane_id {
+            pane_id
+        } else {
+            let pane_id = self.allocate_pane_id()?;
+            let pane = TerminalPane::new(
+                pane_id,
+                scratch_terminal_size(
+                    self.surface,
+                    self.terminal_size,
+                    self.pane_chrome,
+                    self.scratch_height_percent,
+                ),
+            );
             self.panes.insert(pane_id, pane);
             self.scratch_pane_id = Some(pane_id);
             pane_id
@@ -1710,6 +1793,34 @@ mod tests {
         assert!(!original_frame.render_plan.active);
         assert!(new_frame.render_plan.active);
         assert_eq!(app.frame().pane_id, new_pane);
+        Ok(())
+    }
+
+    #[test]
+    fn off_origin_pane_render_plan_uses_local_pane_coordinates() -> Result<(), Box<dyn StdError>> {
+        let mut app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(80, 24));
+
+        let split = app.split_active_pane_empty_with_axis(SplitAxis::Vertical)?;
+        let frame = app.frame_for_pane(split)?;
+
+        assert_eq!(frame.render_plan.pane_rect.x, 0);
+        assert_eq!(frame.render_plan.pane_rect.y, 0);
+        assert!(
+            frame.render_plan.viewport.x < frame.render_plan.pane_rect.width,
+            "viewport should be local to the pane"
+        );
+        assert!(
+            frame.render_plan.viewport.y < frame.render_plan.pane_rect.height,
+            "viewport should be local to the pane"
+        );
+        assert!(
+            frame
+                .render_plan
+                .chrome
+                .iter()
+                .all(|rect| rect.rect.x < frame.render_plan.pane_rect.width),
+            "chrome rects should stay within pane-local coordinates"
+        );
         Ok(())
     }
 

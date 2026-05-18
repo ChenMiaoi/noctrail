@@ -122,10 +122,24 @@ pub(crate) fn pane_terminal_size(
 }
 
 pub(crate) fn scratch_surface(surface: LayoutRect, scratch_height_percent: u8) -> LayoutRect {
+    let horizontal_inset = ((u32::from(surface.width) * 6) / 100).max(12) as u16;
+    let max_width = surface
+        .width
+        .saturating_sub(horizontal_inset.saturating_mul(2));
+    let width = max_width.max(surface.width.saturating_sub(24)).max(1);
+    let top_inset = ((u32::from(surface.height) * 4) / 100).max(12) as u16;
+    let max_height = surface.height.saturating_sub(top_inset.saturating_add(12));
     let height = ((u32::from(surface.height) * u32::from(scratch_height_percent.max(1))) / 100)
         .max(1)
-        .min(u32::from(surface.height)) as u16;
-    LayoutRect::new(surface.x, surface.y, surface.width, height)
+        .min(u32::from(max_height.max(1))) as u16;
+    let x = surface
+        .x
+        .saturating_add((surface.width.saturating_sub(width)) / 2);
+    let y = surface
+        .y
+        .saturating_add(top_inset.min(surface.height.saturating_sub(height)));
+
+    LayoutRect::new(x, y, width, height)
 }
 
 pub(crate) fn scratch_terminal_size(
@@ -174,9 +188,9 @@ pub(crate) fn pane_chrome_rects(
     let pane_background = if active {
         pane_chrome.background
     } else {
-        mix_rgba(pane_chrome.status_background, pane_chrome.background, 0.84)
+        mix_rgba(pane_chrome.status_background, pane_chrome.background, 0.9)
     };
-    let pane_rect = layout_rect_to_render_rect(pane_surface);
+    let pane_rect = layout_rect_to_render_rect(pane_surface, pane_surface);
     if pane_rect.width > 0 && pane_rect.height > 0 {
         rects.push(ChromeRect {
             layer: ChromeLayer::PaneBackground,
@@ -185,17 +199,12 @@ pub(crate) fn pane_chrome_rects(
         });
     }
 
-    let header_surface = if status_surface.height > 0 {
-        status_surface
-    } else {
-        pane_surface
-    };
-    let header_rect = layout_rect_to_render_rect(header_surface);
+    let header_rect = layout_rect_to_render_rect(status_surface, pane_surface);
     if header_rect.width > 0 && header_rect.height > 0 {
         let status_background = if active {
             pane_chrome.status_background
         } else {
-            mix_rgba(pane_chrome.status_background, pane_background, 0.56)
+            mix_rgba(pane_chrome.status_background, pane_background, 0.78)
         };
         rects.push(ChromeRect {
             layer: ChromeLayer::StatusBackground,
@@ -203,16 +212,16 @@ pub(crate) fn pane_chrome_rects(
             color: status_background,
         });
 
-        let indicator_width = if active { 6_usize } else { 3_usize }
-            .min(header_rect.width)
+        let indicator_height = if active { 3_usize } else { 2_usize }
+            .min(header_rect.height)
             .max(1);
         rects.push(ChromeRect {
             layer: ChromeLayer::StatusIndicator,
             rect: RenderRect::new(
                 header_rect.x,
                 header_rect.y,
-                indicator_width,
-                header_rect.height,
+                header_rect.width,
+                indicator_height,
             ),
             color: if active {
                 pane_chrome.active_indicator
@@ -222,7 +231,22 @@ pub(crate) fn pane_chrome_rects(
         });
     }
 
-    let status_rect = layout_rect_to_render_rect(status_surface);
+    if status_surface.height == 0 && pane_rect.width > 0 && pane_rect.height > 0 {
+        let indicator_height = if active { 3_usize } else { 2_usize }
+            .min(pane_rect.height)
+            .max(1);
+        rects.push(ChromeRect {
+            layer: ChromeLayer::StatusIndicator,
+            rect: RenderRect::new(0, 0, pane_rect.width, indicator_height),
+            color: if active {
+                pane_chrome.active_indicator
+            } else {
+                pane_chrome.inactive_indicator
+            },
+        });
+    }
+
+    let status_rect = layout_rect_to_render_rect(status_surface, pane_surface);
     if status_rect.width > 0 && status_rect.height > 0 {
         rects.push(ChromeRect {
             layer: ChromeLayer::StatusSeparator,
@@ -235,7 +259,7 @@ pub(crate) fn pane_chrome_rects(
             color: if active {
                 pane_chrome.status_separator
             } else {
-                mix_rgba(pane_chrome.status_separator, pane_background, 0.72)
+                mix_rgba(pane_chrome.status_separator, pane_background, 0.86)
             },
         });
     }
@@ -281,8 +305,8 @@ fn pane_outer_insets(pane_surface: LayoutRect, pane_chrome: PaneChromeConfig) ->
     let right_gap = pane_chrome.gap - left_gap;
     let top_gap = pane_chrome.gap / 2;
     let bottom_gap = pane_chrome.gap - top_gap;
-    let horizontal_cap = (pane_surface.width / 10).max(2);
-    let vertical_cap = (pane_surface.height / 10).max(2);
+    let horizontal_cap = (pane_surface.width / 10).max(4);
+    let vertical_cap = (pane_surface.height / 10).max(4);
     EdgeInsets {
         left: left_gap
             .saturating_add(pane_chrome.padding)
@@ -300,7 +324,7 @@ fn pane_outer_insets(pane_surface: LayoutRect, pane_chrome: PaneChromeConfig) ->
 }
 
 fn effective_status_height(inner_height: u16, pane_chrome: PaneChromeConfig) -> u16 {
-    if pane_chrome.status_height == 0 || inner_height <= 2 || inner_height < 48 {
+    if pane_chrome.status_height == 0 || inner_height <= 2 || inner_height < 44 {
         return 0;
     }
 
@@ -319,10 +343,10 @@ fn status_spacing_for_height(status_height: u16, pane_chrome: PaneChromeConfig) 
     }
 }
 
-fn layout_rect_to_render_rect(rect: LayoutRect) -> RenderRect {
+fn layout_rect_to_render_rect(rect: LayoutRect, origin: LayoutRect) -> RenderRect {
     RenderRect::new(
-        usize::from(rect.x),
-        usize::from(rect.y),
+        usize::from(rect.x.saturating_sub(origin.x)),
+        usize::from(rect.y.saturating_sub(origin.y)),
         usize::from(rect.width),
         usize::from(rect.height),
     )

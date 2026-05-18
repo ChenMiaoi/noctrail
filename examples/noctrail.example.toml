@@ -10,23 +10,23 @@ fallback = ["Microsoft YaHei UI", "Segoe UI Emoji"]
 opacity = 1.0
 
 [theme.color]
-background = "#070d12"
-foreground = "#e8eef2"
-chrome-background = "#121a22"
-chrome-foreground = "#f7fafc"
-chrome-muted = "#97a5b2"
-chrome-accent = "#7ad9b2"
-chrome-danger = "#f28779"
+background = "#0a1016"
+foreground = "#e4ebf1"
+chrome-background = "#131b23"
+chrome-foreground = "#f3f7fb"
+chrome-muted = "#8395a5"
+chrome-accent = "#82c7ba"
+chrome-danger = "#db8d80"
 
 [theme.border]
-active = "#91b4ff"
-inactive = "#313d49"
+active = "#8fb0d2"
+inactive = "#243140"
 width = 1
 
 [theme.pane]
-gap = 12
-padding = 8
-radius = 18
+gap = 16
+padding = 10
+radius = 22
 
 [theme.blur]
 enabled = true
@@ -34,17 +34,17 @@ fallback-tint-opacity = 0.94
 
 [theme.animation]
 enabled = true
-duration-ms = 120
+duration-ms = 96
 
 [theme.low-power]
 enabled = false
 
 [theme.cursor]
-color = "#ffd885"
+color = "#f2d28c"
 blink-interval-ms = 600
 
 [theme.selection]
-background = "#2d5a84d8"
+background = "#254a66d8"
 foreground = "#ffffff"
 
 [keymap]

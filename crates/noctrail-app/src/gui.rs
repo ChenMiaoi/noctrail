@@ -33,7 +33,9 @@ use winit::{
     window::{CursorIcon, ResizeDirection, Window, WindowId},
 };
 
-use crate::{DesktopApp, DesktopFrame, PaneChromeConfig, clipboard::ClipboardBridge, input};
+use crate::{
+    DesktopApp, DesktopFrame, PaneChromeConfig, PaneStatusLine, clipboard::ClipboardBridge, input,
+};
 
 mod platform;
 
@@ -75,6 +77,21 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     run_with_options(GuiLaunchOptions::default())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StartupScene {
+    #[default]
+    None,
+    VisualSmoke(VisualSmokeScene),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VisualSmokeScene {
+    #[default]
+    SinglePane,
+    TilingFourUp,
+    Scratch,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct GuiLaunchOptions {
     pub safe_mode: bool,
@@ -86,6 +103,7 @@ pub struct GuiLaunchOptions {
     pub keymap: KeymapConfig,
     pub layout: LayoutConfig,
     pub agent: AgentConfig,
+    pub startup_scene: StartupScene,
 }
 
 impl Default for GuiLaunchOptions {
@@ -100,6 +118,7 @@ impl Default for GuiLaunchOptions {
             keymap: KeymapConfig::default(),
             layout: LayoutConfig::default(),
             agent: AgentConfig::default(),
+            startup_scene: StartupScene::None,
         }
     }
 }
@@ -377,18 +396,7 @@ pub fn patch_preview_smoke() -> Result<(), Box<dyn Error>> {
 pub fn run_with_options(options: GuiLaunchOptions) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::<GuiEvent>::with_user_event().build()?;
     let event_proxy = event_loop.create_proxy();
-    let initial_surface = LayoutRect::new(
-        0,
-        0,
-        DEFAULT_WINDOW_WIDTH as u16,
-        DEFAULT_WINDOW_HEIGHT as u16,
-    );
-    let initial_terminal = terminal_size_from_surface(
-        PhysicalSize::new(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT),
-        &options.font,
-        1.0,
-    );
-    let app = DesktopApp::spawn_shell(initial_surface, initial_terminal)?;
+    let app = build_startup_app(&options)?;
     let mut gui = GuiApp::new(app, options);
     gui.set_event_proxy(event_proxy);
     event_loop.run_app(&mut gui)?;
@@ -483,18 +491,14 @@ fn compose_status_runs(
     input_mode: InputMode,
 ) -> StatusRuns {
     let shell = frame.status_line.shell.as_deref().unwrap_or("shell");
-    let shell_label = shell.to_ascii_uppercase();
+    let shell_label = compact_shell_label(shell);
     let cwd = frame
         .status_line
         .cwd
         .as_deref()
         .map(display_status_path)
         .unwrap_or_else(|| "workspace".to_string());
-    let branch = frame
-        .status_line
-        .git_branch
-        .as_deref()
-        .map(|branch| format!("git:{branch}"));
+    let branch = frame.status_line.git_branch.as_deref();
     let pane_label = if frame.is_scratch {
         "SCRATCH".to_string()
     } else {
@@ -504,65 +508,45 @@ fn compose_status_runs(
     let mut right = Vec::new();
 
     if let Some(exit_status) = frame.status_line.exit_status.as_deref() {
-        let exit_background = if exit_status == "code 0" {
+        let exit_color = if exit_status == "code 0" {
             palette.accent
         } else {
-            palette.chip_danger_background
+            palette.danger
         };
-        right.push(status_chip(
-            exit_status,
-            chip_foreground(exit_background),
-            exit_background,
-            true,
-        ));
-        right.push(StatusRun {
-            text: "  ".to_string(),
-            style: status_style(palette.muted, None, false),
-        });
+        right.push(status_text(exit_status, exit_color, true));
+        right.push(status_divider(palette.muted));
     }
 
     right.extend([
-        status_chip(
+        status_text(
             input_mode.label(),
             if input_mode == InputMode::Editor {
-                chip_foreground(palette.chip_accent_background)
+                palette.accent
             } else {
-                palette.foreground
-            },
-            if input_mode == InputMode::Editor {
-                palette.chip_accent_background
-            } else {
-                palette.chip_background
+                palette.muted
             },
             input_mode == InputMode::Editor,
         ),
-        StatusRun {
-            text: "  ".to_string(),
-            style: status_style(palette.muted, None, false),
-        },
-        status_chip(
+        status_divider(palette.muted),
+        status_text(
             &pane_label,
-            palette.foreground,
-            palette.chip_background,
-            false,
+            if frame.is_scratch {
+                palette.accent
+            } else {
+                palette.foreground
+            },
+            frame.is_scratch,
         ),
-        StatusRun {
-            text: "  ".to_string(),
-            style: status_style(palette.muted, None, false),
-        },
-        status_chip(
+        status_divider(palette.muted),
+        status_text(
             &format!("{}x{}", frame.terminal_size.cols, frame.terminal_size.rows),
-            palette.foreground,
-            palette.chip_background,
+            palette.muted,
             false,
         ),
     ]);
 
     let right_len = status_runs_len(&right);
     let available_left = cols.saturating_sub(right_len.saturating_add(1));
-    let branch_len = branch
-        .as_ref()
-        .map_or(0, |branch| branch.chars().count() + 4);
     let mut left = vec![status_chip(
         &shell_label,
         chip_foreground(palette.chip_accent_background),
@@ -572,40 +556,37 @@ fn compose_status_runs(
     let shell_len = status_runs_len(&left);
 
     if available_left > shell_len.saturating_add(2) {
-        let reserve_branch = if branch.is_some() && available_left > shell_len.saturating_add(14) {
-            branch_len
+        let mut remaining = available_left.saturating_sub(shell_len);
+        left.push(status_gap(2, palette.muted));
+        remaining = remaining.saturating_sub(2);
+
+        let reserve_branch = if branch.is_some() && remaining > 24 {
+            ((remaining / 3).clamp(12, 30)).saturating_add(6)
         } else {
             0
         };
-        let cwd_budget = available_left
-            .saturating_sub(shell_len)
-            .saturating_sub(3)
-            .saturating_sub(reserve_branch);
-        left.push(StatusRun {
-            text: "  ".to_string(),
-            style: status_style(palette.muted, None, false),
-        });
-        let cwd_label = truncate_middle(&cwd, cwd_budget.saturating_sub(2).max(1));
-        left.push(status_chip(
-            &cwd_label,
+        let cwd_budget = remaining.saturating_sub(reserve_branch).max(1);
+        left.push(status_text(
+            &truncate_middle(&cwd, cwd_budget),
             palette.foreground,
-            palette.chip_background,
             false,
         ));
 
         if let Some(branch) = branch
-            && status_runs_len(&left).saturating_add(branch_len) < available_left
+            && reserve_branch > 0
         {
-            left.push(StatusRun {
-                text: "  ".to_string(),
-                style: status_style(palette.muted, None, false),
-            });
-            left.push(status_chip(
-                &branch,
-                palette.accent,
-                palette.chip_background,
-                false,
-            ));
+            let branch_budget = reserve_branch.saturating_sub(6).max(1);
+            let branch_label = truncate_middle(branch, branch_budget);
+            let branch_runs = [
+                status_gap(2, palette.muted),
+                status_text("git:", palette.muted, false),
+                status_text(&branch_label, palette.accent, false),
+            ];
+            if status_runs_len(&left).saturating_add(status_runs_len(&branch_runs))
+                <= available_left
+            {
+                left.extend(branch_runs);
+            }
         }
     }
 
@@ -659,11 +640,42 @@ fn status_style(color: Rgba, background: Option<Rgba>, bold: bool) -> Style {
     }
 }
 
+fn status_text(text: &str, foreground: Rgba, bold: bool) -> StatusRun {
+    StatusRun {
+        text: text.to_string(),
+        style: status_style(foreground, None, bold),
+    }
+}
+
 fn status_chip(text: &str, foreground: Rgba, background: Rgba, bold: bool) -> StatusRun {
     StatusRun {
         text: format!(" {text} "),
         style: status_style(foreground, Some(background), bold),
     }
+}
+
+fn status_gap(width: usize, color: Rgba) -> StatusRun {
+    StatusRun {
+        text: " ".repeat(width),
+        style: status_style(color, None, false),
+    }
+}
+
+fn status_divider(color: Rgba) -> StatusRun {
+    StatusRun {
+        text: " / ".to_string(),
+        style: status_style(color, None, false),
+    }
+}
+
+fn compact_shell_label(shell: &str) -> String {
+    let label = Path::new(shell)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or(shell)
+        .trim_end_matches(".exe");
+    truncate_end(&label.to_ascii_uppercase(), 12)
 }
 
 fn truncate_middle(text: &str, max_chars: usize) -> String {
@@ -686,6 +698,83 @@ fn truncate_middle(text: &str, max_chars: usize) -> String {
         .rev()
         .collect::<String>();
     format!("{prefix}...{suffix}")
+}
+
+fn truncate_end(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 3 {
+        return "...".chars().take(max_chars).collect();
+    }
+
+    let head = max_chars.saturating_sub(3);
+    let prefix = text.chars().take(head).collect::<String>();
+    format!("{prefix}...")
+}
+
+fn transition_rect_for_pane(
+    transition: &ActiveTransition,
+    pane_id: PaneId,
+    progress: f32,
+) -> Option<LayoutRect> {
+    let rect = transition
+        .panes
+        .iter()
+        .find(|pane| pane.pane_id == pane_id)?;
+    let from = rect.from.or(rect.to)?;
+    let to = rect.to.or(rect.from)?;
+    Some(interpolate_layout_rect(from, to, progress))
+}
+
+fn interpolate_layout_rect(from: LayoutRect, to: LayoutRect, progress: f32) -> LayoutRect {
+    let progress = progress.clamp(0.0, 1.0);
+    LayoutRect::new(
+        interpolate_u16(from.x, to.x, progress),
+        interpolate_u16(from.y, to.y, progress),
+        interpolate_u16(from.width, to.width, progress).max(1),
+        interpolate_u16(from.height, to.height, progress).max(1),
+    )
+}
+
+fn interpolate_u16(from: u16, to: u16, progress: f32) -> u16 {
+    let from = f32::from(from);
+    let to = f32::from(to);
+    (from + (to - from) * progress).round().max(0.0) as u16
+}
+
+fn apply_transition_rect(frame: &mut DesktopFrame, pane_surface: LayoutRect) {
+    let delta_x = i32::from(pane_surface.x) - i32::from(frame.pane_surface.x);
+    let delta_y = i32::from(pane_surface.y) - i32::from(frame.pane_surface.y);
+
+    frame.surface = translate_layout_rect(frame.surface, delta_x, delta_y);
+    frame.status_surface = translate_layout_rect(frame.status_surface, delta_x, delta_y);
+    frame.pane_surface = pane_surface;
+    frame.render_plan.pane_rect.width = usize::from(pane_surface.width);
+    frame.render_plan.pane_rect.height = usize::from(pane_surface.height);
+    frame.render_plan.viewport.width = frame
+        .render_plan
+        .viewport
+        .width
+        .min(usize::from(pane_surface.width));
+    frame.render_plan.viewport.height = frame
+        .render_plan
+        .viewport
+        .height
+        .min(usize::from(pane_surface.height));
+}
+
+fn translate_layout_rect(rect: LayoutRect, delta_x: i32, delta_y: i32) -> LayoutRect {
+    LayoutRect::new(
+        translate_u16(rect.x, delta_x),
+        translate_u16(rect.y, delta_y),
+        rect.width,
+        rect.height,
+    )
+}
+
+fn translate_u16(value: u16, delta: i32) -> u16 {
+    (i32::from(value) + delta).clamp(0, i32::from(u16::MAX)) as u16
 }
 
 fn normalize_editor_text(text: &str) -> String {
@@ -887,6 +976,11 @@ impl ActiveTransition {
             return 1.0;
         }
         ((now - self.started_at).as_secs_f32() / total).clamp(0.0, 1.0)
+    }
+
+    fn eased_progress(&self, now: Instant) -> f32 {
+        let t = self.progress(now);
+        1.0 - (1.0 - t).powi(3)
     }
 }
 
@@ -1456,7 +1550,7 @@ impl GuiApp {
                 .switch_workspace(WorkspaceId::new(launch_options.layout.startup_workspace))
                 .expect("validated startup workspace should switch cleanly");
         }
-        apply_debug_startup_layout(&mut app);
+        apply_startup_scene(&mut app, launch_options.startup_scene);
         Self {
             app,
             launch_options,
@@ -2240,10 +2334,21 @@ impl GuiApp {
             pane_ids.push(scratch_id);
         }
 
-        pane_ids
+        let mut frames = pane_ids
             .into_iter()
             .map(|pane_id| self.app.frame_for_pane(pane_id).map_err(Into::into))
-            .collect()
+            .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+
+        if let Some(transition) = self.transition.as_ref() {
+            let progress = transition.eased_progress(Instant::now());
+            for frame in &mut frames {
+                if let Some(rect) = transition_rect_for_pane(transition, frame.pane_id, progress) {
+                    apply_transition_rect(frame, rect);
+                }
+            }
+        }
+
+        Ok(frames)
     }
 
     fn apply_editor_overlay(&mut self, frame: &mut DesktopFrame) {
@@ -3520,6 +3625,36 @@ impl GuiApp {
     }
 }
 
+fn build_startup_app(options: &GuiLaunchOptions) -> Result<DesktopApp, Box<dyn Error>> {
+    let initial_surface = LayoutRect::new(
+        0,
+        0,
+        DEFAULT_WINDOW_WIDTH as u16,
+        DEFAULT_WINDOW_HEIGHT as u16,
+    );
+    let initial_terminal = terminal_size_from_surface(
+        PhysicalSize::new(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT),
+        &options.font,
+        1.0,
+    );
+
+    match options.startup_scene {
+        StartupScene::None => Ok(DesktopApp::spawn_shell(initial_surface, initial_terminal)?),
+        StartupScene::VisualSmoke(_) => Ok(DesktopApp::new(initial_surface, initial_terminal)),
+    }
+}
+
+fn apply_startup_scene(app: &mut DesktopApp, startup_scene: StartupScene) {
+    match startup_scene {
+        StartupScene::None => apply_debug_startup_layout(app),
+        StartupScene::VisualSmoke(scene) => {
+            if let Err(error) = apply_visual_smoke_scene(app, scene) {
+                warn!(?error, ?scene, "failed to apply visual smoke startup scene");
+            }
+        }
+    }
+}
+
 fn apply_debug_startup_layout(app: &mut DesktopApp) {
     let Some(layout) = std::env::var("NOCTRAIL_DEBUG_LAYOUT")
         .ok()
@@ -3541,6 +3676,201 @@ fn apply_debug_startup_layout(app: &mut DesktopApp) {
 
     if let Err(error) = app.split_active_pane_shell_with_axis(axis) {
         warn!(?error, layout, "failed to apply debug startup layout");
+    }
+}
+
+fn apply_visual_smoke_scene(
+    app: &mut DesktopApp,
+    scene: VisualSmokeScene,
+) -> Result<(), crate::AppError> {
+    match scene {
+        VisualSmokeScene::SinglePane => seed_single_pane_scene(app)?,
+        VisualSmokeScene::TilingFourUp => {
+            let _ = build_visual_tiling_scene(app)?;
+        }
+        VisualSmokeScene::Scratch => {
+            let _ = build_visual_tiling_scene(app)?;
+            let scratch = app.toggle_scratch_empty()?;
+            seed_visual_pane(
+                app,
+                scratch,
+                visual_status_line(
+                    "scratch",
+                    "D:\\Code\\src\\rust\\noctrail\\.cache\\scratchpad",
+                    Some("scratch/live-notes"),
+                    None,
+                ),
+                concat!(
+                    "\x1b[38;2;143;211;201mnotes\x1b[0m :: release scratchpad\r\n",
+                    "----------------------------\r\n",
+                    "- compare border hierarchy\r\n",
+                    "- verify floating surface spacing\r\n",
+                    "- capture final GUI screenshots\r\n",
+                    "\r\n",
+                    "\x1b[38;2;123;168;196mstatus\x1b[0m waiting for next pass\r\n",
+                )
+                .as_bytes(),
+            )?;
+        }
+    }
+
+    app.invalidate_visuals();
+    Ok(())
+}
+
+fn seed_single_pane_scene(app: &mut DesktopApp) -> Result<(), crate::AppError> {
+    let root = app
+        .active_pane_id()
+        .ok_or(crate::AppError::MissingActivePane)?;
+    seed_visual_pane(
+        app,
+        root,
+        visual_status_line(
+            "powershell.exe",
+            "D:\\Code\\src\\rust\\noctrail\\crates\\noctrail-app",
+            Some("feature/hyprland-pass-one"),
+            None,
+        ),
+        concat!(
+            "\x1b[38;2;141;220;206mnoctrail\x1b[0m  \x1b[38;2;95;125;149mvisual smoke\x1b[0m\r\n",
+            "\r\n",
+            "> cargo test -p noctrail-app --all-targets\r\n",
+            "\x1b[38;2;183;232;218mok\x1b[0m 212 passed / 0 failed\r\n",
+            "\r\n",
+            "> cargo run -p noctrail-cli -- render-fixtures\r\n",
+            "\x1b[38;2;126;211;180mrendered\x1b[0m ascii.ntshot selection.ntshot pane-border.ntshot\r\n",
+            "\r\n",
+            "> git status --short\r\n",
+            " M crates/noctrail-app/src/gui.rs\r\n",
+            " M crates/noctrail-app/src/layout_projection.rs\r\n",
+            " M scripts/windows-gui-verify.ps1\r\n",
+            "\r\n",
+            "\x1b[38;2;123;168;196mnext\x1b[0m capture tiling baseline\r\n",
+        )
+        .as_bytes(),
+    )
+}
+
+fn build_visual_tiling_scene(app: &mut DesktopApp) -> Result<[PaneId; 4], crate::AppError> {
+    let root = app
+        .active_pane_id()
+        .ok_or(crate::AppError::MissingActivePane)?;
+    let pane_two = app.split_active_pane_empty_with_axis(SplitAxis::Vertical)?;
+    let pane_three = app.split_active_pane_empty_with_axis(SplitAxis::Horizontal)?;
+    let _ = app.focus_direction(FocusDirection::Left)?;
+    let pane_four = app.split_active_pane_empty_with_axis(SplitAxis::Horizontal)?;
+    let _ = app.focus_direction(FocusDirection::Up)?;
+
+    seed_visual_pane(
+        app,
+        root,
+        visual_status_line(
+            "pwsh.exe",
+            "D:\\Code\\src\\rust\\noctrail\\workspace\\client\\shell\\active-pane",
+            Some("rewrite/visual-hierarchy"),
+            None,
+        ),
+        concat!(
+            "\x1b[38;2;126;211;180mACTIVE\x1b[0m pane / focus anchor\r\n",
+            "\r\n",
+            "> cargo run -p noctrail-app -- visual-smoke\r\n",
+            "  scene = tiling-4up\r\n",
+            "\r\n",
+            "\x1b[38;2;183;232;218mok\x1b[0m geometry seeded\r\n",
+            "\x1b[38;2;143;211;201mok\x1b[0m accent contrast locked\r\n",
+            "\r\n",
+            "left column stays brighter and denser\r\n",
+        )
+        .as_bytes(),
+    )?;
+    seed_visual_pane(
+        app,
+        pane_two,
+        visual_status_line(
+            "nu",
+            "D:\\Code\\src\\rust\\noctrail\\workspace\\backend\\integration\\snapshots\\2026\\05\\18",
+            Some("release/ci-hotfix-and-follow-up"),
+            Some("code 7"),
+        ),
+        concat!(
+            "\x1b[38;2;231;145;132mFAILED\x1b[0m integration snapshot\r\n",
+            "\r\n",
+            "error: screenshot diff exceeded threshold\r\n",
+            "  expected accent strip to stay within header\r\n",
+            "  got bleed into inactive pane body\r\n",
+            "\r\n",
+            "hint: tighten chrome rect packing\r\n",
+        )
+        .as_bytes(),
+    )?;
+    seed_visual_pane(
+        app,
+        pane_three,
+        visual_status_line(
+            "bash",
+            "D:\\Users\\Nya\\Projects\\design\\hyprland\\notes\\status-bar-rhythm",
+            Some("design/status-density"),
+            Some("code 0"),
+        ),
+        concat!(
+            "LAYOUT NOTES\r\n",
+            "\r\n",
+            "- fewer badges\r\n",
+            "- longer horizontal cadence\r\n",
+            "- muted inactive panes\r\n",
+            "- keep text area readable at 4-up\r\n",
+        )
+        .as_bytes(),
+    )?;
+    seed_visual_pane(
+        app,
+        pane_four,
+        visual_status_line(
+            "powershell.exe",
+            "D:\\Code\\src\\rust\\noctrail\\artifacts\\visual\\capture\\staging",
+            Some("visual/capture-pipeline"),
+            None,
+        ),
+        concat!(
+            "\x1b[38;2;123;168;196mqueue\x1b[0m\r\n",
+            "\r\n",
+            "single-pane.png\r\n",
+            "tiling-4up.png\r\n",
+            "scratch.png\r\n",
+            "\r\n",
+            "waiting for next screenshot pass\r\n",
+        )
+        .as_bytes(),
+    )?;
+
+    Ok([root, pane_two, pane_three, pane_four])
+}
+
+fn seed_visual_pane(
+    app: &mut DesktopApp,
+    pane_id: PaneId,
+    status_line: PaneStatusLine,
+    bytes: &[u8],
+) -> Result<(), crate::AppError> {
+    app.set_status_line_for_pane(pane_id, status_line)?;
+    let pane = app
+        .pane_mut_by_id(pane_id)
+        .ok_or(crate::AppError::PaneNotFound(pane_id))?;
+    pane.advance_output(bytes);
+    Ok(())
+}
+
+fn visual_status_line(
+    shell: &str,
+    cwd: &str,
+    git_branch: Option<&str>,
+    exit_status: Option<&str>,
+) -> PaneStatusLine {
+    PaneStatusLine {
+        shell: Some(shell.to_string()),
+        cwd: Some(PathBuf::from(cwd)),
+        git_branch: git_branch.map(str::to_string),
+        exit_status: exit_status.map(str::to_string),
     }
 }
 
@@ -3681,12 +4011,11 @@ pub fn pane_chrome_from_theme(theme: &ThemeConfig, font: &FontConfig) -> PaneChr
     let terminal_background = rgba_from_config(theme.color.background);
     let chrome_background = rgba_from_config(theme.color.chrome_background);
     let chrome_foreground = rgba_from_config(theme.color.chrome_foreground);
-    let background = mix_rgba(chrome_background, terminal_background, 0.22);
-    let status_background = mix_rgba(chrome_foreground, background, 0.95);
+    let background = mix_rgba(chrome_background, terminal_background, 0.34);
+    let status_background = mix_rgba(chrome_foreground, background, 0.93);
     let accent = rgba_from_config(theme.color.chrome_accent);
     let inactive = rgba_from_config(theme.border.inactive);
-    let status_height = ((font.size * 1.78).round() as u16).clamp(20, 30);
-    let status_spacing = ((font.size * 0.30).round() as u16).clamp(4, 8);
+    let _ = font;
     PaneChromeConfig {
         border: PaneBorderStyle {
             width: usize::from(theme.border.width),
@@ -3695,14 +4024,14 @@ pub fn pane_chrome_from_theme(theme: &ThemeConfig, font: &FontConfig) -> PaneChr
         },
         background,
         status_background,
-        status_separator: mix_rgba(accent, status_background, 0.58),
+        status_separator: mix_rgba(accent, status_background, 0.74),
         active_indicator: accent,
-        inactive_indicator: mix_rgba(accent, inactive, 0.72),
+        inactive_indicator: mix_rgba(inactive, status_background, 0.52),
         gap: theme.pane.gap,
         padding: theme.pane.padding,
         radius: theme.pane.radius,
-        status_height,
-        status_spacing,
+        status_height: 0,
+        status_spacing: 0,
     }
 }
 
@@ -4137,6 +4466,71 @@ mod tests {
         assert!(title.contains("cwd /tmp/noctrail"));
         assert!(title.contains("git main"));
         assert!(title.contains("exit code 0"));
+    }
+
+    #[test]
+    fn compose_status_runs_uses_single_shell_chip_and_truncates_context() {
+        let frame = status_frame(
+            "powershell.exe",
+            "D:\\Code\\src\\rust\\noctrail\\crates\\noctrail-app\\src\\extremely\\long\\directory\\tree\\for\\status\\layout",
+            Some("feature/hyprland-pass-one-with-a-very-long-branch-name"),
+            Some("code 0"),
+            false,
+        );
+        let palette = status_palette();
+
+        let runs = compose_status_runs(&frame, 72, palette, InputMode::Editor);
+        let left_text = runs
+            .left
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<String>();
+        let right_text = runs
+            .right
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<String>();
+
+        assert!(left_text.contains("POWERSHELL"));
+        assert!(!left_text.contains(".EXE"));
+        assert!(left_text.contains("..."));
+        assert!(left_text.contains("git:"));
+        assert!(right_text.contains("EDIT / WS1 / 80x24"));
+        assert_eq!(
+            runs.left
+                .iter()
+                .filter(|run| run.style.background != Color::Default)
+                .count(),
+            1
+        );
+        assert!(
+            runs.right
+                .iter()
+                .all(|run| run.style.background == Color::Default)
+        );
+        assert!(status_runs_len(&runs.left) + status_runs_len(&runs.right) <= 72);
+    }
+
+    #[test]
+    fn compose_status_runs_preserves_scratch_and_exit_signal_without_overflow() {
+        let frame = status_frame(
+            "nu",
+            "D:\\Code\\src\\rust\\noctrail\\.cache\\scratchpad",
+            Some("scratch/live-notes"),
+            Some("code 7"),
+            true,
+        );
+        let palette = status_palette();
+
+        let runs = compose_status_runs(&frame, 58, palette, InputMode::Terminal);
+        let right_text = runs
+            .right
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<String>();
+
+        assert!(right_text.contains("code 7 / TERM / SCRATCH / 80x24"));
+        assert!(status_runs_len(&runs.left) + status_runs_len(&runs.right) <= 58);
     }
 
     #[test]
@@ -4718,7 +5112,7 @@ mod tests {
 
         let transition = gui.transition.as_ref().expect("transition should start");
         assert_eq!(transition.kind, TransitionKind::Pane);
-        assert_eq!(transition.duration, Duration::from_millis(120));
+        assert_eq!(transition.duration, Duration::from_millis(96));
         assert!(!transition.panes.is_empty());
         Ok(())
     }
@@ -4789,6 +5183,39 @@ mod tests {
 
         assert!(gui.advance_transition(deadline));
         assert!(gui.transition.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn visible_frames_apply_interpolated_transition_geometry() -> Result<(), Box<dyn Error>> {
+        let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 40), PtySize::new(12, 4));
+        let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
+
+        gui.apply_palette_command(PaletteCommand::SplitHorizontal)?;
+        let final_frame = gui.app.frame_for_pane(PaneId::new(1))?;
+        let transition = gui.transition.as_mut().expect("transition should start");
+        transition.started_at = Instant::now() - transition.duration / 2;
+        transition.next_frame_at = Instant::now();
+
+        let frames = gui.visible_frames()?;
+        let moved = frames
+            .iter()
+            .find(|frame| frame.pane_id == PaneId::new(1))
+            .expect("root pane frame should exist");
+
+        assert!(moved.pane_surface.height < 40);
+        assert_eq!(
+            i32::from(moved.status_surface.x) - i32::from(moved.pane_surface.x),
+            i32::from(final_frame.status_surface.x) - i32::from(final_frame.pane_surface.x)
+        );
+        assert_eq!(
+            i32::from(moved.status_surface.y) - i32::from(moved.pane_surface.y),
+            i32::from(final_frame.status_surface.y) - i32::from(final_frame.pane_surface.y)
+        );
+        assert_eq!(
+            moved.render_plan.pane_rect.height,
+            usize::from(moved.pane_surface.height)
+        );
         Ok(())
     }
 
@@ -5222,6 +5649,62 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn status_frame(
+        shell: &str,
+        cwd: &str,
+        git_branch: Option<&str>,
+        exit_status: Option<&str>,
+        is_scratch: bool,
+    ) -> DesktopFrame {
+        DesktopFrame {
+            workspace_id: WorkspaceId::new(1),
+            is_scratch,
+            pane_id: PaneId::new(1),
+            pane_surface: LayoutRect::new(0, 0, 120, 80),
+            status_surface: LayoutRect::new(0, 0, 120, 22),
+            surface: LayoutRect::new(0, 0, 120, 80),
+            terminal_size: PtySize::new(80, 24),
+            process_id: Some(4242),
+            status_line: crate::PaneStatusLine {
+                shell: Some(shell.to_string()),
+                cwd: Some(PathBuf::from(cwd)),
+                git_branch: git_branch.map(str::to_string),
+                exit_status: exit_status.map(str::to_string),
+            },
+            render_plan: RenderPlan {
+                backend: RenderBackend::Gpu,
+                pane_rect: RenderRect::new(0, 0, 120, 80),
+                viewport: RenderRect::new(0, 0, 120, 80),
+                damage: noctrail_term::DamageSet {
+                    dirty_rows: vec![0],
+                    full_frame: true,
+                },
+                scrollback_rows: 0,
+                cursor: Cursor::default(),
+                alternate_screen: false,
+                selection: None,
+                chrome: Vec::new(),
+                active: true,
+                border: PaneBorderStyle::default(),
+                corner_radius: 0,
+                rows: Vec::new(),
+            },
+        }
+    }
+
+    fn status_palette() -> StatusBarPalette {
+        StatusBarPalette {
+            background: rgba_from_hex(0x131b23),
+            foreground: rgba_from_hex(0xf3f7fb),
+            muted: rgba_from_hex(0x8395a5),
+            accent: rgba_from_hex(0x82c7ba),
+            danger: rgba_from_hex(0xdb8d80),
+            chip_background: rgba_from_hex(0x2a333d),
+            chip_accent_background: rgba_from_hex(0x496760),
+            chip_danger_background: rgba_from_hex(0x64423c),
+        }
     }
 
     fn temp_config_path(label: &str) -> PathBuf {

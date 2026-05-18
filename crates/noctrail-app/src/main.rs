@@ -12,7 +12,7 @@ mod logging;
 use noctrail_agent::{ProviderAdapter, ProviderError};
 use noctrail_app::{
     AgentContextPreview, DesktopApp,
-    gui::{self, GuiLaunchOptions},
+    gui::{self, GuiLaunchOptions, StartupScene, VisualSmokeScene},
     input, redaction,
 };
 use noctrail_config::{
@@ -50,6 +50,7 @@ Commands:
   soak-smoke Run the split/close/resize soak probe
   smoke     Spawn a shell, build the single-pane frame, and shut it down
   structured-output-smoke Run the structured output lens probe
+  visual-smoke Run the fixed visual validation scene
   help      Print this help text
 
 Options:
@@ -87,6 +88,7 @@ enum StartupCommand {
     SoakSmoke,
     Smoke,
     StructuredOutputSmoke,
+    VisualSmoke,
     Help,
 }
 
@@ -258,6 +260,12 @@ fn main() {
                 process::exit(1);
             }
         }
+        StartupCommand::VisualSmoke => {
+            if let Err(error) = run_visual_smoke(&options) {
+                eprintln!("{error}");
+                process::exit(1);
+            }
+        }
     }
 }
 
@@ -336,6 +344,10 @@ fn parse_startup_options(args: &[String]) -> Result<StartupOptions, StartupError
                 command = StartupCommand::StructuredOutputSmoke;
                 command_set = true;
             }
+            "visual-smoke" if !command_set => {
+                command = StartupCommand::VisualSmoke;
+                command_set = true;
+            }
             "help" | "-h" | "--help" if !command_set => {
                 command = StartupCommand::Help;
                 command_set = true;
@@ -400,6 +412,7 @@ fn resolve_launch_options(options: &StartupOptions) -> Result<GuiLaunchOptions, 
         keymap: config.keymap,
         layout: config.layout,
         agent: config.agent,
+        startup_scene: StartupScene::None,
     })
 }
 
@@ -426,6 +439,34 @@ fn run_gui(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>> {
     info!("launching GUI event loop");
     gui::run_with_options(resolve_launch_options(options)?)?;
     Ok(())
+}
+
+fn run_visual_smoke(options: &StartupOptions) -> Result<(), Box<dyn std::error::Error>> {
+    let mut launch = resolve_launch_options(options)?;
+    launch.startup_scene = StartupScene::VisualSmoke(visual_smoke_scene_from_env());
+    info!(scene = ?launch.startup_scene, "launching visual smoke scene");
+    gui::run_with_options(launch)?;
+    Ok(())
+}
+
+fn visual_smoke_scene_from_env() -> VisualSmokeScene {
+    let scene = std::env::var("NOCTRAIL_VISUAL_SCENE")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "single-pane".to_string());
+
+    match scene.as_str() {
+        "single" | "single-pane" => VisualSmokeScene::SinglePane,
+        "tiling" | "tiling-4up" | "4up" => VisualSmokeScene::TilingFourUp,
+        "scratch" => VisualSmokeScene::Scratch,
+        other => {
+            warn!(
+                scene = other,
+                "unknown NOCTRAIL_VISUAL_SCENE, falling back to single-pane"
+            );
+            VisualSmokeScene::SinglePane
+        }
+    }
 }
 
 fn split_axis_from_config(axis: LayoutSplitAxis) -> Option<SplitAxis> {
