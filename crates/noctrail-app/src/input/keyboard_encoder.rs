@@ -63,7 +63,7 @@ fn control_text_candidates<'a>(
         .into_iter()
         .chain(request.key_without_modifiers)
         .chain(match request.logical_key.as_ref() {
-            Key::Character(ch) => Some(ch.as_ref()).into_iter(),
+            Key::Character(ch) => Some(ch).into_iter(),
             _ => None.into_iter(),
         })
         .chain(std::iter::once(fallback))

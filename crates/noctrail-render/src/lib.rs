@@ -15,9 +15,11 @@ use wgpu::CurrentSurfaceTexture;
 use winit::{dpi::PhysicalSize, window::Window};
 
 thread_local! {
-    static SOFTWARE_FONT_SYSTEM: RefCell<FontSystem> = RefCell::new(configured_font_system());
+    static SOFTWARE_FONT_SYSTEM: RefCell<FontSystem> = RefCell::new(font::configured_font_system());
     static SOFTWARE_SWASH_CACHE: RefCell<SwashCache> = RefCell::new(SwashCache::new());
 }
+
+mod font;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RenderBackend {
@@ -245,28 +247,6 @@ const FONT_SAMPLE_ASCII: &str = "abcXYZ 0123";
 const FONT_SAMPLE_CJK: &str = "你好，世界";
 const FONT_SAMPLE_EMOJI: &str = "🙂🧪🚀";
 const FONT_SAMPLE_NERD: &str = "\u{e0b0} \u{f417} \u{f120}";
-const BUNDLED_FONT_FILES: [BundledFontFile; 4] = [
-    BundledFontFile {
-        bytes: include_bytes!(
-            "../../../assets/fonts/caskaydia-mono/CaskaydiaMonoNerdFontMono-Regular.ttf"
-        ),
-    },
-    BundledFontFile {
-        bytes: include_bytes!(
-            "../../../assets/fonts/caskaydia-mono/CaskaydiaMonoNerdFontMono-Bold.ttf"
-        ),
-    },
-    BundledFontFile {
-        bytes: include_bytes!(
-            "../../../assets/fonts/caskaydia-mono/CaskaydiaMonoNerdFontMono-Italic.ttf"
-        ),
-    },
-    BundledFontFile {
-        bytes: include_bytes!(
-            "../../../assets/fonts/caskaydia-mono/CaskaydiaMonoNerdFontMono-BoldItalic.ttf"
-        ),
-    },
-];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FontPreferences {
@@ -278,9 +258,9 @@ pub struct FontPreferences {
 impl Default for FontPreferences {
     fn default() -> Self {
         Self {
-            family: default_font_family().to_string(),
+            family: font::default_font_family().to_string(),
             size: DEFAULT_FONT_SIZE,
-            fallback: default_font_fallbacks(),
+            fallback: font::default_font_fallbacks(),
         }
     }
 }
@@ -368,11 +348,6 @@ struct FontCandidate {
     id: fontdb::ID,
     label: String,
     source: FontFaceSource,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct BundledFontFile {
-    bytes: &'static [u8],
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -612,8 +587,10 @@ pub fn rasterize_software_frame(
                     continue;
                 }
 
-                let x = plan.viewport.x as i32 + (rect.col as f32 * config.cell_width).round() as i32;
-                let y = plan.viewport.y as i32 + (rect.row as f32 * config.line_height).round() as i32;
+                let x =
+                    plan.viewport.x as i32 + (rect.col as f32 * config.cell_width).round() as i32;
+                let y =
+                    plan.viewport.y as i32 + (rect.row as f32 * config.line_height).round() as i32;
                 let cell_width = ((rect.span as f32) * config.cell_width).ceil().max(1.0) as u32;
                 let cell_height = config.line_height.ceil().max(1.0) as u32;
                 match rect.layer {
@@ -1011,31 +988,6 @@ fn resolve_primary_family(
     )
 }
 
-fn default_font_family() -> &'static str {
-    DEFAULT_FONT_FAMILY
-}
-
-fn default_font_fallbacks() -> Vec<String> {
-    #[cfg(target_os = "macos")]
-    let families = [
-        "Menlo",
-        "PingFang SC",
-        "Apple Color Emoji",
-        "Segoe UI Emoji",
-    ];
-
-    #[cfg(target_os = "windows")]
-    let families = ["Microsoft YaHei UI", "Segoe UI Emoji", "Noto Color Emoji"];
-
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    let families = DEFAULT_FONT_FALLBACKS;
-
-    families
-        .iter()
-        .map(|family| (*family).to_string())
-        .collect()
-}
-
 fn resolve_requested_family(
     db: &fontdb::Database,
     requested_family: &str,
@@ -1092,7 +1044,7 @@ fn query_family_face<'a>(
 }
 
 fn preferred_system_monospace_face(db: &fontdb::Database) -> Option<&fontdb::FaceInfo> {
-    for family in preferred_system_monospace_families() {
+    for family in font::preferred_system_monospace_families() {
         if let Some(face) = query_family_face(db, FontFamily::Name(family)) {
             return Some(face);
         }
@@ -1108,21 +1060,6 @@ fn preferred_system_monospace_face(db: &fontdb::Database) -> Option<&fontdb::Fac
         })
 }
 
-#[cfg(target_os = "macos")]
-fn preferred_system_monospace_families() -> &'static [&'static str] {
-    &["SF Mono", "Menlo", "Monaco"]
-}
-
-#[cfg(windows)]
-fn preferred_system_monospace_families() -> &'static [&'static str] {
-    &["Cascadia Mono", "Consolas", "Lucida Console"]
-}
-
-#[cfg(not(any(target_os = "macos", windows)))]
-fn preferred_system_monospace_families() -> &'static [&'static str] {
-    &["Noto Sans Mono", "DejaVu Sans Mono", "Liberation Mono"]
-}
-
 fn font_face_label(face: &fontdb::FaceInfo) -> String {
     let family = face
         .families
@@ -1134,25 +1071,6 @@ fn font_face_label(face: &fontdb::FaceInfo) -> String {
         face.post_script_name,
         font_face_source(face).label()
     )
-}
-
-fn configured_font_system() -> FontSystem {
-    let locale = FontSystem::new().locale().to_string();
-    FontSystem::new_with_locale_and_db(locale, configured_font_database())
-}
-
-fn configured_font_database() -> fontdb::Database {
-    let mut db = fontdb::Database::new();
-    load_bundled_fonts(&mut db);
-    db.load_system_fonts();
-    db.set_monospace_family(default_font_family());
-    db
-}
-
-fn load_bundled_fonts(db: &mut fontdb::Database) {
-    for font in BUNDLED_FONT_FILES {
-        db.load_font_data(font.bytes.to_vec());
-    }
 }
 
 fn font_face_source(face: &fontdb::FaceInfo) -> FontFaceSource {
@@ -2230,9 +2148,9 @@ mod tests {
     fn default_font_preferences_match_rendering_note() {
         let preferences = FontPreferences::default();
 
-        assert_eq!(preferences.family, default_font_family());
+        assert_eq!(preferences.family, font::default_font_family());
         assert_eq!(preferences.size, DEFAULT_FONT_SIZE);
-        for family in default_font_fallbacks() {
+        for family in font::default_font_fallbacks() {
             assert!(preferences.fallback.iter().any(|item| item == &family));
         }
     }
@@ -2249,7 +2167,10 @@ mod tests {
             FontFamilyResolution::Missing
         );
         assert_eq!(diagnostics.primary.resolved_source, None);
-        assert_eq!(diagnostics.fallbacks.len(), default_font_fallbacks().len());
+        assert_eq!(
+            diagnostics.fallbacks.len(),
+            font::default_font_fallbacks().len()
+        );
         assert!(
             diagnostics
                 .fallbacks
@@ -2295,8 +2216,8 @@ mod tests {
 
     #[test]
     fn bundled_font_file_inventory_is_complete() {
-        assert_eq!(BUNDLED_FONT_FILES.len(), 4);
-        assert!(BUNDLED_FONT_FILES.iter().all(|font| !font.bytes.is_empty()));
+        assert_eq!(font::bundled_font_file_count(), 4);
+        assert!(font::bundled_fonts_present());
     }
 
     #[test]

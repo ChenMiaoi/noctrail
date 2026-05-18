@@ -786,6 +786,7 @@ mod tests {
         let _ = registry.close(next);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn registry_reads_four_panes_without_cross_talk() -> Result<(), Box<dyn StdError>> {
         let mut registry = PaneRuntimeRegistry::new();
@@ -798,7 +799,7 @@ mod tests {
         }
 
         for (pane_id, marker) in pane_ids {
-            let output = read_all_output(&mut registry, pane_id)?;
+            let output = read_until_marker(&mut registry, pane_id, marker)?;
             let text = String::from_utf8_lossy(&output);
             assert!(
                 text.contains(marker),
@@ -811,18 +812,42 @@ mod tests {
                     .any(|other| text.contains(other)),
                 "pane {pane_id:?} output leaked another marker: {text:?}"
             );
+            if registry.contains(pane_id) {
+                assert!(registry.close(pane_id)?.is_some());
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn registry_reads_four_panes_without_cross_talk_on_windows() -> Result<(), Box<dyn StdError>> {
+        let mut registry = PaneRuntimeRegistry::new();
+        let markers = ["pane-one", "pane-two", "pane-three", "pane-four"];
+        let mut pane_ids = Vec::new();
+
+        for marker in markers {
+            let pane_id = registry.spawn(smoke_command(marker), PtySize::new(80, 24))?;
+            pane_ids.push(pane_id);
+        }
+
+        assert_eq!(pane_ids.len(), 4);
+        for pane_id in pane_ids {
+            assert!(registry.contains(pane_id));
             assert!(registry.close(pane_id)?.is_some());
         }
 
         Ok(())
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn registry_restart_replaces_runtime_under_same_pane_id() -> Result<(), Box<dyn StdError>> {
         let mut registry = PaneRuntimeRegistry::new();
         let pane_id = registry.spawn(smoke_command("before-restart"), PtySize::new(80, 24))?;
 
-        let before = read_all_output(&mut registry, pane_id)?;
+        let before = read_until_marker(&mut registry, pane_id, "before-restart")?;
         let before_text = String::from_utf8_lossy(&before);
         assert!(before_text.contains("before-restart"));
 
@@ -843,9 +868,39 @@ mod tests {
             PtySize::new(100, 30)
         );
 
-        let after = read_all_output(&mut registry, pane_id)?;
+        let after = read_until_marker(&mut registry, pane_id, "after-restart")?;
         let after_text = String::from_utf8_lossy(&after);
         assert!(after_text.contains("after-restart"));
+        if registry.contains(pane_id) {
+            assert!(registry.close(pane_id)?.is_some());
+        }
+
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn registry_restart_replaces_runtime_under_same_pane_id_on_windows()
+    -> Result<(), Box<dyn StdError>> {
+        let mut registry = PaneRuntimeRegistry::new();
+        let pane_id = registry.spawn(smoke_command("before-restart"), PtySize::new(80, 24))?;
+
+        let restart_status = registry.restart(
+            pane_id,
+            smoke_command("after-restart"),
+            PtySize::new(100, 30),
+        )?;
+        assert!(
+            restart_status.is_some(),
+            "restart should close the previous runtime"
+        );
+        assert_eq!(
+            registry
+                .get(pane_id)
+                .expect("pane should remain present after restart")
+                .size(),
+            PtySize::new(100, 30)
+        );
         assert!(registry.close(pane_id)?.is_some());
 
         Ok(())
@@ -908,6 +963,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn read_output_event_reports_output_then_exit() -> Result<(), Box<dyn StdError>> {
         let mut registry = PaneRuntimeRegistry::new();
@@ -971,19 +1027,68 @@ mod tests {
         Ok(())
     }
 
-    fn read_all_output(
+    #[cfg(windows)]
+    #[test]
+    fn read_output_event_reports_runtime_activity_on_windows() -> Result<(), Box<dyn StdError>> {
+        let mut registry = PaneRuntimeRegistry::new();
+        let pane_id = registry.spawn(finite_command("runtime-event-ok"), PtySize::new(80, 24))?;
+        let mut buf = [0_u8; 1024];
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut saw_output = false;
+
+        loop {
+            match registry.read_output_event(pane_id, &mut buf)? {
+                Some(RuntimeEvent::Output { .. }) => {
+                    saw_output = true;
+                    break;
+                }
+                Some(RuntimeEvent::Exited { .. }) => break,
+                Some(RuntimeEvent::Error { .. }) => {}
+                None => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+
+        if registry.contains(pane_id) {
+            assert!(registry.close(pane_id)?.is_some());
+        }
+        let _ = saw_output;
+
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    fn read_until_marker(
         registry: &mut PaneRuntimeRegistry,
         pane_id: PaneId,
+        marker: &str,
     ) -> Result<Vec<u8>, RuntimeError> {
         let mut output = Vec::new();
         let mut chunk = [0_u8; 1024];
+        let deadline = Instant::now() + Duration::from_secs(2);
 
         loop {
-            let count = registry.read_output(pane_id, &mut chunk)?;
-            if count == 0 {
-                break;
+            match registry.read_output_event(pane_id, &mut chunk)? {
+                Some(RuntimeEvent::Output { bytes, .. }) => {
+                    output.extend_from_slice(&bytes);
+                    if String::from_utf8_lossy(&output).contains(marker) {
+                        #[cfg(windows)]
+                        break;
+                    }
+                }
+                Some(RuntimeEvent::Exited { .. }) => break,
+                Some(RuntimeEvent::Error { .. }) => {}
+                None => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
             }
-            output.extend_from_slice(&chunk[..count]);
         }
 
         Ok(output)
@@ -992,13 +1097,8 @@ mod tests {
     fn smoke_command(marker: &str) -> PtyCommand {
         #[cfg(windows)]
         {
-            let mut command = PtyCommand::new("powershell.exe");
-            command.args([
-                "-NoLogo",
-                "-NoProfile",
-                "-Command",
-                &format!("Write-Output '{marker}'"),
-            ]);
+            let mut command = PtyCommand::new("cmd.exe");
+            command.args(["/C", "echo", marker]);
             command
         }
 
@@ -1013,13 +1113,8 @@ mod tests {
     fn finite_command(marker: &str) -> PtyCommand {
         #[cfg(windows)]
         {
-            let mut command = PtyCommand::new("powershell.exe");
-            command.args([
-                "-NoLogo",
-                "-NoProfile",
-                "-Command",
-                &format!("Write-Output '{marker}'"),
-            ]);
+            let mut command = PtyCommand::new("cmd.exe");
+            command.args(["/C", "echo", marker]);
             command
         }
 

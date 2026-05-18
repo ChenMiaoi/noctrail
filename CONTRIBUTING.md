@@ -1,6 +1,6 @@
 # Contributing
 
-Noctrail is early-stage. Keep changes small, reviewable, and aligned with [docs/plan.md](docs/plan.md).
+Noctrail is early-stage. Keep changes small, reviewable, and aligned with [docs/roadmap.md](docs/roadmap.md).
 
 ## Principles
 
@@ -15,6 +15,16 @@ Noctrail is early-stage. Keep changes small, reviewable, and aligned with [docs/
 2. Keep each pull request focused on one logical change.
 3. Add or update tests for behavior changes.
 4. Run the validation commands before requesting review.
+
+## Module Boundaries
+
+- Keep platform-specific logic behind `platform/...` modules instead of
+  scattering `cfg` branches through large product files.
+- Extract platform decision points, not duplicated end-to-end workflows.
+- Avoid speculative abstractions; prefer narrow helpers with explicit
+  inputs and outputs.
+- When a top-level entry file grows past a few hundred lines, split by
+  responsibility before adding more behavior.
 
 ## Validation
 

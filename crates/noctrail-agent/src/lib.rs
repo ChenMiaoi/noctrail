@@ -941,9 +941,10 @@ mod tests {
         #[cfg(windows)]
         {
             vec![
-                "cmd".to_string(),
-                "/C".to_string(),
-                format!("echo {payload}"),
+                "powershell".to_string(),
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                format!("[Console]::Out.Write(@'\n{payload}\n'@)"),
             ]
         }
 
@@ -970,9 +971,10 @@ mod tests {
         #[cfg(windows)]
         {
             vec![
-                "cmd".to_string(),
-                "/C".to_string(),
-                format!("echo {payload}"),
+                "powershell".to_string(),
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                format!("[Console]::Out.Write(@'\n{payload}\n'@)"),
             ]
         }
 

@@ -23,6 +23,7 @@ use noctrail_render::{
 use noctrail_runtime::PaneId;
 use noctrail_term::{Color, Cursor, DamageSet, MouseTrackingMode, Position, SelectionMode, Style};
 use tracing::{debug, error, info, warn};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize},
@@ -32,11 +33,11 @@ use winit::{
     window::{CursorIcon, ResizeDirection, Window, WindowId},
 };
 
-#[cfg(target_os = "macos")]
-use winit::platform::macos::WindowAttributesExtMacOS;
-use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-
 use crate::{DesktopApp, DesktopFrame, PaneChromeConfig, clipboard::ClipboardBridge, input};
+
+mod platform;
+
+use self::platform::{review_file_command, review_output_command, review_patch_cli_command};
 
 const DEFAULT_WINDOW_WIDTH: u32 = 1280;
 const DEFAULT_WINDOW_HEIGHT: u32 = 800;
@@ -688,8 +689,7 @@ fn truncate_middle(text: &str, max_chars: usize) -> String {
 }
 
 fn normalize_editor_text(text: &str) -> String {
-    text.replace("\r\n", " ")
-        .replace(['\r', '\n'], " ")
+    text.replace("\r\n", " ").replace(['\r', '\n'], " ")
 }
 
 fn nth_char_boundary(text: &str, char_index: usize) -> usize {
@@ -1682,16 +1682,24 @@ impl GuiApp {
         };
 
         let config = self.glyph_raster_config(&frame, scale_factor);
-        let strip_origin_y =
-            frame.render_plan.viewport.y + (frame.render_plan.cursor.row as f32 * config.line_height).round() as usize;
-        let max_strip_height = usize::from(frame.pane_surface.height).saturating_sub(strip_origin_y);
+        let strip_origin_y = frame.render_plan.viewport.y
+            + (frame.render_plan.cursor.row as f32 * config.line_height).round() as usize;
+        let max_strip_height =
+            usize::from(frame.pane_surface.height).saturating_sub(strip_origin_y);
         if max_strip_height == 0 {
             return Ok(false);
         }
-        let strip_height = (config.line_height.ceil() as usize).max(1).min(max_strip_height);
+        let strip_height = (config.line_height.ceil() as usize)
+            .max(1)
+            .min(max_strip_height);
         let strip_plan = RenderPlan {
             backend: frame.render_plan.backend,
-            pane_rect: RenderRect::new(0, 0, usize::from(frame.pane_surface.width.max(1)), strip_height),
+            pane_rect: RenderRect::new(
+                0,
+                0,
+                usize::from(frame.pane_surface.width.max(1)),
+                strip_height,
+            ),
             viewport: RenderRect::new(
                 frame.render_plan.viewport.x,
                 0,
@@ -1836,11 +1844,7 @@ impl GuiApp {
                 "f" => self.editor_state_mut(pane_id).move_word_right(),
                 _ => return Ok(false),
             },
-            Key::Character(text)
-                if !control
-                    && !alt
-                    && !text.is_empty() =>
-            {
+            Key::Character(text) if !control && !alt && !text.is_empty() => {
                 self.editor_state_mut(pane_id).insert_text(text);
             }
             _ => return Ok(false),
@@ -2006,24 +2010,18 @@ impl GuiApp {
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), Box<dyn Error>> {
         let requested_transparency = self.theme.opacity < 1.0 && !self.launch_options.safe_mode;
-        #[allow(unused_mut)]
-        let mut attributes = Window::default_attributes()
-            .with_title("Noctrail")
-            .with_inner_size(LogicalSize::new(
-                f64::from(DEFAULT_WINDOW_WIDTH),
-                f64::from(DEFAULT_WINDOW_HEIGHT),
-            ))
-            .with_active(true)
-            .with_resizable(true)
-            .with_decorations(false)
-            .with_transparent(requested_transparency);
-        #[cfg(target_os = "macos")]
-        {
-            attributes = attributes
-                .with_titlebar_hidden(true)
-                .with_fullsize_content_view(true)
-                .with_movable_by_window_background(true);
-        }
+        let attributes = platform::configure_window_attributes(
+            Window::default_attributes()
+                .with_title("Noctrail")
+                .with_inner_size(LogicalSize::new(
+                    f64::from(DEFAULT_WINDOW_WIDTH),
+                    f64::from(DEFAULT_WINDOW_HEIGHT),
+                ))
+                .with_active(true)
+                .with_resizable(true)
+                .with_decorations(false)
+                .with_transparent(requested_transparency),
+        );
         info!(
             safe_mode = self.launch_options.safe_mode,
             backend = ?self.launch_options.renderer_backend,
@@ -2261,7 +2259,9 @@ impl GuiApp {
 
         let state = self.editor_state_mut(frame.pane_id).clone();
         frame.render_plan.cursor = Cursor {
-            row: anchor.row.min(frame.render_plan.rows.len().saturating_sub(1)),
+            row: anchor
+                .row
+                .min(frame.render_plan.rows.len().saturating_sub(1)),
             col: (anchor.col + state.cursor_chars)
                 .min(usize::from(frame.terminal_size.cols).saturating_sub(1)),
         };
@@ -2975,15 +2975,16 @@ impl GuiApp {
                     self.handle_window_resize_interaction();
                     return Ok(());
                 }
-                #[cfg(not(target_os = "macos"))]
-                if self.modifiers.alt_key() {
+                if platform::allows_alt_drag_window() && self.modifiers.alt_key() {
                     if let Some(window) = self.window.as_ref() {
                         let _ = window.drag_window();
                     }
                     return Ok(());
                 }
                 if self.active_input_mode() == InputMode::Editor
-                    && let Some(anchor) = self.editor_state_mut(self.app.active_pane_id().unwrap()).anchor
+                    && let Some(anchor) = self
+                        .editor_state_mut(self.app.active_pane_id().unwrap())
+                        .anchor
                     && let Some(cell) = cell
                     && cell.row == anchor.row
                 {
@@ -3610,50 +3611,6 @@ fn shell_exit_bytes() -> Vec<u8> {
     b"exit\r\n".to_vec()
 }
 
-fn review_output_command(marker: &str) -> String {
-    #[cfg(windows)]
-    {
-        format!("echo {marker}")
-    }
-
-    #[cfg(not(windows))]
-    {
-        format!("printf '{marker}\\n'")
-    }
-}
-
-fn review_file_command(path: &Path) -> String {
-    #[cfg(windows)]
-    {
-        format!("cmd /C echo review-high>\"{}\"", path.display())
-    }
-
-    #[cfg(not(windows))]
-    {
-        format!("sh -lc 'printf review-high > \"{}\"'", path.display())
-    }
-}
-
-fn review_patch_cli_command(path: &Path) -> Vec<String> {
-    #[cfg(windows)]
-    {
-        vec![
-            "cmd".to_string(),
-            "/C".to_string(),
-            format!("type \"{}\"", path.display()),
-        ]
-    }
-
-    #[cfg(not(windows))]
-    {
-        vec![
-            "sh".to_string(),
-            "-lc".to_string(),
-            format!("cat \"{}\"", path.display()),
-        ]
-    }
-}
-
 fn shell_integration_probe_bytes(
     command: &str,
     cwd: &str,
@@ -3831,10 +3788,7 @@ impl ApplicationHandler<GuiEvent> for GuiApp {
             WindowEvent::MouseWheel { delta, .. } => {
                 exit_on_error(event_loop, self.handle_mouse_wheel(delta));
             }
-            WindowEvent::KeyboardInput {
-                event,
-                ..
-            } => {
+            WindowEvent::KeyboardInput { event, .. } => {
                 let key_pressed = event.state == ElementState::Pressed;
                 if matches!(
                     self.shortcut_action(&event.logical_key),
@@ -3932,9 +3886,7 @@ impl ApplicationHandler<GuiEvent> for GuiApp {
                         return;
                     }
                 }
-                if key_pressed
-                    && let Some(action) = self.shortcut_action(&event.logical_key)
-                {
+                if key_pressed && let Some(action) = self.shortcut_action(&event.logical_key) {
                     match action {
                         input::ShortcutAction::ToggleInputMode => unreachable!(),
                         input::ShortcutAction::ToggleAgentAuditBrowser => unreachable!(),
@@ -3995,7 +3947,7 @@ impl ApplicationHandler<GuiEvent> for GuiApp {
                 }
                 let key_without_modifiers = event.key_without_modifiers();
                 let key_without_modifiers = match key_without_modifiers.as_ref() {
-                    winit::keyboard::Key::Character(text) => Some(&text[..]),
+                    winit::keyboard::Key::Character(text) => Some(text),
                     _ => None,
                 };
                 if let Some(bytes) = input::encode_key_event(input::KeyboardEncodeRequest {
@@ -4064,18 +4016,19 @@ impl ApplicationHandler<GuiEvent> for GuiApp {
             self.update_title();
         }
         let now = Instant::now();
-        if !self.window_focused && self.startup_focus_retry_until.is_some() {
-            if let Some(until) = self.startup_focus_retry_until {
-                if now <= until {
-                    if now >= self.next_startup_focus_retry_at {
-                        if let Some(window) = self.window.as_ref() {
-                            window.focus_window();
-                        }
-                        self.next_startup_focus_retry_at = now + STARTUP_FOCUS_RETRY_INTERVAL;
+        if !self.window_focused
+            && self.startup_focus_retry_until.is_some()
+            && let Some(until) = self.startup_focus_retry_until
+        {
+            if now <= until {
+                if now >= self.next_startup_focus_retry_at {
+                    if let Some(window) = self.window.as_ref() {
+                        window.focus_window();
                     }
-                } else {
-                    self.startup_focus_retry_until = None;
+                    self.next_startup_focus_retry_at = now + STARTUP_FOCUS_RETRY_INTERVAL;
                 }
+            } else {
+                self.startup_focus_retry_until = None;
             }
         }
         if self.advance_transition(now) {
