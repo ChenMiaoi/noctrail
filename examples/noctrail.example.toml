@@ -2,26 +2,31 @@
 backend = "gpu"
 
 [font]
-family = "Iosevka"
+family = "CaskaydiaMono NFM"
 size = 15.0
-fallback = ["Noto Sans CJK SC", "Noto Color Emoji"]
+fallback = ["Microsoft YaHei UI", "Segoe UI Emoji"]
 
 [theme]
-opacity = 0.92
+opacity = 1.0
 
 [theme.color]
-background = "#081018"
-foreground = "#d5def5"
+background = "#070d12"
+foreground = "#e8eef2"
+chrome-background = "#121a22"
+chrome-foreground = "#f7fafc"
+chrome-muted = "#97a5b2"
+chrome-accent = "#7ad9b2"
+chrome-danger = "#f28779"
 
 [theme.border]
-active = "#7aa2f7"
-inactive = "#334155"
+active = "#91b4ff"
+inactive = "#313d49"
 width = 1
 
 [theme.pane]
-gap = 6
-padding = 3
-radius = 10
+gap = 12
+padding = 8
+radius = 18
 
 [theme.blur]
 enabled = true
@@ -29,17 +34,17 @@ fallback-tint-opacity = 0.94
 
 [theme.animation]
 enabled = true
-duration-ms = 140
+duration-ms = 120
 
 [theme.low-power]
 enabled = false
 
 [theme.cursor]
-color = "#ffd580"
-blink-interval-ms = 500
+color = "#ffd885"
+blink-interval-ms = 600
 
 [theme.selection]
-background = "#264f78cc"
+background = "#2d5a84d8"
 foreground = "#ffffff"
 
 [keymap]
@@ -57,10 +62,10 @@ focus-up = ["alt-w"]
 focus-down = ["alt-s"]
 
 [layout]
-default-split-axis = "vertical"
-resize-step = 9
-scratch-height-percent = 40
-startup-workspace = 3
+default-split-axis = "auto"
+resize-step = 5
+scratch-height-percent = 33
+startup-workspace = 1
 
 [agent]
 enabled = false

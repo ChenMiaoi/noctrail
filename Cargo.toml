@@ -28,3 +28,36 @@ unsafe_op_in_unsafe_fn = "deny"
 dbg_macro = "deny"
 todo = "warn"
 unwrap_used = "warn"
+
+[profile.dev]
+opt-level = 1
+debug = 0
+debug-assertions = false
+overflow-checks = false
+
+[profile.dev.package.noctrail-app]
+opt-level = 3
+
+[profile.dev.package.noctrail-render]
+opt-level = 3
+
+[profile.dev.package.noctrail-term]
+opt-level = 3
+
+[profile.dev.package.noctrail-runtime]
+opt-level = 3
+
+[profile.dev.package.noctrail-layout]
+opt-level = 3
+
+[profile.dev.package.noctrail-pty]
+opt-level = 3
+
+[profile.dev.package.cosmic-text]
+opt-level = 3
+
+[profile.dev.package.swash]
+opt-level = 3
+
+[profile.dev.package.fontdb]
+opt-level = 3

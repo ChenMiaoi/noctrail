@@ -1,6 +1,6 @@
 //! Render plan and backend boundary for Noctrail.
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{cell::RefCell, collections::BTreeSet, sync::Arc};
 
 use cosmic_text::{
     Attrs as FontAttrs, Buffer as FontBuffer, CacheKey, Family as FontFamily, FontSystem,
@@ -13,6 +13,11 @@ use noctrail_term::{
 use thiserror::Error;
 use wgpu::CurrentSurfaceTexture;
 use winit::{dpi::PhysicalSize, window::Window};
+
+thread_local! {
+    static SOFTWARE_FONT_SYSTEM: RefCell<FontSystem> = RefCell::new(configured_font_system());
+    static SOFTWARE_SWASH_CACHE: RefCell<SwashCache> = RefCell::new(SwashCache::new());
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RenderBackend {
@@ -235,10 +240,33 @@ impl RenderPlan {
 pub struct RenderSurface;
 
 const DEFAULT_FONT_SIZE: f32 = 15.0;
+const DEFAULT_FONT_FAMILY: &str = "CaskaydiaMono NFM";
 const FONT_SAMPLE_ASCII: &str = "abcXYZ 0123";
 const FONT_SAMPLE_CJK: &str = "你好，世界";
 const FONT_SAMPLE_EMOJI: &str = "🙂🧪🚀";
 const FONT_SAMPLE_NERD: &str = "\u{e0b0} \u{f417} \u{f120}";
+const BUNDLED_FONT_FILES: [BundledFontFile; 4] = [
+    BundledFontFile {
+        bytes: include_bytes!(
+            "../../../assets/fonts/caskaydia-mono/CaskaydiaMonoNerdFontMono-Regular.ttf"
+        ),
+    },
+    BundledFontFile {
+        bytes: include_bytes!(
+            "../../../assets/fonts/caskaydia-mono/CaskaydiaMonoNerdFontMono-Bold.ttf"
+        ),
+    },
+    BundledFontFile {
+        bytes: include_bytes!(
+            "../../../assets/fonts/caskaydia-mono/CaskaydiaMonoNerdFontMono-Italic.ttf"
+        ),
+    },
+    BundledFontFile {
+        bytes: include_bytes!(
+            "../../../assets/fonts/caskaydia-mono/CaskaydiaMonoNerdFontMono-BoldItalic.ttf"
+        ),
+    },
+];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FontPreferences {
@@ -274,12 +302,28 @@ impl FontFamilyResolution {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FontFaceSource {
+    Bundled,
+    System,
+}
+
+impl FontFaceSource {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Bundled => "bundled",
+            Self::System => "system",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FontFamilyDiagnostics {
     pub requested_family: String,
     pub resolution: FontFamilyResolution,
     pub resolved_family: Option<String>,
     pub resolved_post_script_name: Option<String>,
+    pub resolved_source: Option<FontFaceSource>,
     pub monospaced: Option<bool>,
 }
 
@@ -323,6 +367,12 @@ pub struct FontDiagnostics {
 struct FontCandidate {
     id: fontdb::ID,
     label: String,
+    source: FontFaceSource,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BundledFontFile {
+    bytes: &'static [u8],
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -454,11 +504,11 @@ pub struct SoftwareRenderPalette {
 impl Default for SoftwareRenderPalette {
     fn default() -> Self {
         Self {
-            background: Rgba::opaque(0x05, 0x0a, 0x0f),
-            foreground: Rgba::opaque(0xc0, 0xca, 0xf5),
-            selection_background: Rgba::opaque(0x26, 0x4f, 0x78),
+            background: Rgba::opaque(0x07, 0x0d, 0x12),
+            foreground: Rgba::opaque(0xe8, 0xee, 0xf2),
+            selection_background: Rgba::opaque(0x2d, 0x5a, 0x84),
             selection_foreground: Rgba::opaque(0xff, 0xff, 0xff),
-            cursor: Rgba::opaque(0xc0, 0xca, 0xf5),
+            cursor: Rgba::opaque(0xff, 0xd8, 0x85),
         }
     }
 }
@@ -480,24 +530,30 @@ struct PixelRect {
 }
 
 pub fn probe_font_diagnostics(preferences: &FontPreferences) -> FontDiagnostics {
-    let mut font_system = FontSystem::new();
-    collect_font_diagnostics(&mut font_system, preferences)
+    SOFTWARE_FONT_SYSTEM.with(|font_system| {
+        let mut font_system = font_system.borrow_mut();
+        collect_font_diagnostics(&mut font_system, preferences)
+    })
 }
 
 pub fn prepare_glyph_frame(
     plan: &RenderPlan,
     config: &GlyphRasterConfig,
 ) -> Result<PreparedGlyphFrame, GlyphPrepareError> {
-    let mut font_system = FontSystem::new();
-    prepare_glyph_frame_with_font_system(&mut font_system, plan, config)
+    SOFTWARE_FONT_SYSTEM.with(|font_system| {
+        let mut font_system = font_system.borrow_mut();
+        prepare_glyph_frame_with_font_system(&mut font_system, plan, config)
+    })
 }
 
 pub fn prepare_render_frame(
     plan: &RenderPlan,
     config: &GlyphRasterConfig,
 ) -> Result<PreparedRenderFrame, GlyphPrepareError> {
-    let mut font_system = FontSystem::new();
-    prepare_render_frame_with_font_system(&mut font_system, plan, config)
+    SOFTWARE_FONT_SYSTEM.with(|font_system| {
+        let mut font_system = font_system.borrow_mut();
+        prepare_render_frame_with_font_system(&mut font_system, plan, config)
+    })
 }
 
 pub fn rasterize_software_frame(
@@ -506,146 +562,150 @@ pub fn rasterize_software_frame(
     palette: &SoftwareRenderPalette,
     cursor_visible: bool,
 ) -> Result<SoftwareRenderFrame, GlyphPrepareError> {
-    let mut font_system = FontSystem::new();
-    let mut swash_cache = SwashCache::new();
-    let prepared = prepare_render_frame_with_font_system(&mut font_system, plan, config)?;
-    let width = plan.pane_rect.width.max(1) as u32;
-    let height = plan.pane_rect.height.max(1) as u32;
-    let mut pixels = vec![0; width as usize * height as usize * 4];
-    fill_rgba(&mut pixels, palette.background);
+    SOFTWARE_FONT_SYSTEM.with(|font_system| {
+        SOFTWARE_SWASH_CACHE.with(|swash_cache| {
+            let mut font_system = font_system.borrow_mut();
+            let mut swash_cache = swash_cache.borrow_mut();
+            let prepared = prepare_render_frame_with_font_system(&mut font_system, plan, config)?;
+            let width = plan.pane_rect.width.max(1) as u32;
+            let height = plan.pane_rect.height.max(1) as u32;
+            let mut pixels = vec![0; width as usize * height as usize * 4];
+            fill_rgba(&mut pixels, palette.background);
 
-    let selection = plan
-        .selection
-        .as_ref()
-        .map(|selection| selection_ranges(&plan.rows, &selection.clone().normalized()));
+            let selection = plan
+                .selection
+                .as_ref()
+                .map(|selection| selection_ranges(&plan.rows, &selection.clone().normalized()));
 
-    for rect in &prepared.chrome.rects {
-        fill_rect_rgba(
-            &mut pixels,
-            width,
-            height,
-            PixelRect {
-                x: rect.rect.x as i32,
-                y: rect.rect.y as i32,
-                width: rect.rect.width as u32,
-                height: rect.rect.height as u32,
-            },
-            rect.color,
-        );
-    }
-
-    for segment in &prepared.border.segments {
-        fill_rect_rgba(
-            &mut pixels,
-            width,
-            height,
-            PixelRect {
-                x: segment.x as i32,
-                y: segment.y as i32,
-                width: segment.width as u32,
-                height: segment.height as u32,
-            },
-            segment.color,
-        );
-    }
-
-    for rect in &prepared.paint.rects {
-        if matches!(rect.layer, PaintLayer::Cursor) && !cursor_visible {
-            continue;
-        }
-
-        let x = plan.viewport.x as i32 + (rect.col as f32 * config.cell_width).round() as i32;
-        let y = plan.viewport.y as i32 + (rect.row as f32 * config.line_height).round() as i32;
-        let cell_width = ((rect.span as f32) * config.cell_width).ceil().max(1.0) as u32;
-        let cell_height = config.line_height.ceil().max(1.0) as u32;
-        match rect.layer {
-            PaintLayer::Background => {
+            for rect in &prepared.chrome.rects {
                 fill_rect_rgba(
                     &mut pixels,
                     width,
                     height,
                     PixelRect {
-                        x,
-                        y,
-                        width: cell_width,
-                        height: cell_height,
+                        x: rect.rect.x as i32,
+                        y: rect.rect.y as i32,
+                        width: rect.rect.width as u32,
+                        height: rect.rect.height as u32,
                     },
-                    resolve_color(rect.color.unwrap_or(Color::Default), palette, false),
+                    rect.color,
                 );
             }
-            PaintLayer::Selection => {
-                fill_rect_rgba(
-                    &mut pixels,
-                    width,
-                    height,
-                    PixelRect {
-                        x,
-                        y,
-                        width: cell_width,
-                        height: cell_height,
-                    },
-                    palette.selection_background,
-                );
-            }
-            PaintLayer::Cursor => {
-                fill_rect_rgba(
-                    &mut pixels,
-                    width,
-                    height,
-                    PixelRect {
-                        x,
-                        y,
-                        width: cell_width,
-                        height: cell_height,
-                    },
-                    palette.cursor,
-                );
-            }
-            PaintLayer::Underline => {
-                let underline_height = ((config.line_height / 14.0).ceil() as u32).max(1);
-                let underline_y = y + cell_height.saturating_sub(underline_height) as i32;
-                fill_rect_rgba(
-                    &mut pixels,
-                    width,
-                    height,
-                    PixelRect {
-                        x,
-                        y: underline_y,
-                        width: cell_width,
-                        height: underline_height,
-                    },
-                    resolve_color(rect.color.unwrap_or(Color::Default), palette, false),
-                );
-            }
-        }
-    }
 
-    for glyph in &prepared.glyphs.glyphs {
-        let selected = selection
-            .as_ref()
-            .is_some_and(|ranges| glyph_intersects_selection(glyph.row, glyph.col, ranges));
-        let base = resolve_color(glyph.style.foreground, palette, selected);
-        if let Some(image) = swash_cache
-            .get_image(&mut font_system, glyph.cache_key)
-            .as_ref()
-        {
-            draw_swash_image(
-                &mut pixels,
+            for segment in &prepared.border.segments {
+                fill_rect_rgba(
+                    &mut pixels,
+                    width,
+                    height,
+                    PixelRect {
+                        x: segment.x as i32,
+                        y: segment.y as i32,
+                        width: segment.width as u32,
+                        height: segment.height as u32,
+                    },
+                    segment.color,
+                );
+            }
+
+            for rect in &prepared.paint.rects {
+                if matches!(rect.layer, PaintLayer::Cursor) && !cursor_visible {
+                    continue;
+                }
+
+                let x = plan.viewport.x as i32 + (rect.col as f32 * config.cell_width).round() as i32;
+                let y = plan.viewport.y as i32 + (rect.row as f32 * config.line_height).round() as i32;
+                let cell_width = ((rect.span as f32) * config.cell_width).ceil().max(1.0) as u32;
+                let cell_height = config.line_height.ceil().max(1.0) as u32;
+                match rect.layer {
+                    PaintLayer::Background => {
+                        fill_rect_rgba(
+                            &mut pixels,
+                            width,
+                            height,
+                            PixelRect {
+                                x,
+                                y,
+                                width: cell_width,
+                                height: cell_height,
+                            },
+                            resolve_color(rect.color.unwrap_or(Color::Default), palette, false),
+                        );
+                    }
+                    PaintLayer::Selection => {
+                        fill_rect_rgba(
+                            &mut pixels,
+                            width,
+                            height,
+                            PixelRect {
+                                x,
+                                y,
+                                width: cell_width,
+                                height: cell_height,
+                            },
+                            palette.selection_background,
+                        );
+                    }
+                    PaintLayer::Cursor => {
+                        fill_rect_rgba(
+                            &mut pixels,
+                            width,
+                            height,
+                            PixelRect {
+                                x,
+                                y,
+                                width: cell_width,
+                                height: cell_height,
+                            },
+                            palette.cursor,
+                        );
+                    }
+                    PaintLayer::Underline => {
+                        let underline_height = ((config.line_height / 14.0).ceil() as u32).max(1);
+                        let underline_y = y + cell_height.saturating_sub(underline_height) as i32;
+                        fill_rect_rgba(
+                            &mut pixels,
+                            width,
+                            height,
+                            PixelRect {
+                                x,
+                                y: underline_y,
+                                width: cell_width,
+                                height: underline_height,
+                            },
+                            resolve_color(rect.color.unwrap_or(Color::Default), palette, false),
+                        );
+                    }
+                }
+            }
+
+            for glyph in &prepared.glyphs.glyphs {
+                let selected = selection
+                    .as_ref()
+                    .is_some_and(|ranges| glyph_intersects_selection(glyph.row, glyph.col, ranges));
+                let base = resolve_color(glyph.style.foreground, palette, selected);
+                if let Some(image) = swash_cache
+                    .get_image(&mut font_system, glyph.cache_key)
+                    .as_ref()
+                {
+                    draw_swash_image(
+                        &mut pixels,
+                        width,
+                        height,
+                        plan.viewport.x as i32 + glyph.x,
+                        plan.viewport.y as i32 + glyph.y,
+                        image,
+                        base,
+                    );
+                }
+            }
+
+            Ok(SoftwareRenderFrame {
                 width,
                 height,
-                plan.viewport.x as i32 + glyph.x,
-                plan.viewport.y as i32 + glyph.y,
-                image,
-                base,
-            );
-        }
-    }
-
-    Ok(SoftwareRenderFrame {
-        width,
-        height,
-        pixels,
-        stats: prepared.stats,
+                pixels,
+                stats: prepared.stats,
+            })
+        })
     })
 }
 
@@ -896,11 +956,13 @@ fn resolve_primary_family(
                 resolution: FontFamilyResolution::Requested,
                 resolved_family: face.families.first().map(|(family, _)| family.clone()),
                 resolved_post_script_name: Some(face.post_script_name.clone()),
+                resolved_source: Some(font_face_source(face)),
                 monospaced: Some(face.monospaced),
             },
             Some(FontCandidate {
                 id: face.id,
                 label: font_face_label(face),
+                source: font_face_source(face),
             }),
             Vec::new(),
         );
@@ -913,11 +975,13 @@ fn resolve_primary_family(
                 resolution: FontFamilyResolution::SystemMonospaceFallback,
                 resolved_family: face.families.first().map(|(family, _)| family.clone()),
                 resolved_post_script_name: Some(face.post_script_name.clone()),
+                resolved_source: Some(font_face_source(face)),
                 monospaced: Some(face.monospaced),
             },
             Some(FontCandidate {
                 id: face.id,
                 label: font_face_label(face),
+                source: font_face_source(face),
             }),
             vec![format!(
                 "requested primary family {:?} unavailable; using system monospace {:?}",
@@ -936,6 +1000,7 @@ fn resolve_primary_family(
             resolution: FontFamilyResolution::Missing,
             resolved_family: None,
             resolved_post_script_name: None,
+            resolved_source: None,
             monospaced: None,
         },
         None,
@@ -947,20 +1012,7 @@ fn resolve_primary_family(
 }
 
 fn default_font_family() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        "CaskaydiaCove Nerd Font Mono"
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        "Consolas"
-    }
-
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    {
-        "JetBrainsMono Nerd Font"
-    }
+    DEFAULT_FONT_FAMILY
 }
 
 fn default_font_fallbacks() -> Vec<String> {
@@ -995,11 +1047,13 @@ fn resolve_requested_family(
                 resolution: FontFamilyResolution::Requested,
                 resolved_family: face.families.first().map(|(family, _)| family.clone()),
                 resolved_post_script_name: Some(face.post_script_name.clone()),
+                resolved_source: Some(font_face_source(face)),
                 monospaced: Some(face.monospaced),
             },
             Some(FontCandidate {
                 id: face.id,
                 label: font_face_label(face),
+                source: font_face_source(face),
             }),
             Vec::new(),
         );
@@ -1011,6 +1065,7 @@ fn resolve_requested_family(
             resolution: FontFamilyResolution::Missing,
             resolved_family: None,
             resolved_post_script_name: None,
+            resolved_source: None,
             monospaced: None,
         },
         None,
@@ -1074,7 +1129,37 @@ fn font_face_label(face: &fontdb::FaceInfo) -> String {
         .first()
         .map(|(family, _)| family.as_str())
         .unwrap_or(face.post_script_name.as_str());
-    format!("{family} ({})", face.post_script_name)
+    format!(
+        "{family} ({}) [{}]",
+        face.post_script_name,
+        font_face_source(face).label()
+    )
+}
+
+fn configured_font_system() -> FontSystem {
+    let locale = FontSystem::new().locale().to_string();
+    FontSystem::new_with_locale_and_db(locale, configured_font_database())
+}
+
+fn configured_font_database() -> fontdb::Database {
+    let mut db = fontdb::Database::new();
+    load_bundled_fonts(&mut db);
+    db.load_system_fonts();
+    db.set_monospace_family(default_font_family());
+    db
+}
+
+fn load_bundled_fonts(db: &mut fontdb::Database) {
+    for font in BUNDLED_FONT_FILES {
+        db.load_font_data(font.bytes.to_vec());
+    }
+}
+
+fn font_face_source(face: &fontdb::FaceInfo) -> FontFaceSource {
+    match &face.source {
+        fontdb::Source::Binary(_) => FontFaceSource::Bundled,
+        _ => FontFaceSource::System,
+    }
 }
 
 fn sample_definitions() -> [(&'static str, &'static str); 4] {
@@ -1146,7 +1231,10 @@ fn diagnose_font_sample(
 
     let status = if !missing_glyphs.is_empty() {
         FontSampleStatus::Missing
-    } else if used_fallback || primary_candidate.is_none() {
+    } else if used_fallback
+        || primary_candidate.is_none()
+        || primary_candidate.is_some_and(|candidate| candidate.source != FontFaceSource::Bundled)
+    {
         FontSampleStatus::Fallback
     } else {
         FontSampleStatus::Primary
@@ -2160,6 +2248,7 @@ mod tests {
             diagnostics.primary.resolution,
             FontFamilyResolution::Missing
         );
+        assert_eq!(diagnostics.primary.resolved_source, None);
         assert_eq!(diagnostics.fallbacks.len(), default_font_fallbacks().len());
         assert!(
             diagnostics
@@ -2169,11 +2258,45 @@ mod tests {
         );
         assert!(
             diagnostics
+                .fallbacks
+                .iter()
+                .all(|fallback| fallback.resolved_source.is_none())
+        );
+        assert!(
+            diagnostics
                 .samples
                 .iter()
                 .all(|sample| sample.status == FontSampleStatus::Missing)
         );
         assert!(!diagnostics.logs.is_empty());
+    }
+
+    #[test]
+    fn bundled_default_font_resolves_from_bundled_source() {
+        let diagnostics = probe_font_diagnostics(&FontPreferences::default());
+
+        assert_eq!(diagnostics.primary.requested_family, DEFAULT_FONT_FAMILY);
+        assert_eq!(
+            diagnostics.primary.resolution,
+            FontFamilyResolution::Requested
+        );
+        assert_eq!(
+            diagnostics.primary.resolved_source,
+            Some(FontFaceSource::Bundled)
+        );
+        assert!(
+            diagnostics
+                .samples
+                .iter()
+                .find(|sample| sample.label == "nerd")
+                .is_some_and(|sample| sample.status != FontSampleStatus::Missing)
+        );
+    }
+
+    #[test]
+    fn bundled_font_file_inventory_is_complete() {
+        assert_eq!(BUNDLED_FONT_FILES.len(), 4);
+        assert!(BUNDLED_FONT_FILES.iter().all(|font| !font.bytes.is_empty()));
     }
 
     #[test]

@@ -1414,19 +1414,23 @@ fn panic_payload_text(info: &panic::PanicHookInfo<'_>) -> String {
 }
 
 fn read_all_runtime_output(app: &mut DesktopApp) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let runtime = app
-        .pane_mut()
-        .runtime_mut()
-        .ok_or("active pane is missing a runtime")?;
     let mut output = Vec::new();
     let mut chunk = [0_u8; 1024];
 
     loop {
-        let count = runtime.read_output(&mut chunk)?;
+        let count = {
+            let runtime = app
+                .pane_mut()
+                .runtime_mut()
+                .ok_or("active pane is missing a runtime")?;
+            runtime.read_output(&mut chunk)?
+        };
         if count == 0 {
             break;
         }
-        output.extend_from_slice(&chunk[..count]);
+        let bytes = chunk[..count].to_vec();
+        app.advance_output(&bytes);
+        output.extend_from_slice(&bytes);
     }
 
     Ok(output)

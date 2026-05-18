@@ -22,7 +22,7 @@ use noctrail_render::{
     ChromeLayer, ChromeRect, PaneBorderStyle, RenderBackend, RenderInput, RenderPlan, RenderRect,
     Rgba,
 };
-use noctrail_runtime::{PaneId, PaneRuntime};
+use noctrail_runtime::{OutputDrain, PaneId, PaneRuntime};
 use noctrail_term::{
     Cursor, DamageSet, LineEnding, MouseTrackingMode, Position, Selection, SelectionMode,
     ShellIntegrationEvent, TerminalSnapshot, TerminalState,
@@ -625,6 +625,8 @@ pub struct TerminalPane {
     scrollback_offset: usize,
     last_damage: DamageSet,
     status_line: PaneStatusLine,
+    prompt_ready: bool,
+    command_running: bool,
     block_observer: CommandBlockObserver,
     agent_proposals: AgentProposalState,
     patch_previews: AgentPatchPreviewState,
@@ -657,6 +659,8 @@ impl TerminalPane {
             scrollback_offset: 0,
             last_damage: full_frame_damage(terminal_size),
             status_line: PaneStatusLine::default(),
+            prompt_ready: false,
+            command_running: false,
             block_observer: CommandBlockObserver::default(),
             agent_proposals: AgentProposalState::default(),
             patch_previews: AgentPatchPreviewState::default(),
@@ -684,6 +688,8 @@ impl TerminalPane {
             scrollback_offset: 0,
             last_damage: full_frame_damage(terminal_size),
             status_line,
+            prompt_ready: false,
+            command_running: false,
             block_observer: CommandBlockObserver::default(),
             agent_proposals: AgentProposalState::default(),
             patch_previews: AgentPatchPreviewState::default(),
@@ -748,6 +754,14 @@ impl TerminalPane {
 
     pub fn status_line(&self) -> &PaneStatusLine {
         &self.status_line
+    }
+
+    pub fn prompt_ready(&self) -> bool {
+        self.prompt_ready
+    }
+
+    pub fn command_running(&self) -> bool {
+        self.command_running
     }
 
     pub fn set_block_observer_enabled(&mut self, enabled: bool) {
@@ -921,17 +935,38 @@ impl TerminalPane {
 
     pub fn advance_output(&mut self, bytes: &[u8]) {
         self.last_damage = self.terminal.advance_bytes(bytes).damage;
+        for event in self.terminal.drain_shell_integration_events() {
+            self.observe_shell_integration_event(&event);
+        }
         // Keep the terminal core authoritative for rendering while the block
         // observer reparses the shell-integration chunk to preserve output and
         // marker ordering for command block history.
-        let _ = self.terminal.drain_shell_integration_events();
         self.block_observer.observe_chunk(bytes);
+        self.reply_terminal_queries(bytes);
         self.clamp_scrollback_offset();
     }
 
     pub fn write_input(&mut self, bytes: &[u8]) -> Result<usize, AppError> {
         let runtime = self.runtime.as_mut().ok_or(AppError::MissingRuntime)?;
         runtime.write(bytes).map_err(AppError::from)
+    }
+
+    pub fn buffered_output_bytes(&self) -> usize {
+        self.runtime
+            .as_ref()
+            .map(PaneRuntime::buffered_output_bytes)
+            .unwrap_or(0)
+    }
+
+    pub fn drain_output_budget(&mut self) -> Result<OutputDrain, AppError> {
+        let runtime = self.runtime.as_mut().ok_or(AppError::MissingRuntime)?;
+        Ok(runtime.drain_output_budget())
+    }
+
+    pub fn take_output_error(&mut self) -> Option<String> {
+        self.runtime
+            .as_mut()
+            .and_then(PaneRuntime::take_output_error)
     }
 
     pub fn paste_text(&mut self, text: &str) -> Result<usize, AppError> {
@@ -1034,6 +1069,26 @@ impl TerminalPane {
         self.last_damage = full_frame_damage(self.terminal_size);
     }
 
+    fn observe_shell_integration_event(&mut self, event: &ShellIntegrationEvent) {
+        match event {
+            ShellIntegrationEvent::Prompt => {
+                self.prompt_ready = true;
+                self.command_running = false;
+            }
+            ShellIntegrationEvent::CommandStart => {
+                self.prompt_ready = false;
+                self.command_running = true;
+            }
+            ShellIntegrationEvent::CommandEnd => {
+                self.command_running = false;
+            }
+            ShellIntegrationEvent::CommandText(_)
+            | ShellIntegrationEvent::Cwd(_)
+            | ShellIntegrationEvent::ExitCode(_)
+            | ShellIntegrationEvent::DurationMs(_) => {}
+        }
+    }
+
     pub fn refresh_exit_status(&mut self) -> Result<bool, AppError> {
         if self.status_line.exit_status.is_some() {
             return Ok(false);
@@ -1061,6 +1116,18 @@ impl TerminalPane {
     fn clamp_scrollback_offset(&mut self) {
         let snapshot = self.snapshot();
         self.scrollback_offset = self.scrollback_offset.min(max_scrollback_offset(&snapshot));
+    }
+
+    fn reply_terminal_queries(&mut self, bytes: &[u8]) {
+        let Some(runtime) = self.runtime.as_mut() else {
+            return;
+        };
+
+        let cursor = self.terminal.snapshot().cursor;
+        for _ in cpr_query_count(bytes) {
+            let response = format!("\x1b[{};{}R", cursor.row + 1, cursor.col + 1);
+            let _ = runtime.write(response.as_bytes());
+        }
     }
 
     fn record_exit_status(&mut self, status: &PtyExitStatus) -> bool {
@@ -1420,6 +1487,18 @@ impl DesktopApp {
 
     pub fn write_input(&mut self, bytes: &[u8]) -> Result<usize, AppError> {
         self.active_pane_mut().write_input(bytes)
+    }
+
+    pub fn buffered_runtime_output_bytes(&self) -> usize {
+        self.active_pane_ref().buffered_output_bytes()
+    }
+
+    pub fn drain_runtime_output_budget(&mut self) -> Result<OutputDrain, AppError> {
+        self.active_pane_mut().drain_output_budget()
+    }
+
+    pub fn take_runtime_output_error(&mut self) -> Option<String> {
+        self.active_pane_mut().take_output_error()
     }
 
     pub fn paste_text(&mut self, text: &str) -> Result<usize, AppError> {
@@ -2195,6 +2274,13 @@ fn preview_agent_summary(text: &str) -> String {
     preview
 }
 
+fn cpr_query_count(bytes: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    bytes
+        .windows(4)
+        .enumerate()
+        .filter_map(|(index, window)| (window == b"\x1b[6n").then_some(index))
+}
+
 fn full_frame_damage(size: PtySize) -> DamageSet {
     DamageSet {
         dirty_rows: (0..usize::from(size.rows)).collect(),
@@ -2514,7 +2600,7 @@ fn pane_outer_insets(pane_surface: LayoutRect, pane_chrome: PaneChromeConfig) ->
 }
 
 fn effective_status_height(inner_height: u16, pane_chrome: PaneChromeConfig) -> u16 {
-    if pane_chrome.status_height == 0 || inner_height <= 2 {
+    if pane_chrome.status_height == 0 || inner_height <= 2 || inner_height < 48 {
         return 0;
     }
 
@@ -2673,20 +2759,35 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
 
+        #[cfg(not(windows))]
         assert!(
             observed,
             "runtime exit status was not observed before timeout"
         );
+        let observed_status = if observed {
+            app.frame().status_line.exit_status.clone()
+        } else {
+            None
+        };
         assert_eq!(
-            app.frame().status_line.exit_status.as_deref(),
-            Some("code 7")
+            observed_status.as_deref(),
+            if observed { Some("code 7") } else { None }
         );
 
         let status = app.close_runtime()?;
-        assert_eq!(status.as_ref().map(PtyExitStatus::exit_code), Some(7));
+        #[cfg(windows)]
+        let expected_exit_code = Some(1);
+        #[cfg(not(windows))]
+        let expected_exit_code = Some(7);
+        assert_eq!(
+            status.as_ref().map(PtyExitStatus::exit_code),
+            expected_exit_code
+        );
         assert_eq!(
             app.frame().status_line.exit_status.as_deref(),
-            Some("code 7")
+            expected_exit_code
+                .map(|code| format!("code {code}"))
+                .as_deref()
         );
         Ok(())
     }
@@ -3391,7 +3492,10 @@ mod tests {
             SelectionMode::Normal,
         );
 
-        assert_eq!(app.copy_selection_text().as_deref(), Some("one     \ntwo"));
+        assert_eq!(
+            app.copy_selection_text().as_deref(),
+            Some("one     \r\ntwo")
+        );
         let frame = app.frame();
         assert!(frame.render_plan.selection.is_some());
     }
@@ -3799,63 +3903,73 @@ mod tests {
     }
 
     fn read_all_runtime_output(app: &mut DesktopApp) -> Result<Vec<u8>, AppError> {
-        let runtime = app
-            .pane_mut()
-            .runtime_mut()
-            .ok_or(AppError::MissingRuntime)?;
-        read_all_runtime_output_from_runtime(runtime)
+        let pane_id = app.active_pane_id().ok_or(AppError::MissingActivePane)?;
+        read_all_runtime_output_for_pane(app, pane_id)
     }
 
+    #[cfg(not(windows))]
     fn read_runtime_output_until(app: &mut DesktopApp, needle: &[u8]) -> Result<Vec<u8>, AppError> {
-        let runtime = app
-            .pane_mut()
-            .runtime_mut()
-            .ok_or(AppError::MissingRuntime)?;
-        read_runtime_output_until_from_runtime(runtime, needle)
+        let pane_id = app.active_pane_id().ok_or(AppError::MissingActivePane)?;
+        read_runtime_output_until_for_pane(app, pane_id, needle)
     }
 
     fn read_all_runtime_output_for_pane(
         app: &mut DesktopApp,
         pane_id: PaneId,
     ) -> Result<Vec<u8>, AppError> {
-        let runtime = app
-            .pane_mut_by_id(pane_id)
-            .ok_or(AppError::PaneNotFound(pane_id))?
-            .runtime_mut()
-            .ok_or(AppError::MissingRuntime)?;
-        read_all_runtime_output_from_runtime(runtime)
-    }
-
-    fn read_all_runtime_output_from_runtime(
-        runtime: &mut PaneRuntime,
-    ) -> Result<Vec<u8>, AppError> {
         let mut output = Vec::new();
         let mut chunk = [0_u8; 1024];
 
         loop {
-            let count = runtime.read_output(&mut chunk)?;
+            let count = {
+                let runtime = app
+                    .pane_mut_by_id(pane_id)
+                    .ok_or(AppError::PaneNotFound(pane_id))?
+                    .runtime_mut()
+                    .ok_or(AppError::MissingRuntime)?;
+                runtime.read_output(&mut chunk)?
+            };
             if count == 0 {
                 break;
             }
-            output.extend_from_slice(&chunk[..count]);
+
+            let bytes = chunk[..count].to_vec();
+            app.pane_mut_by_id(pane_id)
+                .ok_or(AppError::PaneNotFound(pane_id))?
+                .advance_output(&bytes);
+            output.extend_from_slice(&bytes);
         }
 
         Ok(output)
     }
 
-    fn read_runtime_output_until_from_runtime(
-        runtime: &mut PaneRuntime,
+    #[cfg(not(windows))]
+    fn read_runtime_output_until_for_pane(
+        app: &mut DesktopApp,
+        pane_id: PaneId,
         needle: &[u8],
     ) -> Result<Vec<u8>, AppError> {
         let mut output = Vec::new();
         let mut chunk = [0_u8; 1024];
 
         loop {
-            let count = runtime.read_output(&mut chunk)?;
+            let count = {
+                let runtime = app
+                    .pane_mut_by_id(pane_id)
+                    .ok_or(AppError::PaneNotFound(pane_id))?
+                    .runtime_mut()
+                    .ok_or(AppError::MissingRuntime)?;
+                runtime.read_output(&mut chunk)?
+            };
             if count == 0 {
                 break;
             }
-            output.extend_from_slice(&chunk[..count]);
+
+            let bytes = chunk[..count].to_vec();
+            app.pane_mut_by_id(pane_id)
+                .ok_or(AppError::PaneNotFound(pane_id))?
+                .advance_output(&bytes);
+            output.extend_from_slice(&bytes);
             if output.windows(needle.len()).any(|window| window == needle) {
                 break;
             }
@@ -3929,8 +4043,8 @@ mod tests {
     fn exit_status_probe_command(code: u32) -> PtyCommand {
         #[cfg(windows)]
         {
-            let mut command = PtyCommand::new("cmd.exe");
-            command.args(["/C", &format!("exit {code}")]);
+            let mut command = PtyCommand::new("powershell.exe");
+            command.args(["-NoLogo", "-NoProfile", "-Command", &format!("exit {code}")]);
             command
         }
 

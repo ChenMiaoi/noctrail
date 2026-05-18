@@ -9,7 +9,11 @@ use std::{
 };
 
 #[cfg(windows)]
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{Arc, Mutex, mpsc},
+    thread::{self, JoinHandle},
+};
 
 pub use portable_pty::ExitStatus as PtyExitStatus;
 use portable_pty::{Child, CommandBuilder, MasterPty, native_pty_system};
@@ -81,7 +85,9 @@ impl ResolvedShell {
     pub fn detect() -> Self {
         let cwd = env::current_dir().ok();
         let (program, source) = detect_shell_program(env::vars_os(), env::split_paths);
-        let mut command = PtyCommand::new(program);
+        let mut command = PtyCommand::new(program.clone());
+        #[cfg(windows)]
+        configure_windows_shell_command(&mut command, &program, source);
         if let Some(path) = cwd.clone() {
             command.cwd_path(path);
         }
@@ -284,6 +290,7 @@ impl PtySession {
             .master
             .take_writer()
             .map_err(|error| PtyError::context("failed to take PTY writer", error))?;
+        let writer = configure_pty_writer(writer);
 
         Ok(Self {
             master: Some(pair.master),
@@ -325,15 +332,20 @@ impl PtySession {
         Ok(PtyOutputReader { inner: reader })
     }
 
+    pub fn take_output_reader(&mut self) -> Result<PtyOutputReader, PtyError> {
+        let reader = self
+            .reader
+            .take()
+            .ok_or_else(|| closed_error("take reader from"))?;
+        Ok(PtyOutputReader { inner: reader })
+    }
+
     pub fn write(&mut self, bytes: &[u8]) -> Result<usize, PtyError> {
         let writer = match self.writer.as_mut() {
             Some(writer) => writer,
             None => return Err(closed_error("write to")),
         };
-        writer
-            .write_all(bytes)
-            .and_then(|()| writer.flush())
-            .map_err(PtyError::Write)?;
+        writer.write_all(bytes).map_err(PtyError::Write)?;
         Ok(bytes.len())
     }
 
@@ -443,12 +455,52 @@ where
 {
     let mut comspec = None;
     let mut path_value = None;
+    let mut system_root = None;
+    let mut program_files = None;
+    let mut program_w6432 = None;
 
     for (key, value) in env_vars {
-        if key == OsStr::new("COMSPEC") && !value.is_empty() {
+        let key_text = key.to_string_lossy();
+        if key_text.eq_ignore_ascii_case("COMSPEC") && !value.is_empty() {
             comspec = Some(value);
-        } else if key == OsStr::new("PATH") {
+        } else if key_text.eq_ignore_ascii_case("PATH") {
             path_value = Some(value);
+        } else if key_text.eq_ignore_ascii_case("SYSTEMROOT") && !value.is_empty() {
+            system_root = Some(value);
+        } else if key_text.eq_ignore_ascii_case("PROGRAMFILES") && !value.is_empty() {
+            program_files = Some(value);
+        } else if key_text.eq_ignore_ascii_case("ProgramW6432") && !value.is_empty() {
+            program_w6432 = Some(value);
+        }
+    }
+
+    for (program, source) in [
+        ("pwsh.exe", ShellSource::PathPwsh),
+        ("powershell.exe", ShellSource::PathPowerShell),
+    ] {
+        if program_exists_on_path(path_value.as_deref(), program, &split_paths) {
+            return (OsString::from(program), source);
+        }
+    }
+
+    for root in [program_w6432.as_deref(), program_files.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let candidate = PathBuf::from(root).join("PowerShell").join("7").join("pwsh.exe");
+        if path_is_executable(&candidate) {
+            return (candidate.into_os_string(), ShellSource::PathPwsh);
+        }
+    }
+
+    if let Some(root) = system_root {
+        let candidate = PathBuf::from(root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        if path_is_executable(&candidate) {
+            return (candidate.into_os_string(), ShellSource::PathPowerShell);
         }
     }
 
@@ -456,17 +508,115 @@ where
         return (program, ShellSource::EnvComSpec);
     }
 
-    for (program, source) in [
-        ("pwsh.exe", ShellSource::PathPwsh),
-        ("powershell.exe", ShellSource::PathPowerShell),
-        ("wsl.exe", ShellSource::PathWsl),
-    ] {
-        if program_exists_on_path(path_value.as_deref(), program, &split_paths) {
-            return (OsString::from(program), source);
-        }
+    if program_exists_on_path(path_value.as_deref(), "wsl.exe", &split_paths) {
+        return (OsString::from("wsl.exe"), ShellSource::PathWsl);
     }
 
     (OsString::from("cmd.exe"), ShellSource::FallbackCmd)
+}
+
+#[cfg(windows)]
+fn configure_pty_writer(writer: Box<dyn Write + Send>) -> Box<dyn Write + Send> {
+    Box::new(AsyncPtyWriter::new(writer))
+}
+
+#[cfg(not(windows))]
+fn configure_pty_writer(writer: Box<dyn Write + Send>) -> Box<dyn Write + Send> {
+    writer
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct AsyncPtyWriter {
+    tx: Option<mpsc::Sender<WriterMessage>>,
+    handle: Option<JoinHandle<()>>,
+    error: Arc<Mutex<Option<String>>>,
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+enum WriterMessage {
+    Bytes(Vec<u8>),
+    Flush,
+    Close,
+}
+
+#[cfg(windows)]
+impl AsyncPtyWriter {
+    fn new(mut sink: Box<dyn Write + Send>) -> Self {
+        let (tx, rx) = mpsc::channel::<WriterMessage>();
+        let error = Arc::new(Mutex::new(None));
+        let writer_error = Arc::clone(&error);
+        let handle = thread::spawn(move || {
+            while let Ok(message) = rx.recv() {
+                let result = match message {
+                    WriterMessage::Bytes(bytes) => sink.write_all(&bytes),
+                    WriterMessage::Flush => sink.flush(),
+                    WriterMessage::Close => {
+                        let _ = sink.flush();
+                        break;
+                    }
+                };
+                if let Err(err) = result {
+                    *writer_error
+                        .lock()
+                        .expect("async PTY writer error lock should not be poisoned") =
+                        Some(err.to_string());
+                    break;
+                }
+            }
+        });
+
+        Self {
+            tx: Some(tx),
+            handle: Some(handle),
+            error,
+        }
+    }
+
+    fn take_error(&self) -> Option<String> {
+        self.error
+            .lock()
+            .expect("async PTY writer error lock should not be poisoned")
+            .clone()
+    }
+
+    fn send(&self, message: WriterMessage) -> std::io::Result<()> {
+        if let Some(error) = self.take_error() {
+            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, error));
+        }
+        self.tx
+            .as_ref()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "PTY writer closed"))?
+            .send(message)
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "PTY writer thread stopped")
+            })
+    }
+}
+
+#[cfg(windows)]
+impl Write for AsyncPtyWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.send(WriterMessage::Bytes(buf.to_vec()))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.send(WriterMessage::Flush)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for AsyncPtyWriter {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(WriterMessage::Close);
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -487,6 +637,71 @@ where
 #[cfg(windows)]
 fn path_is_executable(path: &Path) -> bool {
     path.is_file()
+}
+
+#[cfg(windows)]
+fn configure_windows_shell_command(command: &mut PtyCommand, program: &OsStr, source: ShellSource) {
+    if !matches!(source, ShellSource::PathPwsh | ShellSource::PathPowerShell) {
+        return;
+    }
+
+    let shell = Path::new(program)
+        .file_name()
+        .unwrap_or(program)
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    if !matches!(shell.as_str(), "pwsh.exe" | "pwsh" | "powershell.exe" | "powershell") {
+        return;
+    }
+
+    command
+        .arg("-NoLogo")
+        .arg("-NoExit")
+        .arg("-Command")
+        .arg(render_powershell_hook());
+}
+
+#[cfg(windows)]
+fn render_powershell_hook() -> String {
+    r#"function global:__NoctrailEmit([string]$Payload) {
+    [Console]::Out.Write("$([char]27)]1337;Noctrail;$Payload$([char]7)")
+}
+
+$global:__NoctrailOriginalPrompt = $function:prompt
+
+function global:prompt {
+    $exitCode = if ($null -ne $global:LASTEXITCODE) { $global:LASTEXITCODE } else { 0 }
+    __NoctrailEmit "Prompt"
+    __NoctrailEmit ("Cwd;" + (Get-Location).Path)
+    if ($global:__NoctrailCommandActive) {
+        $durationMs = [int]((Get-Date) - $global:__NoctrailCommandStart).TotalMilliseconds
+        __NoctrailEmit ("ExitCode;" + $exitCode)
+        __NoctrailEmit ("DurationMs;" + $durationMs)
+        __NoctrailEmit "CommandEnd"
+        $global:__NoctrailCommandActive = $false
+    }
+    if ($global:__NoctrailOriginalPrompt) {
+        & $global:__NoctrailOriginalPrompt
+    } else {
+        "PS $((Get-Location).Path)> "
+    }
+}
+
+if (Get-Module -ListAvailable -Name PSReadLine) {
+    Import-Module PSReadLine
+    Set-PSReadLineKeyHandler -Chord Enter -ScriptBlock {
+        $line = $null
+        $cursor = $null
+        [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
+        $global:__NoctrailCommandActive = $true
+        $global:__NoctrailCommandStart = Get-Date
+        __NoctrailEmit "CommandStart"
+        __NoctrailEmit ("CommandText;" + $line)
+        [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+    }
+}
+"#
+    .to_string()
 }
 
 fn closed_error(action: &'static str) -> PtyError {

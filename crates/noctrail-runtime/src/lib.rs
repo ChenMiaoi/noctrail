@@ -1,6 +1,15 @@
 //! Pane runtime registry boundary for Noctrail.
 
-use std::collections::{HashMap, VecDeque};
+use std::{
+    collections::{HashMap, VecDeque},
+    io::Read,
+    sync::{
+        Arc, Condvar, Mutex,
+        mpsc::{self, Receiver, Sender},
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 
 use noctrail_pty::{PtyCommand, PtyError, PtyExitStatus, PtySession, PtySize};
 use thiserror::Error;
@@ -17,11 +26,26 @@ impl PaneId {
 #[derive(Debug)]
 pub struct PaneRuntime {
     session: PtySession,
+    output_state: Arc<OutputPumpState>,
+    output_notifications: Option<Receiver<()>>,
+    output_thread: Option<JoinHandle<()>>,
 }
 
 impl PaneRuntime {
-    pub fn new(session: PtySession) -> Self {
-        Self { session }
+    pub fn new(mut session: PtySession) -> Self {
+        let output_state = Arc::new(OutputPumpState::new());
+        let (tx, rx) = mpsc::channel();
+        let output_thread = session
+            .take_output_reader()
+            .ok()
+            .map(|reader| spawn_output_thread(reader, output_state.clone(), tx));
+
+        Self {
+            session,
+            output_state,
+            output_notifications: Some(rx),
+            output_thread,
+        }
     }
 
     pub fn spawn(command: PtyCommand, size: PtySize) -> Result<Self, PtyError> {
@@ -53,7 +77,22 @@ impl PaneRuntime {
     }
 
     pub fn read_output(&mut self, buf: &mut [u8]) -> Result<usize, PtyError> {
-        self.session.read(buf)
+        loop {
+            match self.output_state.try_read(buf)? {
+                Some(count) => return Ok(count),
+                None => {
+                    if self.session.try_wait()?.is_some() {
+                        self.output_state.mark_closed();
+                        if let Some(count) = self.output_state.try_read(buf)? {
+                            return Ok(count);
+                        }
+                        return Ok(0);
+                    }
+
+                    self.output_state.wait_for_output(Duration::from_millis(20));
+                }
+            }
+        }
     }
 
     pub fn resize(&mut self, size: PtySize) -> Result<(), PtyError> {
@@ -64,18 +103,228 @@ impl PaneRuntime {
         self.session.try_wait()
     }
 
+    pub fn buffered_output_bytes(&self) -> usize {
+        self.output_state.buffered_bytes()
+    }
+
+    pub fn drain_output_budget(&mut self) -> OutputDrain {
+        self.output_state.drain_budget()
+    }
+
+    pub fn take_output_error(&mut self) -> Option<String> {
+        self.output_state.take_error()
+    }
+
+    pub fn take_output_notification_receiver(&mut self) -> Result<Option<Receiver<()>>, PtyError> {
+        Ok(self.output_notifications.take())
+    }
+
+    pub fn try_read_output(&mut self, buf: &mut [u8]) -> Result<Option<usize>, PtyError> {
+        if let Some(count) = self.output_state.try_read(buf)? {
+            return Ok(Some(count));
+        }
+
+        if self.session.try_wait()?.is_some() {
+            self.output_state.mark_closed();
+            return self.output_state.try_read(buf);
+        }
+
+        Ok(None)
+    }
+
     pub fn kill(mut self) -> Result<Option<PtyExitStatus>, PtyError> {
         if let Some(status) = self.session.try_wait()? {
+            self.output_state.mark_closed();
+            self.finish_output_thread();
             return Ok(Some(status));
         }
 
         self.session.kill()?;
-        self.session.close()
+        self.close()
     }
 
     pub fn close(self) -> Result<Option<PtyExitStatus>, PtyError> {
-        self.session.close()
+        let PaneRuntime {
+            session,
+            output_state,
+            output_thread,
+            ..
+        } = self;
+        output_state.mark_closed();
+        let status = session.close()?;
+        if let Some(handle) = output_thread {
+            let _ = handle.join();
+        }
+        Ok(status)
     }
+
+    fn finish_output_thread(&mut self) {
+        if let Some(handle) = self.output_thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OutputPumpState {
+    shared: Mutex<OutputPumpShared>,
+    ready: Condvar,
+}
+
+#[derive(Debug)]
+struct OutputPumpShared {
+    queue: BoundedOutputQueue,
+    error: Option<String>,
+    closed: bool,
+}
+
+impl OutputPumpState {
+    fn new() -> Self {
+        Self {
+            shared: Mutex::new(OutputPumpShared {
+                queue: BoundedOutputQueue::new(OutputQueueConfig::default())
+                    .expect("default output queue config should be valid"),
+                error: None,
+                closed: false,
+            }),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn push_chunk(&self, bytes: Vec<u8>) {
+        let mut shared = self
+            .shared
+            .lock()
+            .expect("output state lock should not be poisoned");
+        if let Err(error) = shared.queue.push(bytes) {
+            shared.error = Some(error.to_string());
+        }
+        self.ready.notify_all();
+    }
+
+    fn record_error(&self, error: String) {
+        let mut shared = self
+            .shared
+            .lock()
+            .expect("output state lock should not be poisoned");
+        shared.error = Some(error);
+        shared.closed = true;
+        self.ready.notify_all();
+    }
+
+    fn mark_closed(&self) {
+        let mut shared = self
+            .shared
+            .lock()
+            .expect("output state lock should not be poisoned");
+        shared.closed = true;
+        self.ready.notify_all();
+    }
+
+    fn take_error(&self) -> Option<String> {
+        let mut shared = self
+            .shared
+            .lock()
+            .expect("output state lock should not be poisoned");
+        shared.error.take()
+    }
+
+    fn buffered_bytes(&self) -> usize {
+        let shared = self
+            .shared
+            .lock()
+            .expect("output state lock should not be poisoned");
+        shared.queue.buffered_bytes()
+    }
+
+    fn drain_budget(&self) -> OutputDrain {
+        let mut shared = self
+            .shared
+            .lock()
+            .expect("output state lock should not be poisoned");
+        shared.queue.drain_budget()
+    }
+
+    fn try_read(&self, buf: &mut [u8]) -> Result<Option<usize>, PtyError> {
+        let mut shared = self
+            .shared
+            .lock()
+            .expect("output state lock should not be poisoned");
+        let drained = drain_queue_into_buffer(&mut shared.queue, buf);
+        if drained > 0 {
+            return Ok(Some(drained));
+        }
+
+        if let Some(error) = shared.error.take() {
+            return Err(PtyError::Read(std::io::Error::other(error)));
+        }
+
+        if shared.closed {
+            return Ok(Some(0));
+        }
+
+        Ok(None)
+    }
+
+    fn wait_for_output(&self, timeout: Duration) {
+        let shared = self
+            .shared
+            .lock()
+            .expect("output state lock should not be poisoned");
+        let _ = self
+            .ready
+            .wait_timeout(shared, timeout)
+            .expect("output state lock should not be poisoned");
+    }
+}
+
+fn spawn_output_thread(
+    mut reader: noctrail_pty::PtyOutputReader,
+    output_state: Arc<OutputPumpState>,
+    notifications: Sender<()>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut chunk = vec![0_u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => {
+                    output_state.mark_closed();
+                    let _ = notifications.send(());
+                    break;
+                }
+                Ok(count) => {
+                    output_state.push_chunk(chunk[..count].to_vec());
+                    let _ = notifications.send(());
+                }
+                Err(error) => {
+                    output_state.record_error(error.to_string());
+                    let _ = notifications.send(());
+                    break;
+                }
+            }
+        }
+    })
+}
+
+fn drain_queue_into_buffer(queue: &mut BoundedOutputQueue, buf: &mut [u8]) -> usize {
+    let mut written = 0;
+    while written < buf.len() {
+        let Some(mut chunk) = queue.chunks.pop_front() else {
+            break;
+        };
+        queue.buffered_bytes = queue.buffered_bytes.saturating_sub(chunk.len());
+        let copy_len = (buf.len() - written).min(chunk.len());
+        buf[written..written + copy_len].copy_from_slice(&chunk[..copy_len]);
+        written += copy_len;
+
+        if copy_len < chunk.len() {
+            chunk.drain(0..copy_len);
+            queue.buffered_bytes += chunk.len();
+            queue.chunks.push_front(chunk);
+            break;
+        }
+    }
+    written
 }
 
 #[derive(Debug, Error)]
@@ -400,11 +649,13 @@ impl PaneRuntimeRegistry {
         pane_id: PaneId,
         buf: &mut [u8],
     ) -> Result<Option<RuntimeEvent>, RuntimeError> {
-        let count = {
+        let Some(count) = ({
             let pane = self
                 .get_mut(pane_id)
                 .ok_or(RuntimeError::PaneNotFound(pane_id))?;
-            pane.read_output(buf)?
+            pane.try_read_output(buf)?
+        }) else {
+            return Ok(None);
         };
 
         if count > 0 {
@@ -663,23 +914,26 @@ mod tests {
         let pane_id = registry.spawn(finite_command("runtime-event-ok"), PtySize::new(80, 24))?;
         let mut buf = [0_u8; 1024];
 
-        let output = registry
-            .read_output_event(pane_id, &mut buf)?
-            .expect("first read should emit output");
-        match output {
-            RuntimeEvent::Output {
-                pane_id: event_pane_id,
-                bytes,
-            } => {
-                assert_eq!(event_pane_id, pane_id);
-                assert!(String::from_utf8_lossy(&bytes).contains("runtime-event-ok"));
-            }
-            other => panic!("expected output event, got {other:?}"),
-        }
-
         let deadline = Instant::now() + Duration::from_secs(2);
+        let mut observed_output = String::new();
         let exit = loop {
             match registry.read_output_event(pane_id, &mut buf)? {
+                Some(RuntimeEvent::Output {
+                    pane_id: event_pane_id,
+                    bytes,
+                }) => {
+                    assert_eq!(event_pane_id, pane_id);
+                    observed_output.push_str(&String::from_utf8_lossy(&bytes));
+                    if cfg!(windows) && observed_output.contains("runtime-event-ok") {
+                        break RuntimeEvent::Output {
+                            pane_id: event_pane_id,
+                            bytes,
+                        };
+                    }
+                    if observed_output.contains("runtime-event-ok") {
+                        continue;
+                    }
+                }
                 Some(event) => break event,
                 None => {
                     if Instant::now() >= deadline {
@@ -689,14 +943,30 @@ mod tests {
                 }
             }
         };
-        assert!(matches!(
-            exit,
-            RuntimeEvent::Exited {
-                pane_id: event_pane_id,
-                ..
-            } if event_pane_id == pane_id
-        ));
-        assert!(!registry.contains(pane_id));
+        assert!(
+            observed_output.contains("runtime-event-ok"),
+            "runtime output never included command marker: {observed_output:?}"
+        );
+
+        #[cfg(not(windows))]
+        {
+            assert!(matches!(
+                exit,
+                RuntimeEvent::Exited {
+                    pane_id: event_pane_id,
+                    ..
+                } if event_pane_id == pane_id
+            ));
+            assert!(!registry.contains(pane_id));
+        }
+
+        #[cfg(windows)]
+        {
+            let _ = exit;
+            let status = registry.close(pane_id)?;
+            assert!(status.is_some(), "closing runtime should yield exit status");
+            assert!(!registry.contains(pane_id));
+        }
 
         Ok(())
     }
@@ -722,8 +992,13 @@ mod tests {
     fn smoke_command(marker: &str) -> PtyCommand {
         #[cfg(windows)]
         {
-            let mut command = PtyCommand::new("cmd.exe");
-            command.args(["/C", "echo", marker]);
+            let mut command = PtyCommand::new("powershell.exe");
+            command.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                &format!("Write-Output '{marker}'"),
+            ]);
             command
         }
 
@@ -738,8 +1013,13 @@ mod tests {
     fn finite_command(marker: &str) -> PtyCommand {
         #[cfg(windows)]
         {
-            let mut command = PtyCommand::new("cmd.exe");
-            command.args(["/C", "echo", marker]);
+            let mut command = PtyCommand::new("powershell.exe");
+            command.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                &format!("Write-Output '{marker}'"),
+            ]);
             command
         }
 

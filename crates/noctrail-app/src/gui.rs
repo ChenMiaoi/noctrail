@@ -1,5 +1,8 @@
 use std::{
+    collections::HashMap,
+    env,
     error::Error,
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
     thread::{self, JoinHandle},
@@ -17,6 +20,7 @@ use noctrail_render::{
     FontPreferences, GlyphRasterConfig, GpuRenderer, PaneBorderStyle, RenderBackend, RenderGlyph,
     RenderPlan, RenderRect, RenderRow, Rgba, SoftwareRenderPalette, rasterize_software_frame,
 };
+use noctrail_runtime::PaneId;
 use noctrail_term::{Color, Cursor, DamageSet, MouseTrackingMode, Position, SelectionMode, Style};
 use tracing::{debug, error, info, warn};
 use winit::{
@@ -24,7 +28,7 @@ use winit::{
     dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize},
     event::{ElementState, Ime, MouseButton as WinitMouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
-    keyboard::ModifiersState,
+    keyboard::{Key, ModifiersState, NamedKey},
     window::{CursorIcon, ResizeDirection, Window, WindowId},
 };
 
@@ -41,6 +45,8 @@ const STARTUP_DEBUG_WINDOW: Duration = Duration::from_secs(3);
 const STABLE_DEBUG_SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 const WINDOW_RESIZE_HANDLE_PX: f64 = 6.0;
 const MAX_OUTPUT_DRAINS_PER_EVENT: usize = 8;
+const STARTUP_FOCUS_RETRY_WINDOW: Duration = Duration::from_secs(2);
+const STARTUP_FOCUS_RETRY_INTERVAL: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GuiEvent {
@@ -414,8 +420,8 @@ pub(crate) fn layout_rect_from_surface(size: PhysicalSize<u32>) -> LayoutRect {
 
 fn cell_dimensions(font: &FontConfig) -> CellDimensions {
     CellDimensions {
-        width: (font.size * 0.66).max(8.0),
-        height: (font.size * font.line_height).max(16.0),
+        width: (font.size * 0.62).max(8.0),
+        height: (font.size * font.line_height).max((font.size + 6.0).max(18.0)),
     }
 }
 
@@ -469,7 +475,12 @@ struct StatusRuns {
     right: Vec<StatusRun>,
 }
 
-fn compose_status_runs(frame: &DesktopFrame, cols: usize, palette: StatusBarPalette) -> StatusRuns {
+fn compose_status_runs(
+    frame: &DesktopFrame,
+    cols: usize,
+    palette: StatusBarPalette,
+    input_mode: InputMode,
+) -> StatusRuns {
     let shell = frame.status_line.shell.as_deref().unwrap_or("shell");
     let shell_label = shell.to_ascii_uppercase();
     let cwd = frame
@@ -510,6 +521,24 @@ fn compose_status_runs(frame: &DesktopFrame, cols: usize, palette: StatusBarPale
     }
 
     right.extend([
+        status_chip(
+            input_mode.label(),
+            if input_mode == InputMode::Editor {
+                chip_foreground(palette.chip_accent_background)
+            } else {
+                palette.foreground
+            },
+            if input_mode == InputMode::Editor {
+                palette.chip_accent_background
+            } else {
+                palette.chip_background
+            },
+            input_mode == InputMode::Editor,
+        ),
+        StatusRun {
+            text: "  ".to_string(),
+            style: status_style(palette.muted, None, false),
+        },
         status_chip(
             &pane_label,
             palette.foreground,
@@ -656,6 +685,45 @@ fn truncate_middle(text: &str, max_chars: usize) -> String {
         .rev()
         .collect::<String>();
     format!("{prefix}...{suffix}")
+}
+
+fn normalize_editor_text(text: &str) -> String {
+    text.replace("\r\n", " ")
+        .replace(['\r', '\n'], " ")
+}
+
+fn nth_char_boundary(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .map(|(index, _)| index)
+        .nth(char_index)
+        .unwrap_or(text.len())
+}
+
+fn previous_word_boundary(text: &str, cursor_chars: usize) -> usize {
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.is_empty() || cursor_chars == 0 {
+        return 0;
+    }
+    let mut index = cursor_chars.min(chars.len());
+    while index > 0 && chars[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    while index > 0 && !chars[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    index
+}
+
+fn next_word_boundary(text: &str, cursor_chars: usize) -> usize {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut index = cursor_chars.min(chars.len());
+    while index < chars.len() && chars[index].is_whitespace() {
+        index += 1;
+    }
+    while index < chars.len() && !chars[index].is_whitespace() {
+        index += 1;
+    }
+    index
 }
 
 fn mix_rgba(foreground: Rgba, background: Rgba, background_ratio: f32) -> Rgba {
@@ -1055,6 +1123,12 @@ struct GuiApp {
     cursor_visible: bool,
     frame_interval: Duration,
     window_focused: bool,
+    startup_focus_retry_until: Option<Instant>,
+    next_startup_focus_retry_at: Instant,
+    cached_software_frame: Option<noctrail_render::SoftwareRenderFrame>,
+    requested_input_mode: InputMode,
+    editor_states: HashMap<PaneId, EditorBufferState>,
+    latency_probe: Option<LatencyProbe>,
     modifiers: ModifiersState,
     clipboard: ClipboardBridge,
 }
@@ -1090,6 +1164,275 @@ struct StatusBarPalette {
 struct StatusRun {
     text: String,
     style: Style,
+}
+
+#[derive(Debug)]
+struct LatencyProbe {
+    output_path: PathBuf,
+    pending_started_at: Option<Instant>,
+    pending_kind: Option<&'static str>,
+    samples: Vec<LatencyProbeSample>,
+}
+
+#[derive(Debug)]
+struct LatencyProbeSample {
+    kind: &'static str,
+    latency_ms: f64,
+}
+
+impl LatencyProbe {
+    fn from_env() -> Option<Self> {
+        let output_path = env::var_os("NOCTRAIL_INPUT_LATENCY_LOG")?;
+        Some(Self {
+            output_path: PathBuf::from(output_path),
+            pending_started_at: None,
+            pending_kind: None,
+            samples: Vec::new(),
+        })
+    }
+
+    fn begin(&mut self, kind: &'static str) {
+        self.pending_started_at = Some(Instant::now());
+        self.pending_kind = Some(kind);
+    }
+
+    fn finish(&mut self) {
+        let Some(started_at) = self.pending_started_at.take() else {
+            return;
+        };
+        let kind = self.pending_kind.take().unwrap_or("unknown");
+        self.samples.push(LatencyProbeSample {
+            kind,
+            latency_ms: started_at.elapsed().as_secs_f64() * 1000.0,
+        });
+    }
+
+    fn flush(&self) {
+        let mut values = self
+            .samples
+            .iter()
+            .map(|sample| sample.latency_ms)
+            .collect::<Vec<_>>();
+        values.sort_by(|left, right| left.total_cmp(right));
+        let average = if values.is_empty() {
+            None
+        } else {
+            Some(values.iter().sum::<f64>() / values.len() as f64)
+        };
+        let payload = serde_json::json!({
+            "samples": self.samples.iter().map(|sample| serde_json::json!({
+                "kind": sample.kind,
+                "latency_ms": sample.latency_ms,
+            })).collect::<Vec<_>>(),
+            "summary": {
+                "count": values.len(),
+                "p50_ms": percentile(&values, 0.5),
+                "p95_ms": percentile(&values, 0.95),
+                "avg_ms": average,
+            }
+        });
+        let _ = fs::write(
+            &self.output_path,
+            serde_json::to_vec_pretty(&payload).unwrap_or_default(),
+        );
+    }
+}
+
+fn percentile(values: &[f64], ratio: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let index = ((values.len() - 1) as f64 * ratio).ceil() as usize;
+    values.get(index.min(values.len() - 1)).copied()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputMode {
+    Editor,
+    Terminal,
+}
+
+impl InputMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Editor => "EDIT",
+            Self::Terminal => "TERM",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct EditorBufferState {
+    text: String,
+    cursor_chars: usize,
+    history: Vec<String>,
+    history_index: Option<usize>,
+    history_restore: Option<String>,
+    anchor: Option<Cursor>,
+}
+
+impl EditorBufferState {
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.cursor_chars = 0;
+        self.history_index = None;
+        self.history_restore = None;
+        self.anchor = None;
+    }
+
+    fn sync_anchor(&mut self, anchor: Cursor) {
+        if self.is_empty() {
+            self.anchor = Some(anchor);
+        }
+    }
+
+    fn cursor_byte_index(&self) -> usize {
+        nth_char_boundary(&self.text, self.cursor_chars)
+    }
+
+    fn char_len(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    fn set_text(&mut self, text: String) {
+        self.text = normalize_editor_text(&text);
+        self.cursor_chars = self.char_len();
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        let text = normalize_editor_text(text);
+        if text.is_empty() {
+            return;
+        }
+        let byte_index = self.cursor_byte_index();
+        self.text.insert_str(byte_index, &text);
+        self.cursor_chars += text.chars().count();
+        self.history_index = None;
+        self.history_restore = None;
+    }
+
+    fn move_left(&mut self) {
+        self.cursor_chars = self.cursor_chars.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        self.cursor_chars = (self.cursor_chars + 1).min(self.char_len());
+    }
+
+    fn move_home(&mut self) {
+        self.cursor_chars = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor_chars = self.char_len();
+    }
+
+    fn move_word_left(&mut self) {
+        self.cursor_chars = previous_word_boundary(&self.text, self.cursor_chars);
+    }
+
+    fn move_word_right(&mut self) {
+        self.cursor_chars = next_word_boundary(&self.text, self.cursor_chars);
+    }
+
+    fn delete_backward(&mut self) {
+        if self.cursor_chars == 0 {
+            return;
+        }
+        let end = self.cursor_byte_index();
+        let start = nth_char_boundary(&self.text, self.cursor_chars - 1);
+        self.text.replace_range(start..end, "");
+        self.cursor_chars -= 1;
+        self.history_index = None;
+        self.history_restore = None;
+    }
+
+    fn delete_forward(&mut self) {
+        if self.cursor_chars >= self.char_len() {
+            return;
+        }
+        let start = self.cursor_byte_index();
+        let end = nth_char_boundary(&self.text, self.cursor_chars + 1);
+        self.text.replace_range(start..end, "");
+        self.history_index = None;
+        self.history_restore = None;
+    }
+
+    fn delete_to_start(&mut self) {
+        let end = self.cursor_byte_index();
+        self.text.replace_range(0..end, "");
+        self.cursor_chars = 0;
+        self.history_index = None;
+        self.history_restore = None;
+    }
+
+    fn delete_to_end(&mut self) {
+        let start = self.cursor_byte_index();
+        self.text.truncate(start);
+        self.history_index = None;
+        self.history_restore = None;
+    }
+
+    fn delete_previous_word(&mut self) {
+        let start_chars = previous_word_boundary(&self.text, self.cursor_chars);
+        let start = nth_char_boundary(&self.text, start_chars);
+        let end = self.cursor_byte_index();
+        self.text.replace_range(start..end, "");
+        self.cursor_chars = start_chars;
+        self.history_index = None;
+        self.history_restore = None;
+    }
+
+    fn push_history(&mut self, command: &str) {
+        let command = command.trim();
+        if command.is_empty() {
+            return;
+        }
+        if self.history.last().is_some_and(|last| last == command) {
+            return;
+        }
+        self.history.push(command.to_string());
+        if self.history.len() > 200 {
+            let overflow = self.history.len() - 200;
+            self.history.drain(0..overflow);
+        }
+        self.history_index = None;
+        self.history_restore = None;
+    }
+
+    fn history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let next_index = match self.history_index {
+            Some(index) => index.saturating_sub(1),
+            None => {
+                self.history_restore = Some(self.text.clone());
+                self.history.len() - 1
+            }
+        };
+        self.history_index = Some(next_index);
+        self.set_text(self.history[next_index].clone());
+    }
+
+    fn history_next(&mut self) {
+        let Some(index) = self.history_index else {
+            return;
+        };
+        if index + 1 < self.history.len() {
+            let next_index = index + 1;
+            self.history_index = Some(next_index);
+            self.set_text(self.history[next_index].clone());
+            return;
+        }
+        let restore = self.history_restore.take().unwrap_or_default();
+        self.history_index = None;
+        self.set_text(restore);
+    }
 }
 
 impl GuiApp {
@@ -1144,7 +1487,13 @@ impl GuiApp {
             next_cursor_blink_at: now + Duration::from_millis(theme.cursor.blink_interval_ms),
             cursor_visible: true,
             frame_interval: Duration::from_millis(theme.cursor.blink_interval_ms),
-            window_focused: true,
+            window_focused: false,
+            startup_focus_retry_until: Some(now + STARTUP_FOCUS_RETRY_WINDOW),
+            next_startup_focus_retry_at: now,
+            cached_software_frame: None,
+            requested_input_mode: InputMode::Editor,
+            editor_states: HashMap::new(),
+            latency_probe: LatencyProbe::from_env(),
             modifiers: ModifiersState::empty(),
             clipboard: ClipboardBridge::new(),
         }
@@ -1228,6 +1577,277 @@ impl GuiApp {
 
     fn shortcut_action(&self, logical_key: &winit::keyboard::Key) -> Option<input::ShortcutAction> {
         input::shortcut_action(logical_key, self.modifiers, &self.launch_options.keymap)
+    }
+
+    fn toggle_input_mode(&mut self) {
+        self.requested_input_mode = match self.requested_input_mode {
+            InputMode::Editor => InputMode::Terminal,
+            InputMode::Terminal => InputMode::Editor,
+        };
+        self.touch_cursor_blink();
+        self.request_redraw();
+    }
+
+    fn editor_state_mut(&mut self, pane_id: PaneId) -> &mut EditorBufferState {
+        self.editor_states.entry(pane_id).or_default()
+    }
+
+    fn effective_input_mode(&self, frame: &DesktopFrame) -> InputMode {
+        if self.requested_input_mode == InputMode::Terminal {
+            return InputMode::Terminal;
+        }
+
+        let Some(pane) = self.app.pane_by_id(frame.pane_id) else {
+            return InputMode::Terminal;
+        };
+        let shell = frame.status_line.shell.as_deref().unwrap_or_default();
+        let shell_supported = matches!(
+            shell.to_ascii_lowercase().as_str(),
+            "pwsh.exe" | "pwsh" | "powershell.exe" | "powershell"
+        );
+        if !shell_supported {
+            return InputMode::Terminal;
+        }
+        if frame.render_plan.alternate_screen {
+            return InputMode::Terminal;
+        }
+        if pane.mouse_tracking_mode() != MouseTrackingMode::Disabled {
+            return InputMode::Terminal;
+        }
+        if !pane.prompt_ready() {
+            return InputMode::Terminal;
+        }
+
+        InputMode::Editor
+    }
+
+    fn active_input_mode(&self) -> InputMode {
+        let frame = self.app.frame();
+        self.effective_input_mode(&frame)
+    }
+
+    fn mark_latency_probe(&mut self, kind: &'static str) {
+        if let Some(probe) = self.latency_probe.as_mut() {
+            probe.begin(kind);
+        }
+    }
+
+    fn complete_latency_probe(&mut self) {
+        if let Some(probe) = self.latency_probe.as_mut() {
+            probe.finish();
+        }
+    }
+
+    fn present_now(&mut self) -> Result<(), Box<dyn Error>> {
+        if let Err(error) = self.render_current_frame() {
+            self.record_gpu_fallback(error.to_string());
+        }
+        self.complete_latency_probe();
+        self.update_title();
+        Ok(())
+    }
+
+    fn refresh_editor_feedback(
+        &mut self,
+        latency_kind: &'static str,
+    ) -> Result<(), Box<dyn Error>> {
+        self.mark_latency_probe(latency_kind);
+        self.touch_cursor_blink();
+        if self.present_editor_row_feedback()? {
+            self.complete_latency_probe();
+            self.update_title();
+            Ok(())
+        } else {
+            self.present_now()
+        }
+    }
+
+    fn present_editor_row_feedback(&mut self) -> Result<bool, Box<dyn Error>> {
+        let Some(window) = self.window.as_ref() else {
+            return Ok(false);
+        };
+        let scale_factor = window.scale_factor();
+        let mut frame = self.app.frame();
+        if self.effective_input_mode(&frame) != InputMode::Editor {
+            return Ok(false);
+        }
+        self.apply_editor_overlay(&mut frame);
+        let Some(row) = frame
+            .render_plan
+            .rows
+            .get(frame.render_plan.cursor.row)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+
+        let config = self.glyph_raster_config(&frame, scale_factor);
+        let strip_origin_y =
+            frame.render_plan.viewport.y + (frame.render_plan.cursor.row as f32 * config.line_height).round() as usize;
+        let max_strip_height = usize::from(frame.pane_surface.height).saturating_sub(strip_origin_y);
+        if max_strip_height == 0 {
+            return Ok(false);
+        }
+        let strip_height = (config.line_height.ceil() as usize).max(1).min(max_strip_height);
+        let strip_plan = RenderPlan {
+            backend: frame.render_plan.backend,
+            pane_rect: RenderRect::new(0, 0, usize::from(frame.pane_surface.width.max(1)), strip_height),
+            viewport: RenderRect::new(
+                frame.render_plan.viewport.x,
+                0,
+                frame.render_plan.viewport.width,
+                strip_height,
+            ),
+            damage: DamageSet {
+                dirty_rows: vec![0],
+                full_frame: true,
+            },
+            scrollback_rows: 0,
+            cursor: Cursor {
+                row: 0,
+                col: frame.render_plan.cursor.col,
+            },
+            alternate_screen: false,
+            selection: None,
+            chrome: Vec::new(),
+            active: true,
+            border: PaneBorderStyle::default(),
+            corner_radius: 0,
+            rows: vec![RenderRow {
+                row: 0,
+                wrapped: row.wrapped,
+                glyphs: row.glyphs,
+            }],
+        };
+        let strip = rasterize_software_frame(
+            &strip_plan,
+            &config,
+            &self.software_palette(),
+            self.cursor_visible,
+        )?;
+        let Some(cached) = self.cached_software_frame.as_mut() else {
+            return Ok(false);
+        };
+        blit_software_frame(
+            cached,
+            &strip,
+            usize::from(frame.pane_surface.x),
+            usize::from(frame.pane_surface.y).saturating_add(strip_origin_y),
+        );
+        let Some(renderer) = self.renderer.as_mut() else {
+            return Ok(false);
+        };
+        renderer.render_software_frame(cached)?;
+        Ok(true)
+    }
+
+    fn submit_editor_buffer(&mut self) -> Result<bool, Box<dyn Error>> {
+        let Some(pane_id) = self.app.active_pane_id() else {
+            return Ok(false);
+        };
+        let state = self.editor_state_mut(pane_id);
+        if state.text.is_empty() {
+            self.app.write_input(b"\r")?;
+            return Ok(true);
+        }
+        let command = state.text.clone();
+        state.push_history(&command);
+        state.clear();
+        let mut bytes = command.into_bytes();
+        bytes.push(b'\r');
+        self.app.write_input(&bytes)?;
+        Ok(true)
+    }
+
+    fn insert_editor_text(&mut self, text: &str) -> bool {
+        let Some(pane_id) = self.app.active_pane_id() else {
+            return false;
+        };
+        self.editor_state_mut(pane_id).insert_text(text);
+        true
+    }
+
+    fn handle_editor_key(
+        &mut self,
+        event: &winit::event::KeyEvent,
+    ) -> Result<bool, Box<dyn Error>> {
+        if event.state != ElementState::Pressed {
+            return Ok(false);
+        }
+        if self.active_input_mode() != InputMode::Editor {
+            return Ok(false);
+        }
+
+        let Some(pane_id) = self.app.active_pane_id() else {
+            return Ok(false);
+        };
+        let control = self.modifiers.control_key();
+        let alt = self.modifiers.alt_key();
+        let latency_kind = match event.logical_key.as_ref() {
+            Key::Named(NamedKey::Backspace) | Key::Named(NamedKey::Delete) => "delete",
+            Key::Named(NamedKey::Space) => "insert",
+            Key::Character(_) => "insert",
+            _ => "move",
+        };
+        match event.logical_key.as_ref() {
+            Key::Named(NamedKey::Enter) => return self.submit_editor_buffer(),
+            Key::Named(NamedKey::ArrowLeft) => {
+                self.editor_state_mut(pane_id).move_left();
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                self.editor_state_mut(pane_id).move_right();
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                self.editor_state_mut(pane_id).history_prev();
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                self.editor_state_mut(pane_id).history_next();
+            }
+            Key::Named(NamedKey::Home) => {
+                self.editor_state_mut(pane_id).move_home();
+            }
+            Key::Named(NamedKey::End) => {
+                self.editor_state_mut(pane_id).move_end();
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.editor_state_mut(pane_id).delete_backward();
+            }
+            Key::Named(NamedKey::Delete) => {
+                self.editor_state_mut(pane_id).delete_forward();
+            }
+            Key::Named(NamedKey::Space) => {
+                self.editor_state_mut(pane_id).insert_text(" ");
+            }
+            Key::Character(text) if control => match text.to_ascii_lowercase().as_str() {
+                "a" => self.editor_state_mut(pane_id).move_home(),
+                "e" => self.editor_state_mut(pane_id).move_end(),
+                "u" => self.editor_state_mut(pane_id).delete_to_start(),
+                "k" => self.editor_state_mut(pane_id).delete_to_end(),
+                "w" => self.editor_state_mut(pane_id).delete_previous_word(),
+                "c" => self.editor_state_mut(pane_id).clear(),
+                "l" => {
+                    self.app.write_input(&[0x0c])?;
+                    self.editor_state_mut(pane_id).anchor = None;
+                }
+                _ => return Ok(false),
+            },
+            Key::Character(text) if alt => match text.to_ascii_lowercase().as_str() {
+                "b" => self.editor_state_mut(pane_id).move_word_left(),
+                "f" => self.editor_state_mut(pane_id).move_word_right(),
+                _ => return Ok(false),
+            },
+            Key::Character(text)
+                if !control
+                    && !alt
+                    && !text.is_empty() =>
+            {
+                self.editor_state_mut(pane_id).insert_text(text);
+            }
+            _ => return Ok(false),
+        }
+
+        self.refresh_editor_feedback(latency_kind)?;
+        Ok(true)
     }
 
     fn start_transition(&mut self, kind: Option<TransitionKind>, before: TransitionSnapshot) {
@@ -1386,12 +2006,14 @@ impl GuiApp {
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<(), Box<dyn Error>> {
         let requested_transparency = self.theme.opacity < 1.0 && !self.launch_options.safe_mode;
+        #[allow(unused_mut)]
         let mut attributes = Window::default_attributes()
             .with_title("Noctrail")
             .with_inner_size(LogicalSize::new(
                 f64::from(DEFAULT_WINDOW_WIDTH),
                 f64::from(DEFAULT_WINDOW_HEIGHT),
             ))
+            .with_active(true)
             .with_resizable(true)
             .with_decorations(false)
             .with_transparent(requested_transparency);
@@ -1410,6 +2032,8 @@ impl GuiApp {
             "creating noctrail window"
         );
         let window = Arc::new(event_loop.create_window(attributes)?);
+        self.window = Some(window.clone());
+        window.focus_window();
         let size = window.inner_size();
         self.sync_surface(size, window.scale_factor())?;
         if self.launch_options.safe_mode {
@@ -1436,7 +2060,6 @@ impl GuiApp {
                 }
             }
         }
-        self.window = Some(window);
         self.apply_theme_visuals();
         self.update_title();
         self.request_redraw();
@@ -1480,11 +2103,18 @@ impl GuiApp {
     fn glyph_raster_config(&self, frame: &DesktopFrame, scale_factor: f64) -> GlyphRasterConfig {
         let cols = f32::from(frame.terminal_size.cols.max(1));
         let rows = f32::from(frame.terminal_size.rows.max(1));
+        let nominal = cell_dimensions(&self.font);
+        let measured_cell_width = f32::from(frame.surface.width.max(1)) / cols;
+        let measured_line_height = f32::from(frame.surface.height.max(1)) / rows;
         GlyphRasterConfig {
             font: self.font_preferences.clone(),
             scale: scale_factor as f32,
-            cell_width: (f32::from(frame.surface.width.max(1)) / cols).max(1.0),
-            line_height: (f32::from(frame.surface.height.max(1)) / rows).max(1.0),
+            cell_width: measured_cell_width
+                .clamp(nominal.width * 0.94, nominal.width * 1.08)
+                .max(1.0),
+            line_height: measured_line_height
+                .clamp(nominal.height * 0.96, nominal.height * 1.1)
+                .max(1.0),
             weight: self.font.weight,
             bold_weight: self.font.bold_weight,
         }
@@ -1571,7 +2201,8 @@ impl GuiApp {
         let mut raster =
             solid_software_frame(size.width.max(1), size.height.max(1), palette.background);
 
-        for frame in frames {
+        for mut frame in frames {
+            self.apply_editor_overlay(&mut frame);
             let mut pane_raster = rasterize_software_frame(
                 &frame.render_plan,
                 &self.glyph_raster_config(&frame, scale_factor),
@@ -1593,6 +2224,7 @@ impl GuiApp {
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.render_software_frame(&raster)?;
         }
+        self.cached_software_frame = Some(raster);
 
         Ok(())
     }
@@ -1614,6 +2246,62 @@ impl GuiApp {
             .into_iter()
             .map(|pane_id| self.app.frame_for_pane(pane_id).map_err(Into::into))
             .collect()
+    }
+
+    fn apply_editor_overlay(&mut self, frame: &mut DesktopFrame) {
+        if !frame.render_plan.active || self.effective_input_mode(frame) != InputMode::Editor {
+            return;
+        }
+
+        let anchor = {
+            let state = self.editor_state_mut(frame.pane_id);
+            state.sync_anchor(frame.render_plan.cursor);
+            state.anchor.unwrap_or(frame.render_plan.cursor)
+        };
+
+        let state = self.editor_state_mut(frame.pane_id).clone();
+        frame.render_plan.cursor = Cursor {
+            row: anchor.row.min(frame.render_plan.rows.len().saturating_sub(1)),
+            col: (anchor.col + state.cursor_chars)
+                .min(usize::from(frame.terminal_size.cols).saturating_sub(1)),
+        };
+
+        if state.text.is_empty() {
+            return;
+        }
+
+        let Some(row) = frame.render_plan.rows.get_mut(anchor.row) else {
+            return;
+        };
+        let row_capacity = usize::from(frame.terminal_size.cols);
+        let mut glyphs = row
+            .glyphs
+            .iter()
+            .filter(|glyph| glyph.col < anchor.col)
+            .cloned()
+            .collect::<Vec<_>>();
+        let overlay_style = row
+            .glyphs
+            .iter()
+            .rev()
+            .find(|glyph| glyph.col < anchor.col)
+            .map(|glyph| glyph.style)
+            .unwrap_or_default();
+
+        for (index, ch) in state.text.chars().enumerate() {
+            let col = anchor.col + index;
+            if col >= row_capacity {
+                break;
+            }
+            glyphs.push(RenderGlyph {
+                col,
+                text: ch.to_string(),
+                style: overlay_style,
+                span: 1,
+                wide_continuation: false,
+            });
+        }
+        row.glyphs = glyphs;
     }
 
     fn render_status_bar(
@@ -1639,7 +2327,7 @@ impl GuiApp {
         let horizontal_padding = ((self.font.size * 1.45).round() as usize).max(28);
         let usable_width = status_width.saturating_sub(horizontal_padding.saturating_mul(2));
         let cols = ((usable_width as f32 / config.cell_width).floor() as usize).max(1);
-        let runs = compose_status_runs(frame, cols, palette);
+        let runs = compose_status_runs(frame, cols, palette, self.effective_input_mode(frame));
         let row = compose_status_row(&runs.left, &runs.right, cols);
         let top_padding =
             (((status_height as f32) - config.line_height).max(0.0) / 2.0).floor() as usize;
@@ -2109,9 +2797,14 @@ impl GuiApp {
             Ime::Commit(text) => {
                 self.ime_preedit = None;
                 if !text.is_empty() {
-                    self.app.write_input(text.as_bytes())?;
-                    self.touch_cursor_blink();
-                    self.request_redraw();
+                    if self.active_input_mode() == InputMode::Editor {
+                        self.insert_editor_text(&text);
+                        self.refresh_editor_feedback("ime-commit")?;
+                    } else {
+                        self.app.write_input(text.as_bytes())?;
+                        self.touch_cursor_blink();
+                        self.request_redraw();
+                    }
                 }
                 Ok(())
             }
@@ -2287,6 +2980,18 @@ impl GuiApp {
                     if let Some(window) = self.window.as_ref() {
                         let _ = window.drag_window();
                     }
+                    return Ok(());
+                }
+                if self.active_input_mode() == InputMode::Editor
+                    && let Some(anchor) = self.editor_state_mut(self.app.active_pane_id().unwrap()).anchor
+                    && let Some(cell) = cell
+                    && cell.row == anchor.row
+                {
+                    let cursor = cell.col.saturating_sub(anchor.col);
+                    let state = self.editor_state_mut(self.app.active_pane_id().unwrap());
+                    state.cursor_chars = cursor.min(state.char_len());
+                    self.touch_cursor_blink();
+                    self.request_redraw();
                     return Ok(());
                 }
                 if let Some(cell) = cell {
@@ -2978,41 +3683,53 @@ fn osc_marker_pair_bytes(marker: &str, value: &str) -> Vec<u8> {
 }
 
 fn read_all_runtime_output_for_gui(app: &mut DesktopApp) -> Result<Vec<u8>, Box<dyn Error>> {
-    let runtime = app
-        .pane_mut()
-        .runtime_mut()
-        .ok_or("active pane is missing a runtime")?;
     let mut output = Vec::new();
     let mut chunk = [0_u8; 1024];
 
     loop {
-        let drain = runtime.drain_output_budget();
+        let drain = {
+            let runtime = app
+                .pane_mut()
+                .runtime_mut()
+                .ok_or("active pane is missing a runtime")?;
+            runtime.drain_output_budget()
+        };
         for bytes in drain.chunks {
+            app.advance_output(&bytes);
             output.extend_from_slice(&bytes);
         }
         if drain.remaining_bytes > 0 {
             continue;
         }
 
-        let count = runtime.read_output(&mut chunk)?;
+        let count = {
+            let runtime = app
+                .pane_mut()
+                .runtime_mut()
+                .ok_or("active pane is missing a runtime")?;
+            runtime.read_output(&mut chunk)?
+        };
         if count == 0 {
             break;
         }
-        output.extend_from_slice(&chunk[..count]);
+        let bytes = chunk[..count].to_vec();
+        app.advance_output(&bytes);
+        output.extend_from_slice(&bytes);
     }
 
     Ok(output)
 }
 
-pub fn pane_chrome_from_theme(theme: &ThemeConfig, _font: &FontConfig) -> PaneChromeConfig {
+pub fn pane_chrome_from_theme(theme: &ThemeConfig, font: &FontConfig) -> PaneChromeConfig {
     let terminal_background = rgba_from_config(theme.color.background);
-    let background = mix_rgba(
-        rgba_from_config(theme.color.chrome_background),
-        terminal_background,
-        0.03,
-    );
+    let chrome_background = rgba_from_config(theme.color.chrome_background);
+    let chrome_foreground = rgba_from_config(theme.color.chrome_foreground);
+    let background = mix_rgba(chrome_background, terminal_background, 0.22);
+    let status_background = mix_rgba(chrome_foreground, background, 0.95);
     let accent = rgba_from_config(theme.color.chrome_accent);
     let inactive = rgba_from_config(theme.border.inactive);
+    let status_height = ((font.size * 1.78).round() as u16).clamp(20, 30);
+    let status_spacing = ((font.size * 0.30).round() as u16).clamp(4, 8);
     PaneChromeConfig {
         border: PaneBorderStyle {
             width: usize::from(theme.border.width),
@@ -3020,15 +3737,15 @@ pub fn pane_chrome_from_theme(theme: &ThemeConfig, _font: &FontConfig) -> PaneCh
             inactive: rgba_from_config(theme.border.inactive),
         },
         background,
-        status_background: background,
-        status_separator: mix_rgba(accent, background, 0.3),
+        status_background,
+        status_separator: mix_rgba(accent, status_background, 0.58),
         active_indicator: accent,
-        inactive_indicator: mix_rgba(inactive, background, 0.2),
+        inactive_indicator: mix_rgba(accent, inactive, 0.72),
         gap: theme.pane.gap,
         padding: theme.pane.padding,
         radius: theme.pane.radius,
-        status_height: 0,
-        status_spacing: 0,
+        status_height,
+        status_spacing,
     }
 }
 
@@ -3116,51 +3833,62 @@ impl ApplicationHandler<GuiEvent> for GuiApp {
             }
             WindowEvent::KeyboardInput {
                 event,
-                is_synthetic,
                 ..
             } => {
-                if is_synthetic {
-                    return;
-                }
+                let key_pressed = event.state == ElementState::Pressed;
                 if matches!(
                     self.shortcut_action(&event.logical_key),
                     Some(input::ShortcutAction::ToggleAgentAuditBrowser)
-                ) {
+                ) && key_pressed
+                {
                     self.toggle_agent_audit_browser();
                     return;
                 }
                 if matches!(
                     self.shortcut_action(&event.logical_key),
                     Some(input::ShortcutAction::ToggleAgentContextPreview)
-                ) {
+                ) && key_pressed
+                {
                     self.toggle_agent_context_preview();
                     return;
                 }
                 if matches!(
                     self.shortcut_action(&event.logical_key),
                     Some(input::ShortcutAction::ToggleBlockBrowser)
-                ) {
+                ) && key_pressed
+                {
                     self.toggle_block_browser();
                     return;
                 }
                 if matches!(
                     self.shortcut_action(&event.logical_key),
                     Some(input::ShortcutAction::TogglePatchPreview)
-                ) {
+                ) && key_pressed
+                {
                     self.toggle_patch_preview_browser();
                     return;
                 }
                 if matches!(
                     self.shortcut_action(&event.logical_key),
                     Some(input::ShortcutAction::ToggleReviewPanel)
-                ) {
+                ) && key_pressed
+                {
                     self.toggle_review_panel();
                     return;
                 }
                 if matches!(
                     self.shortcut_action(&event.logical_key),
+                    Some(input::ShortcutAction::ToggleInputMode)
+                ) && key_pressed
+                {
+                    self.toggle_input_mode();
+                    return;
+                }
+                if matches!(
+                    self.shortcut_action(&event.logical_key),
                     Some(input::ShortcutAction::ToggleCommandPalette)
-                ) {
+                ) && key_pressed
+                {
                     self.toggle_command_palette();
                     return;
                 }
@@ -3204,8 +3932,11 @@ impl ApplicationHandler<GuiEvent> for GuiApp {
                         return;
                     }
                 }
-                if let Some(action) = self.shortcut_action(&event.logical_key) {
+                if key_pressed
+                    && let Some(action) = self.shortcut_action(&event.logical_key)
+                {
                     match action {
+                        input::ShortcutAction::ToggleInputMode => unreachable!(),
                         input::ShortcutAction::ToggleAgentAuditBrowser => unreachable!(),
                         input::ShortcutAction::ToggleAgentContextPreview => unreachable!(),
                         input::ShortcutAction::ToggleBlockBrowser => unreachable!(),
@@ -3219,13 +3950,27 @@ impl ApplicationHandler<GuiEvent> for GuiApp {
                         }
                         input::ShortcutAction::Paste => {
                             if let Some(text) = self.clipboard.get_text() {
-                                if self.app.paste_text(&text).is_err() {
+                                let editor_mode = self.active_input_mode() == InputMode::Editor;
+                                let write_result = if editor_mode {
+                                    self.insert_editor_text(&text);
+                                    Ok(0)
+                                } else {
+                                    self.app.paste_text(&text).map(|_| 0)
+                                };
+                                if write_result.is_err() {
                                     event_loop.exit();
                                     return;
                                 }
-                                self.touch_cursor_blink();
-                                self.request_redraw();
-                                self.update_title();
+                                if editor_mode {
+                                    if self.refresh_editor_feedback("paste").is_err() {
+                                        event_loop.exit();
+                                        return;
+                                    }
+                                } else {
+                                    self.touch_cursor_blink();
+                                    self.request_redraw();
+                                    self.update_title();
+                                }
                             }
                         }
                         input::ShortcutAction::Focus(direction) => {
@@ -3239,6 +3984,14 @@ impl ApplicationHandler<GuiEvent> for GuiApp {
                         }
                     }
                     return;
+                }
+                match self.handle_editor_key(&event) {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(_) => {
+                        event_loop.exit();
+                        return;
+                    }
                 }
                 let key_without_modifiers = event.key_without_modifiers();
                 let key_without_modifiers = match key_without_modifiers.as_ref() {
@@ -3281,10 +4034,12 @@ impl ApplicationHandler<GuiEvent> for GuiApp {
                     self.record_gpu_fallback(error.to_string());
                     self.update_title();
                 }
+                self.complete_latency_probe();
                 self.update_title();
             }
             WindowEvent::Focused(true) => {
                 self.window_focused = true;
+                self.startup_focus_retry_until = None;
                 self.touch_cursor_blink();
                 self.request_redraw();
             }
@@ -3308,11 +4063,26 @@ impl ApplicationHandler<GuiEvent> for GuiApp {
         if matches!(self.app.refresh_runtime_statuses(), Ok(true)) {
             self.update_title();
         }
-        if self.advance_transition(Instant::now()) {
+        let now = Instant::now();
+        if !self.window_focused && self.startup_focus_retry_until.is_some() {
+            if let Some(until) = self.startup_focus_retry_until {
+                if now <= until {
+                    if now >= self.next_startup_focus_retry_at {
+                        if let Some(window) = self.window.as_ref() {
+                            window.focus_window();
+                        }
+                        self.next_startup_focus_retry_at = now + STARTUP_FOCUS_RETRY_INTERVAL;
+                    }
+                } else {
+                    self.startup_focus_retry_until = None;
+                }
+            }
+        }
+        if self.advance_transition(now) {
             self.update_title();
             self.request_redraw();
         }
-        if self.advance_cursor_blink(Instant::now()) {
+        if self.advance_cursor_blink(now) {
             self.update_title();
             self.request_redraw();
         }
@@ -3323,6 +4093,9 @@ impl ApplicationHandler<GuiEvent> for GuiApp {
         let _ = self.app.close_runtime();
         if let Some(handle) = self.output_thread.take() {
             let _ = handle.join();
+        }
+        if let Some(probe) = self.latency_probe.as_ref() {
+            probe.flush();
         }
     }
 
@@ -3356,11 +4129,11 @@ mod tests {
         );
         assert_eq!(
             terminal_size_from_surface(PhysicalSize::new(320, 160), &font, 1.0),
-            PtySize::new(32, 6)
+            PtySize::new(34, 6)
         );
         assert_eq!(
             terminal_size_from_surface(PhysicalSize::new(320, 160), &font, 2.0),
-            PtySize::new(16, 3)
+            PtySize::new(17, 3)
         );
     }
 
@@ -4071,6 +4844,7 @@ mod tests {
         let app = DesktopApp::new(LayoutRect::new(0, 0, 120, 80), PtySize::new(10, 3));
         let mut gui = GuiApp::new(app, GuiLaunchOptions::default());
         let now = Instant::now();
+        gui.window_focused = true;
         gui.next_cursor_blink_at = now + Duration::from_millis(50);
 
         assert!(!gui.advance_cursor_blink(now + Duration::from_millis(20)));
@@ -4218,10 +4992,19 @@ mod tests {
 
         assert!(
             gui.drain_output_events(),
-            "expected buffered output to drain in one pass"
+            "expected buffered output to start draining"
         );
 
-        let rendered = rendered_text(&gui.app.frame()).replace('\n', "");
+        let drain_deadline = Instant::now() + Duration::from_secs(5);
+        let mut rendered = String::new();
+        while Instant::now() < drain_deadline {
+            rendered = rendered_text(&gui.app.frame()).replace('\n', "");
+            if rendered.contains(marker) {
+                break;
+            }
+            let _ = gui.drain_output_events();
+            thread::sleep(Duration::from_millis(20));
+        }
         gui.app.write_input(shell_exit_bytes().as_slice())?;
         let _ = gui.app.close_runtime()?;
         if let Some(handle) = gui.output_thread.take() {

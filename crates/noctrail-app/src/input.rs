@@ -12,6 +12,7 @@ pub enum ShortcutAction {
     Copy,
     Paste,
     Focus(FocusDirection),
+    ToggleInputMode,
     ToggleAgentAuditBrowser,
     ToggleAgentContextPreview,
     ToggleBlockBrowser,
@@ -47,12 +48,20 @@ pub(crate) struct KeyboardEncodeRequest<'a> {
     pub repeat: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyboardProtocol {
+    Xterm,
+}
+
 pub fn shortcut_action(
     logical_key: &Key,
     modifiers: ModifiersState,
     keymap: &KeymapConfig,
 ) -> Option<ShortcutAction> {
     let binding = shortcut_binding_string(logical_key, modifiers)?;
+    if binding.eq_ignore_ascii_case("ctrl-shift-e") {
+        return Some(ShortcutAction::ToggleInputMode);
+    }
 
     [
         (ShortcutAction::Copy, keymap.copy.as_slice()),
@@ -217,6 +226,7 @@ fn control_byte(ch: char) -> Option<u8> {
     match ch {
         'a'..='z' | 'A'..='Z' => Some(ch.to_ascii_uppercase() as u8 - b'@'),
         '@' | ' ' => Some(0x00),
+        '/' => Some(0x1f),
         '[' => Some(0x1b),
         '\\' => Some(0x1c),
         ']' => Some(0x1d),
@@ -252,6 +262,47 @@ fn mouse_button_code(kind: MouseReportKind) -> u8 {
 }
 
 fn named_key_bytes(named: NamedKey, modifiers: ModifiersState) -> Option<Vec<u8>> {
+    if let Some(parameter) = modifiers_parameter(modifiers) {
+        let protocol = KeyboardProtocol::Xterm;
+        let suffix = match named {
+            NamedKey::ArrowUp => Some(("1", 'A')),
+            NamedKey::ArrowDown => Some(("1", 'B')),
+            NamedKey::ArrowRight => Some(("1", 'C')),
+            NamedKey::ArrowLeft => Some(("1", 'D')),
+            NamedKey::Home => Some(("1", 'H')),
+            NamedKey::End => Some(("1", 'F')),
+            NamedKey::F1 => Some(("1", 'P')),
+            NamedKey::F2 => Some(("1", 'Q')),
+            NamedKey::F3 => Some(("1", 'R')),
+            NamedKey::F4 => Some(("1", 'S')),
+            _ => None,
+        };
+        if let Some((prefix, final_byte)) = suffix {
+            return Some(modified_csi_sequence(
+                protocol, prefix, parameter, final_byte,
+            ));
+        }
+
+        let tilde_code = match named {
+            NamedKey::PageUp => Some(5),
+            NamedKey::PageDown => Some(6),
+            NamedKey::Insert => Some(2),
+            NamedKey::Delete => Some(3),
+            NamedKey::F5 => Some(15),
+            NamedKey::F6 => Some(17),
+            NamedKey::F7 => Some(18),
+            NamedKey::F8 => Some(19),
+            NamedKey::F9 => Some(20),
+            NamedKey::F10 => Some(21),
+            NamedKey::F11 => Some(23),
+            NamedKey::F12 => Some(24),
+            _ => None,
+        };
+        if let Some(code) = tilde_code {
+            return Some(format!("\x1b[{code};{parameter}~").into_bytes());
+        }
+    }
+
     let base = match named {
         NamedKey::Enter => b"\r".to_vec(),
         NamedKey::Tab => {
@@ -310,6 +361,25 @@ fn named_key_bytes(named: NamedKey, modifiers: ModifiersState) -> Option<Vec<u8>
     };
 
     Some(base)
+}
+
+fn modifiers_parameter(modifiers: ModifiersState) -> Option<u8> {
+    let encoded = 1
+        + u8::from(modifiers.shift_key())
+        + (u8::from(modifiers.alt_key()) * 2)
+        + (u8::from(modifiers.control_key()) * 4);
+    (encoded > 1).then_some(encoded)
+}
+
+fn modified_csi_sequence(
+    protocol: KeyboardProtocol,
+    prefix: &str,
+    parameter: u8,
+    final_byte: char,
+) -> Vec<u8> {
+    match protocol {
+        KeyboardProtocol::Xterm => format!("\x1b[{prefix};{parameter}{final_byte}").into_bytes(),
+    }
 }
 
 #[cfg(test)]
@@ -436,6 +506,20 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_slash_uses_unit_separator() {
+        let bytes = encode_key_event(request(
+            ElementState::Pressed,
+            &Key::Character("/".into()),
+            Some("/"),
+            Some("/"),
+            ModifiersState::CONTROL,
+            false,
+        ))
+        .expect("ctrl-/ should map");
+        assert_eq!(bytes, vec![0x1f]);
+    }
+
+    #[test]
     fn shift_tab_uses_backtab_sequence() {
         let bytes = key_to_pty_bytes(
             &Key::Named(NamedKey::Tab),
@@ -451,6 +535,34 @@ mod tests {
         let bytes = key_to_pty_bytes(&Key::Named(NamedKey::F5), None, ModifiersState::empty())
             .expect("f5 should map");
         assert_eq!(bytes, b"\x1b[15~");
+    }
+
+    #[test]
+    fn alt_arrow_keys_use_modified_xterm_sequences() {
+        let bytes = key_to_pty_bytes(&Key::Named(NamedKey::ArrowLeft), None, ModifiersState::ALT)
+            .expect("alt-left should map");
+        assert_eq!(bytes, b"\x1b[1;3D");
+    }
+
+    #[test]
+    fn ctrl_home_uses_modified_xterm_sequence() {
+        let bytes = key_to_pty_bytes(&Key::Named(NamedKey::Home), None, ModifiersState::CONTROL)
+            .expect("ctrl-home should map");
+        assert_eq!(bytes, b"\x1b[1;5H");
+    }
+
+    #[test]
+    fn shift_function_key_uses_modified_xterm_sequence() {
+        let bytes = key_to_pty_bytes(&Key::Named(NamedKey::F5), None, ModifiersState::SHIFT)
+            .expect("shift-f5 should map");
+        assert_eq!(bytes, b"\x1b[15;2~");
+    }
+
+    #[test]
+    fn shift_enter_keeps_carriage_return() {
+        let bytes = key_to_pty_bytes(&Key::Named(NamedKey::Enter), None, ModifiersState::SHIFT)
+            .expect("shift-enter should map");
+        assert_eq!(bytes, b"\r");
     }
 
     #[test]
@@ -548,6 +660,14 @@ mod tests {
                 &default_keymap(),
             ),
             Some(ShortcutAction::ToggleReviewPanel)
+        );
+        assert_eq!(
+            shortcut_action(
+                &Key::Character("e".into()),
+                ModifiersState::CONTROL | ModifiersState::SHIFT,
+                &default_keymap(),
+            ),
+            Some(ShortcutAction::ToggleInputMode)
         );
     }
 

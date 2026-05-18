@@ -52,6 +52,15 @@ Run the development CLI:
 cargo run -p noctrail-cli -- doctor
 ```
 
+Run the real Windows GUI latency gate:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/windows-enforce-present-latency.ps1 -BuildRelease
+```
+
+This gate launches the real `noctrail-app` window, injects keyboard input,
+and fails if the measured `key event -> present` `p95` exceeds `60ms`.
+
 ## Configuration
 
 Noctrail reads an optional TOML config with `noctrail-app --config <path>`.

@@ -35,7 +35,7 @@ cargo run -p noctrail-app -- gui --config /path/to/noctrail.toml
 backend = "gpu" # or "software"
 ```
 
-`backend`
+`renderer.backend`
 - Type: string
 - Default: `"gpu"`
 - Accepted values: `"gpu"`, `"software"`
@@ -44,45 +44,68 @@ backend = "gpu" # or "software"
 
 ```toml
 [font]
-family = "JetBrainsMono Nerd Font"
-size = 14.0
-fallback = ["Noto Sans CJK SC", "Noto Color Emoji"]
+family = "CaskaydiaMono NFM"
+size = 15.0
+line-height = 1.55
+weight = 450
+bold-weight = 650
+fallback = ["Microsoft YaHei UI", "Segoe UI Emoji"]
 ```
 
-`family`
+`font.family`
 - Type: string
-- Default: `"JetBrainsMono Nerd Font"`
+- Default: `"CaskaydiaMono NFM"`
+- Notes:
+  Noctrail now bundles the primary `Caskaydia` Mono run set in-repo, so the default family does not rely on a system install. `doctor font` reports this as `source=bundled`.
 
-`size`
+`font.size`
 - Type: float
-- Default: `14.0`
+- Default: `15.0`
 - Constraint: `> 0`
 
-`fallback`
+`font.line-height`
+- Type: float
+- Default: `1.55`
+- Constraint: `> 0`
+
+`font.weight`
+- Type: integer
+- Default: `450`
+
+`font.bold-weight`
+- Type: integer
+- Default: `650`
+
+`font.fallback`
 - Type: string array
-- Default:
-  `["Noto Sans CJK SC", "Noto Color Emoji", "Apple Color Emoji",
-  "Segoe UI Emoji"]`
+- Default on Windows: `["Microsoft YaHei UI", "Segoe UI Emoji", "Noto Color Emoji"]`
+- Notes:
+  Fallback families remain system-resolved. Use them for CJK, emoji, or any glyph range not covered by bundled `Caskaydia`.
 
 ## Theme
 
 ```toml
 [theme]
-opacity = 0.92
+opacity = 1.0
 
 [theme.color]
-background = "#050a0f"
-foreground = "#c0caf5"
+background = "#070d12"
+foreground = "#e8eef2"
+chrome-background = "#121a22"
+chrome-foreground = "#f7fafc"
+chrome-muted = "#97a5b2"
+chrome-accent = "#7ad9b2"
+chrome-danger = "#f28779"
 
 [theme.border]
-active = "#7aa2f7"
-inactive = "#3b4261"
+active = "#91b4ff"
+inactive = "#313d49"
 width = 1
 
 [theme.pane]
-gap = 4
-padding = 2
-radius = 8
+gap = 12
+padding = 8
+radius = 18
 
 [theme.blur]
 enabled = false
@@ -96,11 +119,11 @@ duration-ms = 120
 enabled = false
 
 [theme.cursor]
-color = "#c0caf5"
+color = "#ffd885"
 blink-interval-ms = 600
 
 [theme.selection]
-background = "#264f78cc"
+background = "#2d5a84d8"
 foreground = "#ffffff"
 ```
 
@@ -108,22 +131,6 @@ foreground = "#ffffff"
 - Type: float
 - Default: `1.0`
 - Constraint: `0.0..=1.0`
-
-`theme.color.background`
-- Type: color string
-- Default: `"#050a0f"`
-
-`theme.color.foreground`
-- Type: color string
-- Default: `"#c0caf5"`
-
-`theme.border.active`
-- Type: color string
-- Default: `"#7aa2f7"`
-
-`theme.border.inactive`
-- Type: color string
-- Default: `"#3b4261"`
 
 Color-valued fields
 - Type: string
@@ -135,15 +142,15 @@ Color-valued fields
 
 `theme.pane.gap`
 - Type: integer
-- Default: `4`
+- Default: `12`
 
 `theme.pane.padding`
 - Type: integer
-- Default: `2`
+- Default: `8`
 
 `theme.pane.radius`
 - Type: integer
-- Default: `8`
+- Default: `18`
 
 `theme.blur.enabled`
 - Type: bool
@@ -169,7 +176,7 @@ Color-valued fields
 
 `theme.cursor.color`
 - Type: color string
-- Default: `"#c0caf5"`
+- Default: `"#ffd885"`
 
 `theme.cursor.blink-interval-ms`
 - Type: integer
@@ -178,7 +185,7 @@ Color-valued fields
 
 `theme.selection.background`
 - Type: color string
-- Default: `"#264f78cc"`
+- Default: `"#2d5a84d8"`
 
 `theme.selection.foreground`
 - Type: color string
@@ -218,9 +225,6 @@ Validation rules:
 
 ## Layout
 
-The layout table controls how the current pane tree behaves at startup
-and how keyboard-driven layout mutations behave.
-
 ```toml
 [layout]
 default-split-axis = "auto"
@@ -229,31 +233,25 @@ scratch-height-percent = 33
 startup-workspace = 1
 ```
 
-`default-split-axis`
+`layout.default-split-axis`
 - Type: string
 - Default: `"auto"`
 - Accepted values: `"auto"`, `"horizontal"`, `"vertical"`
-- Effect:
-  `split_active_pane_shell()` follows auto BSP behavior in `"auto"`
-  mode, or always uses the configured axis otherwise
 
-`resize-step`
+`layout.resize-step`
 - Type: integer
 - Default: `5`
 - Constraint: `> 0`
-- Effect: command-palette resize operations move splits by this delta
 
-`scratch-height-percent`
+`layout.scratch-height-percent`
 - Type: integer
 - Default: `33`
 - Constraint: `1..=100`
-- Effect: dropdown scratch pane height as a percentage of window height
 
-`startup-workspace`
+`layout.startup-workspace`
 - Type: integer
 - Default: `1`
 - Constraint: `1..=9`
-- Effect: GUI launches focused on that workspace
 
 ## Agent
 
@@ -299,14 +297,6 @@ command = []
 `agent.provider.command`
 - Type: string array
 - Required for: `"cli"`
-- Example:
-  `command = ["sh", "-lc", "printf '{\\\"commands\\\":[]}'"]`
-
-Provider validation:
-- If `agent.enabled = true`, `agent.provider` must exist
-- `openai-compatible` requires `model` and `endpoint`
-- `local` requires `model`
-- `cli` requires `command`
 
 ## Full Example
 

@@ -14,9 +14,9 @@ const DEFAULT_FONT_LINE_HEIGHT: f32 = 1.55;
 const DEFAULT_FONT_WEIGHT: u16 = 450;
 const DEFAULT_FONT_BOLD_WEIGHT: u16 = 650;
 const DEFAULT_CURSOR_BLINK_INTERVAL_MS: u64 = 600;
-const DEFAULT_PANE_GAP: u16 = 20;
-const DEFAULT_PANE_PADDING: u16 = 14;
-const DEFAULT_PANE_RADIUS: u16 = 22;
+const DEFAULT_PANE_GAP: u16 = 12;
+const DEFAULT_PANE_PADDING: u16 = 8;
+const DEFAULT_PANE_RADIUS: u16 = 18;
 const DEFAULT_BLUR_FALLBACK_TINT_OPACITY: f32 = 0.92;
 const DEFAULT_ANIMATION_DURATION_MS: u64 = 120;
 const DEFAULT_LAYOUT_RESIZE_STEP: u16 = 5;
@@ -24,6 +24,7 @@ const DEFAULT_SCRATCH_HEIGHT_PERCENT: u8 = 33;
 const DEFAULT_STARTUP_WORKSPACE: u8 = 1;
 const MIN_WORKSPACE_ID: u8 = 1;
 const MAX_WORKSPACE_ID: u8 = 9;
+const DEFAULT_FONT_FAMILY: &str = "CaskaydiaMono NFM";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -103,20 +104,7 @@ impl Default for FontConfig {
 }
 
 fn default_font_family() -> &'static str {
-    #[cfg(target_os = "macos")]
-    {
-        "CaskaydiaCove Nerd Font Mono"
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        "Consolas"
-    }
-
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    {
-        "JetBrainsMono Nerd Font"
-    }
+    DEFAULT_FONT_FAMILY
 }
 
 fn default_font_fallbacks() -> Vec<String> {
@@ -165,13 +153,13 @@ pub struct ThemeColors {
 impl Default for ThemeColors {
     fn default() -> Self {
         Self {
-            background: RgbaColor::from_rgb(0x0b, 0x10, 0x14),
-            foreground: RgbaColor::from_rgb(0xe6, 0xeb, 0xef),
-            chrome_background: RgbaColor::from_rgb(0x14, 0x1c, 0x24),
-            chrome_foreground: RgbaColor::from_rgb(0xf5, 0xf7, 0xfa),
-            chrome_muted: RgbaColor::from_rgb(0x8c, 0x99, 0xa5),
-            chrome_accent: RgbaColor::from_rgb(0x73, 0xc9, 0xa7),
-            chrome_danger: RgbaColor::from_rgb(0xf0, 0x76, 0x62),
+            background: RgbaColor::from_rgb(0x07, 0x0d, 0x12),
+            foreground: RgbaColor::from_rgb(0xe8, 0xee, 0xf2),
+            chrome_background: RgbaColor::from_rgb(0x12, 0x1a, 0x22),
+            chrome_foreground: RgbaColor::from_rgb(0xf7, 0xfa, 0xfc),
+            chrome_muted: RgbaColor::from_rgb(0x97, 0xa5, 0xb2),
+            chrome_accent: RgbaColor::from_rgb(0x7a, 0xd9, 0xb2),
+            chrome_danger: RgbaColor::from_rgb(0xf2, 0x87, 0x79),
         }
     }
 }
@@ -187,8 +175,8 @@ pub struct BorderTheme {
 impl Default for BorderTheme {
     fn default() -> Self {
         Self {
-            active: RgbaColor::from_rgb(0x7a, 0xa2, 0xf7),
-            inactive: RgbaColor::from_rgb(0x3b, 0x42, 0x61),
+            active: RgbaColor::from_rgb(0x91, 0xb4, 0xff),
+            inactive: RgbaColor::from_rgb(0x31, 0x3d, 0x49),
             width: 1,
         }
     }
@@ -205,7 +193,7 @@ pub struct CursorTheme {
 impl Default for CursorTheme {
     fn default() -> Self {
         Self {
-            color: RgbaColor::from_rgb(0xc0, 0xca, 0xf5),
+            color: RgbaColor::from_rgb(0xff, 0xd8, 0x85),
             blink_interval_ms: DEFAULT_CURSOR_BLINK_INTERVAL_MS,
         }
     }
@@ -221,7 +209,7 @@ pub struct SelectionTheme {
 impl Default for SelectionTheme {
     fn default() -> Self {
         Self {
-            background: RgbaColor::from_rgb(0x26, 0x4f, 0x78),
+            background: RgbaColor::from_rgba(0x2d, 0x5a, 0x84, 0xd8),
             foreground: RgbaColor::from_rgb(0xff, 0xff, 0xff),
         }
     }
@@ -827,11 +815,11 @@ mod tests {
         );
         assert_eq!(
             config.theme.color.background,
-            RgbaColor::from_rgb(0x0b, 0x10, 0x14)
+            RgbaColor::from_rgb(0x07, 0x0d, 0x12)
         );
         assert_eq!(
             config.theme.color.chrome_accent,
-            RgbaColor::from_rgb(0x73, 0xc9, 0xa7)
+            RgbaColor::from_rgb(0x7a, 0xd9, 0xb2)
         );
         assert_eq!(config.theme.pane.gap, DEFAULT_PANE_GAP);
         assert_eq!(config.theme.pane.padding, DEFAULT_PANE_PADDING);
